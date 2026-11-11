@@ -24,7 +24,7 @@ use cloudillo_core::extract::{Auth, IdTag, OptionalAuth};
 use cloudillo_core::file_access;
 use cloudillo_types::auth_adapter::AuthCtx;
 use cloudillo_types::meta_adapter::{self, AppTrust};
-use cloudillo_types::types::FileAttrs;
+use cloudillo_types::types::{ApiResponse, FileAttrs};
 
 // ============================================================================
 // Container Content API — serve files from within zip packages
@@ -236,9 +236,10 @@ mod tests {
 
 /// Query parameters for app listing
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListAppsQuery {
-	/// Search term (matches name, description, tags)
-	pub search: Option<String>,
+	/// Free-text filter (matches name, description, tags)
+	pub q: Option<String>,
 }
 
 /// App info response
@@ -246,6 +247,7 @@ pub struct ListAppsQuery {
 #[serde(rename_all = "camelCase")]
 pub struct AppInfo {
 	pub name: Box<str>,
+	#[serde(rename = "publisherIdTag")]
 	pub publisher_tag: Box<str>,
 	pub version: Box<str>,
 	pub action_id: Box<str>,
@@ -262,8 +264,8 @@ pub async fn list_apps(
 	tn_id: TnId,
 	OptionalAuth(_auth): OptionalAuth,
 	Query(opts): Query<ListAppsQuery>,
-) -> ClResult<Json<Vec<AppInfo>>> {
-	let apps = app.meta_adapter.list_installed_apps(tn_id, opts.search.as_deref()).await?;
+) -> ClResult<Json<ApiResponse<Vec<AppInfo>>>> {
+	let apps = app.meta_adapter.list_installed_apps(tn_id, opts.q.as_deref()).await?;
 
 	let result: Vec<AppInfo> = apps
 		.into_iter()
@@ -277,7 +279,7 @@ pub async fn list_apps(
 		})
 		.collect();
 
-	Ok(Json(result))
+	Ok(Json(ApiResponse::new(result)))
 }
 
 // ============================================================================
@@ -300,7 +302,7 @@ pub async fn install_app(
 	tn_id: TnId,
 	Auth(_auth): Auth,
 	Json(req): Json<InstallAppRequest>,
-) -> ClResult<(StatusCode, Json<InstalledAppInfo>)> {
+) -> ClResult<(StatusCode, Json<ApiResponse<InstalledAppInfo>>)> {
 	// Look up the APKG action
 	let action = app
 		.meta_adapter
@@ -369,7 +371,7 @@ pub async fn install_app(
 
 	Ok((
 		StatusCode::CREATED,
-		Json(InstalledAppInfo {
+		Json(ApiResponse::new(InstalledAppInfo {
 			app_name: app_name.into(),
 			publisher_tag: issuer_tag,
 			version: version.into(),
@@ -378,7 +380,7 @@ pub async fn install_app(
 			status: "A".into(),
 			capabilities,
 			auto_update: false,
-		}),
+		})),
 	))
 }
 
@@ -387,10 +389,12 @@ pub async fn install_app(
 #[serde(rename_all = "camelCase")]
 pub struct InstalledAppInfo {
 	pub app_name: Box<str>,
+	#[serde(rename = "publisherIdTag")]
 	pub publisher_tag: Box<str>,
 	pub version: Box<str>,
 	pub action_id: Box<str>,
 	pub file_id: Box<str>,
+	#[serde(with = "cloudillo_types::api_enums::app_status::text")]
 	pub status: Box<str>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub capabilities: Option<Vec<Box<str>>>,
@@ -404,7 +408,7 @@ pub async fn list_installed_apps(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(_auth): Auth,
-) -> ClResult<Json<Vec<InstalledAppInfo>>> {
+) -> ClResult<Json<ApiResponse<Vec<InstalledAppInfo>>>> {
 	let apps = app.meta_adapter.list_installed_apps(tn_id, None).await?;
 
 	let result: Vec<InstalledAppInfo> = apps
@@ -421,7 +425,7 @@ pub async fn list_installed_apps(
 		})
 		.collect();
 
-	Ok(Json(result))
+	Ok(Json(ApiResponse::new(result)))
 }
 
 /// Uninstall an app

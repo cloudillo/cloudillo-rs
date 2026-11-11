@@ -38,14 +38,14 @@ use tokio::runtime::Handle;
 use crate::prelude::*;
 use cloudillo_core::{
 	Auth, audit,
-	extract::{IdTag, OptionalRequestId},
+	extract::IdTag,
 	scheduler::{Task, TaskId},
 };
 use cloudillo_types::{
 	auth_adapter::AuditCategory,
 	blob_adapter::BlobRef,
 	meta_adapter::{FileId, ListActionOptions, ListFileOptions, MAX_PARENT_DEPTH},
-	types::{ApiResponse, CursorData, serialize_timestamp_iso},
+	types::{ApiResponse, ApiTime, CursorData},
 };
 
 /// How long an export stays available after it was requested.
@@ -84,8 +84,7 @@ pub enum ExportState {
 #[serde(rename_all = "camelCase")]
 pub struct ExportStatus {
 	pub status: ExportState,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
+	pub created_at: ApiTime,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub size: Option<u64>,
 }
@@ -138,7 +137,7 @@ async fn request_export(app: &App, tn_id: TnId) -> ClResult<ExportStatus> {
 	}
 	remove_quiet(&zip_path(app, tn_id)).await;
 	let status =
-		ExportStatus { status: ExportState::Pending, created_at: Timestamp::now(), size: None };
+		ExportStatus { status: ExportState::Pending, created_at: ApiTime::now(), size: None };
 	write_status(app, tn_id, &status).await?;
 	let scheduled = app
 		.scheduler
@@ -159,7 +158,6 @@ pub async fn post_export(
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
 	IdTag(id_tag): IdTag,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ExportStatus>>)> {
 	cloudillo_core::abac::require_tenant_account(&auth, &id_tag)?;
 	let status = request_export(&app, auth.tn_id).await?;
@@ -175,10 +173,7 @@ pub async fn post_export(
 	)
 	.await;
 	info!(tn_id = ?auth.tn_id, "Export requested");
-	Ok((
-		StatusCode::ACCEPTED,
-		Json(ApiResponse::new(status).with_req_id(req_id.unwrap_or_default())),
-	))
+	Ok((StatusCode::ACCEPTED, Json(ApiResponse::new(status))))
 }
 
 /// POST /api/admin/tenants/{id_tag}/export - Queue an export for a tenant (SADM). The tenant's
@@ -211,14 +206,14 @@ pub async fn get_export(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	IdTag(id_tag): IdTag,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ExportStatus>>)> {
 	cloudillo_core::abac::require_tenant_account(&auth, &id_tag)?;
 	let status = read_status(&app, auth.tn_id).await?.ok_or(Error::NotFound)?;
-	Ok((StatusCode::OK, Json(ApiResponse::new(status).with_req_id(req_id.unwrap_or_default()))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(status))))
 }
 
-/// GET /api/export/download - Stream the ready ZIP, once (404 unless ready)
+/// GET /api/export/download - Stream the ready ZIP (404 unless ready). Repeatable: the expiry
+/// window is the only cleanup, so an interrupted download can be retried.
 pub async fn get_export_download(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -234,10 +229,6 @@ pub async fn get_export_download(
 		.await
 		.map_err(|_| Error::NotFound)?;
 	let size = file.metadata().await?.len();
-	// One download: unlinked now, the open handle keeps streaming it.
-	// An interrupted download loses the export and the owner requests a new one.
-	// Delete at end of stream if that bites.
-	app.remove_export(tn_id).await;
 	audit::record_event(
 		&app,
 		AuditCategory::Admin,
@@ -269,7 +260,7 @@ pub async fn get_export_download(
 #[derive(Debug)]
 pub struct ExportTask {
 	tn_id: TnId,
-	created_at: Timestamp,
+	created_at: ApiTime,
 }
 
 #[async_trait]
@@ -285,7 +276,7 @@ impl Task<App> for ExportTask {
 		let (tn_id, ts) = ctx
 			.split_once(':')
 			.ok_or_else(|| Error::ValidationError("invalid export task context".into()))?;
-		Ok(Arc::new(ExportTask { tn_id: TnId(tn_id.parse()?), created_at: Timestamp(ts.parse()?) }))
+		Ok(Arc::new(ExportTask { tn_id: TnId(tn_id.parse()?), created_at: ApiTime(ts.parse()?) }))
 	}
 
 	fn serialize(&self) -> String {

@@ -8,7 +8,7 @@
 use sqlx::{Row, SqlitePool};
 
 use cloudillo_types::meta_adapter::{CreateRefOptions, ListRefsOptions, RefData, UpdateRefOptions};
-use cloudillo_types::prelude::*;
+use cloudillo_types::{prelude::*, types::ApiTime};
 
 use crate::utils::{Db, push_patch};
 
@@ -22,8 +22,8 @@ fn row_to_ref_data(row: &sqlx::sqlite::SqliteRow) -> RefData {
 		ref_id: row.get("ref_id"),
 		r#type: row.get("type"),
 		description: row.get("description"),
-		created_at: Timestamp(created_at),
-		expires_at: expires_at.map(Timestamp),
+		created_at: ApiTime(created_at),
+		expires_at: expires_at.map(ApiTime),
 		count: count.and_then(|c| u32::try_from(c).ok()),
 		resource_id: row.get("resource_id"),
 		access_level: access_level.and_then(|s| s.chars().next()),
@@ -82,7 +82,24 @@ pub(crate) async fn list(
 		}
 	}
 
-	query.push(" ORDER BY created_at DESC, description");
+	// The anchor row is looked up by id, so deleting it mid-walk ends the walk early;
+	// carry created_at in `after` if that matters.
+	if let Some(ref after) = opts.after {
+		query.push(
+			" AND (created_at, ref_id) < (SELECT created_at, ref_id FROM refs WHERE tn_id = ",
+		);
+		query.push_bind(tn_id.0);
+		query.push(" AND ref_id = ");
+		query.push_bind(after.as_str());
+		query.push(")");
+	}
+
+	query.push(" ORDER BY created_at DESC, ref_id DESC");
+
+	if let Some(limit) = opts.limit {
+		query.push(" LIMIT ");
+		query.push_bind(i64::from(limit));
+	}
 
 	let rows = query.build().fetch_all(db).await.db()?;
 
@@ -137,8 +154,8 @@ pub(crate) async fn create(
 		ref_id: ref_id.into(),
 		r#type: opts.typ.clone().into(),
 		description: opts.description.clone().map(Into::into),
-		created_at: now,
-		expires_at: opts.expires_at,
+		created_at: now.into(),
+		expires_at: opts.expires_at.map(Into::into),
 		count: opts.count, // None = unlimited
 		resource_id: opts.resource_id.clone().map(Into::into),
 		access_level: opts.access_level,
@@ -266,7 +283,7 @@ pub(crate) async fn validate_ref(
 	if let Some(exp) = expires_at {
 		let now = Timestamp::now();
 		if exp <= now.0 {
-			return Err(Error::ValidationError("Ref has expired".to_string()));
+			return Err(Error::RefExpired);
 		}
 	}
 
@@ -274,7 +291,7 @@ pub(crate) async fn validate_ref(
 	if let Some(c) = count
 		&& c <= 0
 	{
-		return Err(Error::ValidationError("Ref has already been used".to_string()));
+		return Err(Error::RefUsed);
 	}
 
 	// Return ref data without decrementing count
@@ -282,8 +299,8 @@ pub(crate) async fn validate_ref(
 		ref_id: ref_id.into(),
 		r#type: ref_type.into(),
 		description,
-		created_at: Timestamp(created_at),
-		expires_at: expires_at.map(Timestamp),
+		created_at: ApiTime(created_at),
+		expires_at: expires_at.map(ApiTime),
 		count: count.and_then(|c| u32::try_from(c).ok()),
 		resource_id,
 		access_level: access_level_str.and_then(|s| s.chars().next()),
@@ -340,7 +357,7 @@ pub(crate) async fn use_ref(
 	if let Some(exp) = expires_at {
 		let now = Timestamp::now();
 		if exp <= now.0 {
-			return Err(Error::ValidationError("Ref has expired".to_string()));
+			return Err(Error::RefExpired);
 		}
 	}
 
@@ -353,7 +370,7 @@ pub(crate) async fn use_ref(
 				.await
 				.db()?;
 		if result.rows_affected() == 0 {
-			return Err(Error::ValidationError("Ref has already been used".to_string()));
+			return Err(Error::RefUsed);
 		}
 		count.and_then(|c| u32::try_from((c - 1).max(0)).ok())
 	} else {
@@ -367,8 +384,8 @@ pub(crate) async fn use_ref(
 		ref_id: ref_id.into(),
 		r#type: ref_type.into(),
 		description,
-		created_at: Timestamp(created_at),
-		expires_at: expires_at.map(Timestamp),
+		created_at: ApiTime(created_at),
+		expires_at: expires_at.map(ApiTime),
 		count: new_count, // None = unlimited
 		resource_id,
 		access_level: access_level_str.and_then(|s| s.chars().next()),

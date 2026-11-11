@@ -12,7 +12,7 @@ use cloudillo_core::CreateActionFn;
 use cloudillo_core::extract::Auth;
 use cloudillo_ref::service::{CreateRefInternalParams, create_ref_internal};
 use cloudillo_types::action_types::CreateAction;
-use cloudillo_types::types::ApiResponse;
+use cloudillo_types::types::{ApiResponse, ApiTime};
 
 /// Request body for creating a community invite
 #[derive(Debug, Deserialize)]
@@ -34,10 +34,10 @@ pub struct InviteCommunityResponse {
 	pub ref_id: String,
 	pub invite_url: String,
 	pub target_id_tag: String,
-	pub expires_at: Option<i64>,
+	pub expires_at: Option<ApiTime>,
 }
 
-/// POST /api/admin/invite-community - Create a community invite and send PRINVT action
+/// POST /api/admin/community-invites - Create a community invite and send PRINVT action
 pub async fn post_invite_community(
 	State(app): State<App>,
 	Auth(auth): Auth,
@@ -111,7 +111,7 @@ pub async fn post_invite_community(
 		ref_id,
 		invite_url,
 		target_id_tag: req.target_id_tag,
-		expires_at: expires_at.map(|ts| ts.0),
+		expires_at: expires_at.map(ApiTime::from),
 	};
 
 	Ok((StatusCode::CREATED, Json(ApiResponse::new(response))))

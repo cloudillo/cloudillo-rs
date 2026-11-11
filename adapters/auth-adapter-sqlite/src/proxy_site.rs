@@ -11,6 +11,7 @@ use cloudillo_types::{
 	auth_adapter::{CreateProxySiteData, ProxySiteConfig, ProxySiteData, UpdateProxySiteData},
 	prelude::*,
 	secret_box::{self, SecretBox},
+	types::ApiTime,
 };
 
 fn cert_key_aad(site_id: i64) -> String {
@@ -42,11 +43,11 @@ fn parse_proxy_site_row(row: &sqlx::sqlite::SqliteRow) -> Result<ProxySiteData, 
 		proxy_type: row.try_get("proxy_type")?,
 		cert: row.try_get("cert")?,
 		cert_key: row.try_get("cert_key")?,
-		cert_expires_at: row.try_get::<Option<i64>, _>("cert_expires_at")?.map(Timestamp),
+		cert_expires_at: row.try_get::<Option<i64>, _>("cert_expires_at")?.map(ApiTime),
 		config,
 		created_by: row.try_get("created_by")?,
-		created_at: Timestamp(row.try_get::<i64, _>("created_at")?),
-		updated_at: Timestamp(row.try_get::<i64, _>("updated_at")?),
+		created_at: ApiTime(row.try_get::<i64, _>("created_at")?),
+		updated_at: ApiTime(row.try_get::<i64, _>("updated_at")?),
 	})
 }
 

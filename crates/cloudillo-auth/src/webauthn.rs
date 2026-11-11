@@ -20,7 +20,7 @@ use webauthn_rs::prelude::*;
 
 use crate::audit::record_auth;
 use cloudillo_core::Auth;
-use cloudillo_core::extract::{IdTag, OptionalRequestId};
+use cloudillo_core::extract::IdTag;
 use cloudillo_types::{auth_adapter, types::ApiResponse};
 
 use crate::prelude::*;
@@ -59,11 +59,11 @@ struct LoginChallengeToken {
 ///
 // ponytail: process-local, so a multi-process deployment would need this in the
 // auth adapter's `vars` table or a shared cache instead. Memory within one TTL window is
-// bounded only by the rate limiter on `GET /api/auth/wa/login/challenge`.
+// bounded only by the rate limiter on `POST /api/auth/login/passkey/challenge`.
 static SPENT_CHALLENGES: LazyLock<DashMap<String, Instant>> = LazyLock::new(DashMap::new);
 
 /// Above this many live entries, drop the expired ones on the next insert. Rescanning past
-/// the threshold is fine — `GET /api/auth/wa/login/challenge` is rate-limited, so the map
+/// the threshold is fine — `POST /api/auth/login/passkey/challenge` is rate-limited, so the map
 /// cannot get there often.
 const SPENT_SWEEP_ABOVE: usize = 1024;
 
@@ -275,7 +275,7 @@ pub struct Assertion {
 // Handlers
 // ============================================================================
 
-/// GET /api/auth/wa/reg - List WebAuthn credentials
+/// GET /api/auth/passkeys - List WebAuthn credentials
 pub async fn list_reg(
 	State(app): State<App>,
 	Auth(auth): Auth,
@@ -298,8 +298,8 @@ pub async fn list_reg(
 	Ok((StatusCode::OK, Json(ApiResponse::new(result))))
 }
 
-/// GET /api/auth/wa/reg/challenge - Get registration challenge
-pub async fn get_reg_challenge(
+/// POST /api/auth/passkey-challenges - Mint a registration challenge
+pub async fn post_reg_challenge(
 	State(app): State<App>,
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
@@ -355,7 +355,7 @@ pub async fn get_reg_challenge(
 	Ok((StatusCode::OK, Json(ApiResponse::new(RegChallengeRes { options, token }))))
 }
 
-/// POST /api/auth/wa/reg - Register a new credential
+/// POST /api/auth/passkeys - Register a new credential
 pub async fn post_reg(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -452,14 +452,13 @@ pub async fn post_reg(
 	))
 }
 
-/// DELETE /api/auth/wa/reg/{key_id} - Delete a credential
+/// DELETE /api/auth/passkeys/{passkeyId} - Delete a credential
 pub async fn delete_reg(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
 	Path(key_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	info!("Deleting WebAuthn credential {} for {}", key_id, auth.id_tag);
 
 	app.auth_adapter.delete_webauthn_credential(auth.tn_id, &key_id).await?;
@@ -474,8 +473,7 @@ pub async fn delete_reg(
 	)
 	.await;
 
-	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
 /// The tenant's stored credentials that still deserialize into a usable [`Passkey`].
@@ -486,9 +484,9 @@ async fn valid_passkeys(app: &App, tn_id: TnId) -> Vec<Passkey> {
 	credentials.iter().filter_map(|c| stored_to_passkey(c).ok()).collect()
 }
 
-/// Whether the tenant has at least one usable passkey — all `login-init` needs.
-/// The challenge itself is minted separately by `GET /api/auth/wa/login/challenge`
-/// at the moment the user clicks: `login-init` runs at page load, an unbounded
+/// Whether the tenant has at least one usable passkey — all `POST /api/auth/login/init` needs.
+/// The challenge itself is minted separately by `POST /api/auth/login/passkey/challenge`
+/// at the moment the user clicks: `/api/auth/login/init` runs at page load, an unbounded
 /// time earlier, so a challenge minted there would often already be expired.
 pub async fn has_passkeys(app: &App, tn_id: TnId) -> bool {
 	!valid_passkeys(app, tn_id).await.is_empty()
@@ -548,8 +546,8 @@ async fn try_login_challenge(app: &App, id_tag: &IdTag, tn_id: TnId) -> Option<L
 	Some(LoginChallengeRes { options, token })
 }
 
-/// GET /api/auth/wa/login/challenge - Get login challenge
-pub async fn get_login_challenge(
+/// POST /api/auth/login/passkey/challenge - Get login challenge
+pub async fn post_login_challenge(
 	State(app): State<App>,
 	id_tag: IdTag,
 	tn_id: TnId,
@@ -561,7 +559,7 @@ pub async fn get_login_challenge(
 	Ok((StatusCode::OK, Json(ApiResponse::new(result))))
 }
 
-/// POST /api/auth/wa/login - Authenticate with WebAuthn
+/// POST /api/auth/login/passkey - Authenticate with WebAuthn
 pub async fn post_login(
 	State(app): State<App>,
 	IdTag(host_id_tag): IdTag,

@@ -8,13 +8,13 @@
 //! | Path | GET | POST | PUT | PATCH | DELETE |
 //! |---|---|---|---|---|---|
 //! | `/api/actions`                        | `list_public()` ᴳ | `create()` ᶜ | | | |
-//! | `/api/actions/verify`                 | | `reader_state()` ᴱ | | | |
-//! | `/api/actions/{action_id}`            | `read()` ᴬ | | | `write()` ᶜ | `write()` ᶜ |
-//! | `/api/actions/{action_id}/publish`    | | `write()` ᶜ | | | |
-//! | `/api/actions/{action_id}/cancel`     | | `write()` ᶜ | | | |
-//! | `/api/actions/{action_id}/accept`     | | `moderate()` ᴱ | | | |
-//! | `/api/actions/{action_id}/reject`     | | `moderate()` ᴱ | | | |
-//! | `/api/actions/{action_id}/dismiss`    | | `write()` ᶜ | | | |
+//! | `/api/actions/{id}`                   | `read()` ᴬ | | | `write()` ᶜ | `write()` ᶜ |
+//! | `/api/actions/{id}/publish`           | | `write()` ᶜ | | | |
+//! | `/api/actions/{id}/cancel`            | | `write()` ᶜ | | | |
+//! | `/api/actions/{id}/accept`            | | `moderate()` ᴱ | | | |
+//! | `/api/actions/{id}/reject`            | | `moderate()` ᴱ | | | |
+//! | `/api/actions/{id}/dismiss`           | | `write()` ᶜ | | | |
+//! | `/api/action-verifications`           | | `reader_state()` ᴱ | | | |
 //! | `/api/reader-state`                   | `reader_state()` ᴱ | | | | |
 //! | `/api/reader-state/{kind}/{ref}`      | | | | `reader_state()` ᴱ | |
 //! | `/api/outbox`                         | `reader_state()` ᴱ | | | | |
@@ -26,7 +26,7 @@
 //! ᶜ auth + ABAC, ᴱ auth only — handler self-enforces. The guard on each fn is
 //! in `routes/protected.rs` / `routes/public.rs`.
 //!
-//! `/api/actions/{action_id}` spans two guards: `GET` is a public ABAC read,
+//! `/api/actions/{id}` spans two guards: `GET` is a public ABAC read,
 //! `PATCH`/`DELETE` are protected ABAC writes. They cannot be chained.
 
 use axum::{
@@ -45,17 +45,14 @@ pub(crate) fn create() -> Router<App> {
 
 /// Action mutation and moderation, gated by `check_perm_action("write")`.
 ///
-/// Every route here **must** capture the action id as `{action_id}` — the guard
+/// Every route here **must** capture the action id as `{id}` — the guard
 /// reads it by name. Other captures are ignored.
 pub(crate) fn write() -> Router<App> {
 	Router::new()
-		.route(
-			"/api/actions/{action_id}",
-			delete(handler::delete_action).patch(handler::patch_action),
-		)
-		.route("/api/actions/{action_id}/publish", post(handler::publish_draft))
-		.route("/api/actions/{action_id}/cancel", post(handler::cancel_scheduled))
-		.route("/api/actions/{action_id}/dismiss", post(handler::post_action_dismiss))
+		.route("/api/actions/{id}", delete(handler::delete_action).patch(handler::patch_action))
+		.route("/api/actions/{id}/publish", post(handler::publish_draft))
+		.route("/api/actions/{id}/cancel", post(handler::cancel_scheduled))
+		.route("/api/actions/{id}/dismiss", post(handler::post_action_dismiss))
 }
 
 /// Inbox moderation — authentication only, the handlers self-enforce.
@@ -72,15 +69,15 @@ pub(crate) fn write() -> Router<App> {
 /// to). `/dismiss` stays in [`write`] — it has no such self-enforcement.
 pub(crate) fn moderate() -> Router<App> {
 	Router::new()
-		.route("/api/actions/{action_id}/accept", post(handler::post_action_accept))
-		.route("/api/actions/{action_id}/reject", post(handler::post_action_reject))
+		.route("/api/actions/{id}/accept", post(handler::post_action_accept))
+		.route("/api/actions/{id}/reject", post(handler::post_action_reject))
 }
 
 /// The reader's own state — authentication only, no ABAC guard.
 ///
 /// - `/api/reader-state`: the reader's own follow state (read watermark, notify
 ///   level, pin/archive/…) on their own node; owner only — the handlers check;
-/// - `/api/actions/verify`: token verification with this node's cached keys
+/// - `/api/action-verifications`: token verification with this node's cached keys
 ///   (owner only — the handler checks; it spends the tenant's outbound budget);
 /// - `/api/outbox`: federation history sync (peer-initiated pull). Auth is
 ///   enforced by the `Auth` extractor; non-related peers are rejected with an
@@ -89,15 +86,15 @@ pub(crate) fn reader_state() -> Router<App> {
 	Router::new()
 		.route("/api/reader-state", get(handler::list_reader_state))
 		.route("/api/reader-state/{kind}/{ref}", patch(handler::patch_reader_state))
-		.route("/api/actions/verify", post(handler::post_verify_tokens))
+		.route("/api/action-verifications", post(handler::post_verify_tokens))
 		.route("/api/outbox", get(handler::get_outbox))
 }
 
 /// Action reads, gated by `check_perm_action("read")` with a guest
 /// (OptionalAuth) context. Every route here must capture the action id as
-/// `{action_id}`.
+/// `{id}`.
 pub(crate) fn read() -> Router<App> {
-	Router::new().route("/api/actions/{action_id}", get(handler::get_action_by_id))
+	Router::new().route("/api/actions/{id}", get(handler::get_action_by_id))
 }
 
 /// Federation inbox — unauthenticated peers POST signed action tokens.

@@ -20,7 +20,7 @@ use crate::settings::{
 	PermissionLevel, SettingDefinition, SettingScope, SettingValue, SettingsRegistry,
 };
 use cloudillo_types::auth_adapter::{AuditCategory, AuditEvent, AuditEventRow, AuditQuery};
-use cloudillo_types::types::SHARED_TN;
+use cloudillo_types::types::{ApiTime, CursorData, SHARED_TN};
 
 const DEFAULT_RETENTION_DAYS: i64 = 365;
 const PURGE_CRON: &str = "40 4 * * *";
@@ -100,8 +100,40 @@ pub async fn record(app: &App, ev: AuditEvent) {
 	crate::alert::notify(app, &ev);
 }
 
+/// Filter of the audit list APIs (`GET /api/auth/audit`, `GET /api/admin/audit`).
+/// `createdAfter`/`createdBefore` are RFC 3339 (inclusive); `event` is a prefix.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditFilter {
+	pub created_after: Option<ApiTime>,
+	pub created_before: Option<ApiTime>,
+	pub category: Option<String>,
+	pub event: Option<String>,
+	pub outcome: Option<String>,
+	pub limit: Option<u32>,
+	/// Opaque cursor: the previous page's `next`
+	pub cursor: Option<String>,
+}
+
+impl AuditFilter {
+	/// The adapter query for this filter, narrowed to `tn_id` / `actor` if given.
+	pub fn into_query(self, tn_id: Option<TnId>, actor: Option<Box<str>>) -> ClResult<AuditQuery> {
+		Ok(AuditQuery {
+			tn_id,
+			from: self.created_after.map(Timestamp::from),
+			to: self.created_before.map(Timestamp::from),
+			category: parse_category(self.category.as_deref())?,
+			event_prefix: self.event.map(Into::into),
+			actor,
+			outcome: self.outcome.map(Into::into),
+			limit: Some(page_limit(self.limit)),
+			cursor: CursorData::parse_int(self.cursor.as_deref(), "audit")?,
+		})
+	}
+}
+
 /// The `category` query parameter of the audit list APIs.
-pub fn parse_category(c: Option<&str>) -> ClResult<Option<AuditCategory>> {
+fn parse_category(c: Option<&str>) -> ClResult<Option<AuditCategory>> {
 	c.map(|c| {
 		AuditCategory::parse(c)
 			.ok_or_else(|| Error::ValidationError("unknown audit category".into()))
@@ -110,7 +142,7 @@ pub fn parse_category(c: Option<&str>) -> ClResult<Option<AuditCategory>> {
 }
 
 /// The `limit` query parameter of the audit list APIs.
-pub fn page_limit(l: Option<u32>) -> u32 {
+fn page_limit(l: Option<u32>) -> u32 {
 	l.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
 }
 

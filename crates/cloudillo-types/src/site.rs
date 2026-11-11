@@ -193,7 +193,7 @@ pub fn site_path(mount_path: &str, rel: &str) -> String {
 /// `cloudillo_site::wrapper::push_nav_item`, which escapes the value but cannot change
 /// its scheme, and the site CSP's `script-src 'unsafe-inline'` does not stop a
 /// `javascript:` URL. The frontend serializer's `safeHref` allowlist covers container
-/// markup only — a nav target arrives through `PATCH /api/sites` — so this predicate is
+/// markup only — a nav target arrives through `PATCH /api/site` — so this predicate is
 /// the only place the check can happen. Both the validating and the rendering side call
 /// it, so the two cannot drift.
 pub fn is_safe_nav_target(target: &str) -> bool {

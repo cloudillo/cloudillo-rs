@@ -77,7 +77,7 @@ use axum::{
 };
 use cloudillo_core::{
 	abac, doc_format,
-	extract::{Auth, IdTag, OptionalRequestId},
+	extract::{Auth, IdTag},
 };
 use cloudillo_types::{
 	auth_adapter::AuthCtx,
@@ -92,6 +92,9 @@ use crate::prelude::*;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PutDocFormat {
+	/// `publisherTag` is the pre-rename key, kept so an older shell is not refused (see
+	/// `version` below). Remove together with `version`.
+	#[serde(rename = "publisherIdTag", alias = "publisherTag")]
 	pub publisher_tag: String,
 	pub app_name: String,
 	/// Encoded document format version, `MMMmmmppp` — three decimal digits for each
@@ -105,11 +108,14 @@ pub struct PutDocFormat {
 	/// frontend, which is the required deploy order. Remove one release after both
 	/// halves have shipped.
 	pub version: Option<String>,
-	/// `"RTDB"` | `"CRDT"` | `"BLOB"`
+	/// `"RTDB"` | `"CRDT"` | `"BLOB"`. `storeTp` is the pre-rename key (see `publisherTag`).
+	#[serde(rename = "storeType", alias = "storeTp")]
 	pub store_tp: Option<String>,
 	/// Deep-link query param name, e.g. `"nav"`.
 	pub nav_param: Option<String>,
 	pub search: Option<serde_json::Value>,
+	/// `x` is the pre-rename key (see `publisherTag`).
+	#[serde(rename = "extra", alias = "x")]
 	pub x: Option<serde_json::Value>,
 }
 
@@ -138,7 +144,6 @@ pub async fn list_doc_formats(
 	tn_id: TnId,
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<DocFormatEntry>>>)> {
 	require_format_reader(&auth, &tenant_id_tag)?;
 	let formats = doc_format::resolve_list(&app, tn_id)
@@ -146,7 +151,7 @@ pub async fn list_doc_formats(
 		.into_iter()
 		.map(|(format, source)| DocFormatEntry { format, source: source.as_str() })
 		.collect();
-	Ok((StatusCode::OK, Json(ApiResponse::new(formats).with_req_id(req_id.unwrap_or_default()))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(formats))))
 }
 
 /// `PUT /api/doc-formats/{content_type}` — register or update a manifest.
@@ -155,7 +160,6 @@ pub async fn put_doc_format(
 	tn_id: TnId,
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path(content_type): Path<String>,
 	Json(body): Json<PutDocFormat>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Option<DocFormat>>>)> {
@@ -181,10 +185,7 @@ pub async fn put_doc_format(
 		&& same_as_bundled(bundled, &body)
 	{
 		debug!(content_type, "Doc format registration matches the bundled default; ignoring");
-		return Ok((
-			StatusCode::OK,
-			Json(ApiResponse::new(Some(bundled.clone())).with_req_id(req_id.unwrap_or_default())),
-		));
+		return Ok((StatusCode::OK, Json(ApiResponse::new(Some(bundled.clone())))));
 	}
 
 	// `existing` is the tenant row alone, deliberately — a bundled entry is *not*
@@ -196,10 +197,7 @@ pub async fn put_doc_format(
 
 	match gate(existing.as_ref(), &body) {
 		GateDecision::Unchanged => {
-			return Ok((
-				StatusCode::OK,
-				Json(ApiResponse::new(existing).with_req_id(req_id.unwrap_or_default())),
-			));
+			return Ok((StatusCode::OK, Json(ApiResponse::new(existing))));
 		}
 		GateDecision::Stale => {
 			// 200 with the stored row rather than a 409 — see the module docs.
@@ -210,10 +208,7 @@ pub async fn put_doc_format(
 				app = %format!("{}/{}", body.publisher_tag, body.app_name),
 				"Ignored a doc format registration older than the stored one"
 			);
-			return Ok((
-				StatusCode::OK,
-				Json(ApiResponse::new(existing).with_req_id(req_id.unwrap_or_default())),
-			));
+			return Ok((StatusCode::OK, Json(ApiResponse::new(existing))));
 		}
 		GateDecision::WriteSameVersion => {
 			warn!(
@@ -272,7 +267,7 @@ pub async fn put_doc_format(
 	}
 
 	let stored = app.meta_adapter.read_doc_format(tn_id, &content_type).await?;
-	Ok((StatusCode::OK, Json(ApiResponse::new(stored).with_req_id(req_id.unwrap_or_default()))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(stored))))
 }
 
 /// `DELETE /api/doc-formats/{content_type}` — drop the tenant's row.
@@ -286,18 +281,14 @@ pub async fn delete_doc_format(
 	tn_id: TnId,
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path(content_type): Path<String>,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	require_tenant_admin(&auth, &tenant_id_tag)?;
 	if app.meta_adapter.read_doc_format(tn_id, &content_type).await?.is_none() {
 		// Already at the bundled default: nothing to drop, and nothing wrong
 		// either. Only a content type neither tier knows is a 404.
 		if app.bundled_apps.get(&content_type).is_some() {
-			return Ok((
-				StatusCode::OK,
-				Json(ApiResponse::new(()).with_req_id(req_id.unwrap_or_default())),
-			));
+			return Ok(StatusCode::NO_CONTENT);
 		}
 		return Err(Error::NotFound);
 	}
@@ -316,7 +307,7 @@ pub async fn delete_doc_format(
 		.delete_deep_search_by_content_type(tn_id, &content_type)
 		.await?;
 
-	Ok((StatusCode::OK, Json(ApiResponse::new(()).with_req_id(req_id.unwrap_or_default()))))
+	Ok(StatusCode::NO_CONTENT)
 }
 
 /// Registering or dropping a document format is a tenant-administrative act.
@@ -550,7 +541,7 @@ mod tests {
 			nav_param: Some("nav".into()),
 			search,
 			x: None,
-			updated_at: Timestamp(0),
+			updated_at: Timestamp(0).into(),
 		}
 	}
 

@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
 // SPDX-License-Identifier: MPL-2.0
 
-//! `/api/me**`, `/api/profiles/**`.
+//! `/api/me**`, `/api/profiles/**`, `/api/profile-lookups`, `/api/registrations/**`,
+//! `/api/communities`.
 //!
-//! Also holds `/api/admin/profiles/{id_tag}` — it is an `/api/admin` URL but a
+//! `/api/me/**` is this node's tenant; `/api/profiles/{idTag}` is every other profile.
+//!
+//! Also holds `/api/admin/profiles/{idTag}` — it is an `/api/admin` URL but a
 //! profile handler under the profile ABAC guard, so it lives with the rest of
 //! the `check_perm_profile` family. `routes/tables/admin.rs` cross-references it.
 //!
@@ -16,17 +19,18 @@
 //! | `/api/me/app-domain`                   | `public_discovery()` ᴳ | | | | |
 //! | `/api/me/image`                        | | | `tenant_profile()` ᴸ ᴮ | | |
 //! | `/api/me/cover`                        | | | `tenant_profile()` ᴸ ᴮ | | |
+//! | `/api/me/idp-status`                   | `own()` ᴱ | | | | |
+//! | `/api/me/idp/resend`                   | | `own()` ᴱ | | | |
 //! | `/api/profiles`                        | `own()` ᴱ ᵀ | | | | |
-//! | `/api/profiles/batch`                  | `batch()` ᴾ | | | | |
-//! | `/api/profiles/{id_tag}`               | `read()` ᶜ | | `own()` ᴱ | `write()` ᶜ | |
-//! | `/api/profiles/{id_tag}/refresh`       | | `own()` ᴱ | | | |
-//! | `/api/profiles/{id_tag}/settings`      | `own()` ᴱ | | | | |
-//! | `/api/profiles/{id_tag}/settings/{name}` | `own()` ᴱ | | `own()` ᴱ | | |
-//! | `/api/profiles/me/idp-status`          | `own()` ᴱ | | | | |
-//! | `/api/profiles/me/resend-activation`   | | `own()` ᴱ | | | |
-//! | `/api/profiles/register`               | | `registration()` ᴿ | | | |
-//! | `/api/profiles/verify`                 | | `registration()` ᴿ | | | |
-//! | `/api/admin/profiles/{id_tag}`         | | | | `admin()` ᶜ | |
+//! | `/api/profile-lookups`                 | `batch()` ᴾ | | | | |
+//! | `/api/profiles/{idTag}`                | `read()` ᶜ | | | `write()` ᶜ | |
+//! | `/api/profiles/{idTag}/refresh`        | | `own()` ᴱ | | | |
+//! | `/api/profiles/{idTag}/settings`       | `own()` ᴱ | | | | |
+//! | `/api/profiles/{idTag}/settings/{name}` | `own()` ᴱ | | `own()` ᴱ | | |
+//! | `/api/communities`                     | | `own()` ᴱ | | | |
+//! | `/api/registrations`                   | | `registration()` ᴿ | | | |
+//! | `/api/registrations/verify`            | | `registration()` ᴿ | | | |
+//! | `/api/admin/profiles/{idTag}`          | | | | `admin()` ᶜ | |
 //! | `/api/channels`                        | `channels_public()` ᴼ | `channels_admin()` ᴱ | | | |
 //! | `/api/channels/{name}`                 | | | | `channels_admin()` ᴱ | `channels_admin()` ᴱ |
 //! | `/api/channels/{name}/members`         | `channels_admin()` ᴱ | | | | |
@@ -43,14 +47,8 @@
 //! (`cloudillo_core::profile_visibility::RequesterTier::from_auth`). The guard
 //! on each fn is in `routes/protected.rs` / `routes/public.rs`.
 //!
-//! `/api/profiles/{id_tag}` spans three guards — `GET` under
-//! `check_perm_profile("read")`, `PATCH` under `("write")`, `PUT` under none
-//! (community creation, auth only). They cannot be chained.
-//!
-//! `/api/profiles/batch` is a static segment and `/api/profiles/{id_tag}` a
-//! parameter, so matchit resolves `batch` to the batch route however the two
-//! tables are merged — static beats param. [`tests::batch_is_not_shadowed_by_the_id_tag_route`]
-//! pins that.
+//! `/api/profiles/{idTag}` spans two guards — `GET` under
+//! `check_perm_profile("read")`, `PATCH` under `("write")`. They cannot be chained.
 //!
 //! `/api/me` spans the public and protected tiers: the `GET` is unauthenticated
 //! tenant discovery, the `PATCH` edits the **tenant's** record (its name, `x`, images), so
@@ -71,11 +69,11 @@ use cloudillo_profile::{
 
 /// Profile reads, gated by `check_perm_profile("read")`.
 ///
-/// Every route here **must** capture the subject as `{id_tag}` — the guard reads
+/// Every route here **must** capture the subject as `{idTag}` — the guard reads
 /// it by name. It extracts `Auth` (no guest path), so this table must sit inside
 /// `require_auth`. Other captures are ignored.
 pub(crate) fn read() -> Router<App> {
-	Router::new().route("/api/profiles/{id_tag}", get(list::get_profile_by_id_tag))
+	Router::new().route("/api/profiles/{idTag}", get(list::get_profile_by_id_tag))
 }
 
 /// Reduced public profile projection for a set of id_tags, mounted under
@@ -90,23 +88,23 @@ pub(crate) fn read() -> Router<App> {
 /// `cloudillo_core::middleware::require_auth_public_data`; the use case and the
 /// disclosure it accepts are on `cloudillo_profile::list::get_profiles_batch`.
 pub(crate) fn batch() -> Router<App> {
-	Router::new().route("/api/profiles/batch", get(list::get_profiles_batch))
+	Router::new().route("/api/profile-lookups", get(list::get_profiles_batch))
 }
 
 /// Relationship changes, gated by `check_perm_profile("write")` — the subject
-/// must be captured as `{id_tag}`.
+/// must be captured as `{idTag}`.
 pub(crate) fn write() -> Router<App> {
-	Router::new().route("/api/profiles/{id_tag}", patch(update::patch_profile_relationship))
+	Router::new().route("/api/profiles/{idTag}", patch(update::patch_profile_relationship))
 }
 
 /// Tenant-admin profile changes, gated by `check_perm_profile("admin")` — the
-/// subject must be captured as `{id_tag}`.
+/// subject must be captured as `{idTag}`.
 pub(crate) fn admin() -> Router<App> {
-	Router::new().route("/api/admin/profiles/{id_tag}", patch(update::patch_profile_admin))
+	Router::new().route("/api/admin/profiles/{idTag}", patch(update::patch_profile_admin))
 }
 
 /// Channel administration — authentication only; every handler self-enforces moderator+
-/// (`cloudillo_profile::channel::require_moderator`). No `{id_tag}` capture, so the
+/// (`cloudillo_profile::channel::require_moderator`). No `{idTag}` capture, so the
 /// `check_perm_profile` family does not fit.
 pub(crate) fn channels_admin() -> Router<App> {
 	Router::new()
@@ -134,17 +132,16 @@ pub(crate) fn partners_own() -> Router<App> {
 
 /// The caller's own profile — authentication only, no ABAC guard.
 ///
-/// - `/api/profiles/me/idp-status` and `/api/profiles/me/resend-activation` are
-///   the pull-on-demand IDP onboarding gate. Active only during onboarding
-///   (`ui.onboarding === 'verify-idp'`); once cleared, no client should be
-///   calling them.
-/// - `PUT /api/profiles/{id_tag}` creates a community profile.
-/// - `POST /api/profiles/{id_tag}/refresh` forces an immediate re-sync of the
-///   caller's local mirror of `{id_tag}`, bypassing the scheduled
+/// - `/api/me/idp-status` and `/api/me/idp/resend` are the pull-on-demand IDP
+///   onboarding gate. Active only during onboarding (`ui.onboarding === 'verify-idp'`);
+///   once cleared, no client should be calling them.
+/// - `POST /api/communities` creates a community profile (`idTag` in the body).
+/// - `POST /api/profiles/{idTag}/refresh` forces an immediate re-sync of the
+///   caller's local mirror of `{idTag}`, bypassing the scheduled
 ///   staleness/abandonment window. Auth-only: the handler checks the caller
-///   already tracks `{id_tag}` before refreshing (mirrors the
-///   `/api/files/{file_id}/refresh` precedent).
-/// - `/api/profiles/{id_tag}/settings**` are `{id_tag}`'s **own** preferences on this
+///   already tracks `{idTag}` before refreshing (mirrors the
+///   `/api/files/{id}/refresh` precedent).
+/// - `/api/profiles/{idTag}/settings**` are `{idTag}`'s **own** preferences on this
 ///   tenant — the first surface here owned by a member rather than the tenant. The
 ///   handlers admit the profile itself and `SADM` only (leaders and moderators excluded)
 ///   and refuse scoped tokens outright; see
@@ -152,13 +149,13 @@ pub(crate) fn partners_own() -> Router<App> {
 pub(crate) fn own() -> Router<App> {
 	Router::new()
 		.route("/api/profiles", get(list::list_profiles))
-		.route("/api/profiles/me/idp-status", get(idp_status::get_me_idp_status))
-		.route("/api/profiles/me/resend-activation", post(idp_status::post_me_resend_activation))
-		.route("/api/profiles/{id_tag}", put(community::put_community_profile))
-		.route("/api/profiles/{id_tag}/refresh", post(update::post_profile_refresh))
-		.route("/api/profiles/{id_tag}/settings", get(settings::handler::list_profile_settings))
+		.route("/api/me/idp-status", get(idp_status::get_me_idp_status))
+		.route("/api/me/idp/resend", post(idp_status::post_me_resend_activation))
+		.route("/api/communities", post(community::post_community))
+		.route("/api/profiles/{idTag}/refresh", post(update::post_profile_refresh))
+		.route("/api/profiles/{idTag}/settings", get(settings::handler::list_profile_settings))
 		.route(
-			"/api/profiles/{id_tag}/settings/{name}",
+			"/api/profiles/{idTag}/settings/{name}",
 			get(settings::handler::get_profile_setting).put(settings::handler::put_profile_setting),
 		)
 }
@@ -177,8 +174,8 @@ pub(crate) fn tenant_profile() -> Router<App> {
 /// mounted under the strict `"auth"` rate-limit bucket.
 pub(crate) fn registration() -> Router<App> {
 	Router::new()
-		.route("/api/profiles/register", post(register::post_register))
-		.route("/api/profiles/verify", post(register::post_verify_profile))
+		.route("/api/registrations", post(register::post_register))
+		.route("/api/registrations/verify", post(register::post_verify_profile))
 }
 
 /// Unauthenticated tenant discovery. Mounted under the `"general"` bucket.
@@ -197,11 +194,8 @@ pub(crate) fn recovery_public() -> Router<App> {
 
 #[cfg(test)]
 mod tests {
-	use axum::{Router, body::Body, http::Request, routing::get};
-	use tower::ServiceExt;
-
-	/// The `/api/profiles/…` routes each table declares, as `"verb path"`. Only handles
-	/// single-line `.route(..)` declarations, which is all the tables read here have.
+	/// The routes each table declares, as `"verb path"`. Only handles single-line
+	/// `.route(..)` declarations, which is all the tables read here have.
 	fn declared_routes(table_fn: &str) -> Vec<String> {
 		let src = include_str!("profile.rs");
 		let (_, rest) =
@@ -219,59 +213,16 @@ mod tests {
 		routes
 	}
 
-	/// `/api/profiles/batch` must not be swallowed by `/api/profiles/{id_tag}`.
+	/// Pins the declared route sets of `batch()` and `read()`.
 	///
-	/// The two live in different tables under different guards, so a mis-resolve
-	/// would not merely return the wrong body — it would run the batch request
-	/// through `check_perm_profile("read")` with `"batch"` as the subject.
-	///
-	/// Two halves:
-	///
-	/// 1. The declared route sets of `batch()` and `read()`, pinned exactly. That makes
-	///    the replica below a faithful stand-in, and doubles as the guard on the
-	///    scope-agnostic tier's contents — a second route added to `batch()` would
-	///    inherit `require_auth_public_data` without touching `routes/protected.rs`,
-	///    where the tier's inventory test lives.
-	/// 2. Resolution, on a **replica** router carrying the same two path literals — the
-	///    real tables are `Router<App>`, axum can only serve a `Router<()>`, and no test
-	///    harness builds an `App`. Built from hand-written literals, so this half is an
-	///    axum/matchit upgrade canary for static-beats-param, not a test of our routes.
-	#[tokio::test]
-	async fn batch_is_not_shadowed_by_the_id_tag_route() {
-		assert_eq!(declared_routes("batch"), ["get /api/profiles/batch"]);
-		assert_eq!(declared_routes("read"), ["get /api/profiles/{id_tag}"]);
-
-		// Replica: same two literals, param route merged *last* — the harder
-		// ordering for static-first to survive.
-		let app: Router = Router::new()
-			.route("/api/profiles/batch", get(|| async { "batch" }))
-			.merge(Router::new().route("/api/profiles/{id_tag}", get(|| async { "by-id-tag" })));
-
-		for (uri, expected) in [
-			("/api/profiles/batch?idTags=a.example.com", "batch"),
-			("/api/profiles/batch", "batch"),
-			("/api/profiles/alice.example.com", "by-id-tag"),
-		] {
-			let res = app
-				.clone()
-				.oneshot(Request::builder().uri(uri).body(Body::empty()).expect("build request"))
-				.await
-				.expect("router responds");
-			let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.expect("body");
-			assert_eq!(&body[..], expected.as_bytes(), "{uri} resolved to the wrong handler");
-		}
-
-		// Nothing swallows deeper paths under the static segment.
-		let res = app
-			.oneshot(
-				Request::builder()
-					.uri("/api/profiles/batch/extra")
-					.body(Body::empty())
-					.expect("build request"),
-			)
-			.await
-			.expect("router responds");
-		assert_eq!(res.status(), axum::http::StatusCode::NOT_FOUND);
+	/// `batch()` is the sole table on the scope-agnostic `require_auth_public_data` tier: a
+	/// second route added there would inherit that guard without touching
+	/// `routes/protected.rs`, where the tier's inventory test lives. `read()` is pinned so
+	/// the `{idTag}` capture the `check_perm_profile` guard reads by name cannot drift.
+	#[test]
+	fn batch_and_read_route_sets_are_pinned() {
+		assert_eq!(declared_routes("batch"), ["get /api/profile-lookups"]);
+		assert_eq!(declared_routes("read"), ["get /api/profiles/{idTag}"]);
 	}
 }
 

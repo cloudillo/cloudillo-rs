@@ -32,7 +32,7 @@ use std::net::SocketAddr;
 use crate::prelude::*;
 use cloudillo_core::abac::require_tenant_self;
 use cloudillo_core::audit;
-use cloudillo_core::extract::{Auth, IdTag, OptionalAuth, OptionalRequestId};
+use cloudillo_core::extract::{Auth, IdTag, OptionalAuth};
 use cloudillo_core::share_access::{
 	ShareStanding, ensure_grant_within, ensure_standing, require_share_manager, share_standing,
 };
@@ -43,9 +43,7 @@ use cloudillo_types::meta_adapter::{
 	CreateRefOptions, IDP_ACTIVATION_REF_TYPE, ListRefsOptions, PASSWORD_REF_TYPE,
 	REGISTER_REF_TYPE, RefData, SHARE_FILE_REF_TYPE, UpdateRefOptions, WELCOME_REF_TYPE,
 };
-use cloudillo_types::types::{
-	AccessLevel, ApiResponse, serialize_timestamp_iso, serialize_timestamp_iso_opt,
-};
+use cloudillo_types::types::{AccessLevel, ApiResponse, ApiTime, CursorData};
 use cloudillo_types::utils;
 
 /// Which authority an operation on a ref of a given type answers to.
@@ -66,10 +64,10 @@ pub enum RefGate {
 /// base tenant's alone, would lock every other tenant out of its own refs.
 ///
 /// `password`, `welcome` and `idp.activation` are power over the tenant *account* itself
-/// (`POST /api/auth/set-password` accepts a `password` or `welcome` refId), and on a community
+/// (`POST /api/auth/password/set` accepts a `password` or `welcome` refId), and on a community
 /// tenant `leader` is held by ordinary members, who are not the account.
 ///
-/// `profile.invite` is not tenant-scoped at all: `cloudillo_profile::community::put_community_profile`
+/// `profile.invite` is not tenant-scoped at all: `cloudillo_profile::community::post_community`
 /// validates one and then calls `create_tenant`, so redeeming it creates a WHOLE NEW TENANT on this
 /// server. That makes it server-scoped exactly like `register`, and its refId is handed out under the
 /// inviting admin's own `tn_id` — so listing it must answer to `SADM`, not to any tenant's leadership.
@@ -156,26 +154,20 @@ fn parse_access_level(s: &str) -> ClResult<char> {
 /// Response structure for ref details (authenticated users get full data)
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RefResponse {
-	#[serde(rename = "refId")]
+	#[serde(rename = "id")]
 	pub ref_id: String,
 	pub r#type: String,
 	pub description: Option<String>,
-	#[serde(rename = "createdAt", serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	#[serde(
-		rename = "expiresAt",
-		serialize_with = "serialize_timestamp_iso_opt",
-		skip_serializing_if = "Option::is_none"
-	)]
-	pub expires_at: Option<Timestamp>,
+	pub created_at: ApiTime,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub expires_at: Option<ApiTime>,
 	/// Usage count: None = unlimited, Some(n) = n uses remaining
 	pub count: Option<u32>,
 	/// Resource ID for share links (e.g., file_id for share.file type)
-	#[serde(rename = "resourceId")]
 	pub resource_id: Option<String>,
 	/// Access level for share links ("read" or "write")
-	#[serde(rename = "accessLevel")]
 	pub access_level: Option<String>,
 	/// Launch params as serialized query string
 	pub params: Option<String>,
@@ -188,8 +180,9 @@ pub struct RefResponse {
 
 /// Minimal response structure for unauthenticated requests (only refId and type)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RefResponseMinimal {
-	#[serde(rename = "refId")]
+	#[serde(rename = "id")]
 	pub ref_id: String,
 	pub r#type: String,
 }
@@ -218,7 +211,7 @@ impl From<RefData> for RefResponse {
 impl RefResponse {
 	/// Replace the bearer credential with a stable, non-invertible surrogate.
 	///
-	/// Deterministic, so the frontend can keep keying its rows on `refId`; prefixed `r1~` per the
+	/// Deterministic, so the frontend can keep keying its rows on `id`; prefixed `r1~` per the
 	/// content-addressed id convention, and paired with `redacted: true` so no client mistakes it
 	/// for a usable link.
 	pub fn redact(mut self) -> Self {
@@ -236,6 +229,7 @@ impl From<RefData> for RefResponseMinimal {
 
 /// Request structure for creating a new ref
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateRefRequest {
 	/// Type of reference: "share.file", "profile.invite", "password", "welcome",
 	/// "idp.activation" or "register". Gated by [`ref_create_gate`], which admits `share.file`
@@ -244,7 +238,7 @@ pub struct CreateRefRequest {
 	/// Human-readable description
 	pub description: Option<String>,
 	/// Optional expiration as an ISO 8601 timestamp (e.g. `"2026-05-31T00:00:00Z"`)
-	pub expires_at: Option<Timestamp>,
+	pub expires_at: Option<ApiTime>,
 	/// Number of times this ref can be used:
 	/// - Omit field: defaults to 1 (single use)
 	/// - null: unlimited uses
@@ -252,10 +246,8 @@ pub struct CreateRefRequest {
 	#[serde(default)]
 	pub count: Patch<u32>,
 	/// Resource ID for share links (e.g., file_id for share.file type)
-	#[serde(rename = "resourceId")]
 	pub resource_id: Option<String>,
 	/// Access level for share links ("read" or "write", default: "read")
-	#[serde(rename = "accessLevel")]
 	pub access_level: Option<String>,
 	/// Launch params as serialized query string (e.g., "mode=present")
 	pub params: Option<String>,
@@ -263,14 +255,18 @@ pub struct CreateRefRequest {
 
 /// Query parameters for listing refs
 #[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ListRefsQuery {
 	/// Filter by ref type
 	pub r#type: Option<String>,
 	/// Filter by status: 'active', 'used', 'expired', 'all' (default: 'active')
-	pub filter: Option<String>,
+	pub status: Option<String>,
 	/// Filter by resource_id (for listing share links for a specific resource)
-	#[serde(rename = "resourceId")]
 	pub resource_id: Option<String>,
+	/// Opaque cursor from a previous page's `next`
+	pub cursor: Option<String>,
+	/// Page size (default 100, max 500)
+	pub limit: Option<u32>,
 }
 
 // Re-export service types for backward compatibility
@@ -297,17 +293,26 @@ pub async fn list_refs(
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
 	Query(query_params): Query<ListRefsQuery>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<RefResponse>>>)> {
 	info!(
 		tn_id = ?tn_id,
 		r#type = ?query_params.r#type,
-		filter = ?query_params.filter,
+		status = ?query_params.status,
 		resource_id = ?query_params.resource_id,
 		"GET /api/refs - Listing refs"
 	);
 
 	reject_scoped(&auth)?;
+	let limit = query_params.limit.unwrap_or(100).clamp(1, 500);
+	let after = match query_params.cursor.as_deref() {
+		None => None,
+		Some(c) => Some(
+			CursorData::decode(c)
+				.filter(|c| c.s == "ref")
+				.ok_or_else(|| Error::ValidationError("invalid cursor".into()))?
+				.id,
+		),
+	};
 
 	let mut redact = false;
 	// Share links are keyed by the placement's `entry_id`, whatever id the caller named.
@@ -334,11 +339,22 @@ pub async fn list_refs(
 
 	let opts = ListRefsOptions {
 		typ: query_params.r#type,
-		filter: query_params.filter.or(Some("active".to_string())),
+		filter: query_params.status.or(Some("active".to_string())),
 		resource_id: list_resource_id,
+		// One extra row tells whether another page exists
+		limit: Some(limit + 1),
+		after,
 	};
 
-	let refs = app.meta_adapter.list_refs(tn_id, &opts).await?;
+	let mut refs = app.meta_adapter.list_refs(tn_id, &opts).await?;
+	// From the raw rows: a redacted response no longer carries the real `ref_id`.
+	let next = if refs.len() > limit as usize {
+		refs.truncate(limit as usize);
+		refs.last()
+			.map(|r| CursorData::new("ref", serde_json::Value::Null, &r.ref_id).encode())
+	} else {
+		None
+	};
 
 	let response_data: Vec<RefResponse> = refs
 		.into_iter()
@@ -346,11 +362,7 @@ pub async fn list_refs(
 		.map(|r| if redact { r.redact() } else { r })
 		.collect();
 
-	let total = response_data.len();
-	let mut response = ApiResponse::with_pagination(response_data, 0, total, total);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::with_next(response_data, next);
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -368,7 +380,6 @@ pub async fn create_ref(
 	tn_id: TnId,
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(create_req): Json<CreateRefRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<RefResponse>>)> {
 	info!(
@@ -466,7 +477,7 @@ pub async fn create_ref(
 	let opts = CreateRefOptions {
 		typ: create_req.r#type.clone(),
 		description: create_req.description.clone(),
-		expires_at: create_req.expires_at,
+		expires_at: create_req.expires_at.map(Into::into),
 		count,
 		resource_id: stored_resource_id,
 		access_level: access_level_char,
@@ -495,15 +506,12 @@ pub async fn create_ref(
 	}
 
 	let response_data = RefResponse::from(ref_data);
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(response_data);
 
 	Ok((StatusCode::CREATED, Json(response)))
 }
 
-/// GET /api/refs/{ref_id} - Get a specific ref by ID
+/// GET /api/refs/{id} - Get a specific ref by ID
 ///
 /// Returns full ref details if authenticated, only refId and type if not authenticated.
 #[axum::debug_handler]
@@ -512,7 +520,6 @@ pub async fn get_ref(
 	tn_id: TnId,
 	OptionalAuth(auth): OptionalAuth,
 	Path(ref_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
 	let is_authenticated = auth.is_some();
 
@@ -529,25 +536,19 @@ pub async fn get_ref(
 	let response_value = if is_authenticated {
 		// Authenticated: return full details
 		let response_data = RefResponse::from(ref_data);
-		let mut response = ApiResponse::new(response_data);
-		if let Some(id) = req_id {
-			response = response.with_req_id(id);
-		}
+		let response = ApiResponse::new(response_data);
 		serde_json::to_value(response)?
 	} else {
 		// Unauthenticated: return only refId and type
 		let response_data = RefResponseMinimal::from(ref_data);
-		let mut response = ApiResponse::new(response_data);
-		if let Some(id) = req_id {
-			response = response.with_req_id(id);
-		}
+		let response = ApiResponse::new(response_data);
 		serde_json::to_value(response)?
 	};
 
 	Ok((StatusCode::OK, Json(response_value)))
 }
 
-/// DELETE /api/refs/{ref_id} - Delete/revoke a ref
+/// DELETE /api/refs/{id} - Delete/revoke a ref
 ///
 /// Revoking is as privileged as minting: ungated, any authenticated caller could kill anyone's
 /// share link or any pending invite / password reset on the tenant. Gated on the existing ref's
@@ -559,8 +560,7 @@ pub async fn delete_ref(
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
 	Path(ref_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	info!(
 		tn_id = ?tn_id,
 		ref_id = %ref_id,
@@ -608,32 +608,28 @@ pub async fn delete_ref(
 		e
 	})?;
 
-	let mut response = ApiResponse::new(());
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
-
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
-/// Request body for PATCH /api/refs/{ref_id}.
+/// Request body for PATCH /api/refs/{id}.
 ///
 /// Each field uses `Patch<T>` semantics: omitted = leave unchanged,
 /// explicit `null` = clear, value = set.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateRefRequest {
 	#[serde(default)]
 	pub description: Patch<String>,
 	/// Expiration as an ISO 8601 timestamp string. Use `null` to clear.
-	#[serde(rename = "expiresAt", default)]
-	pub expires_at: Patch<Timestamp>,
+	#[serde(default)]
+	pub expires_at: Patch<ApiTime>,
 	#[serde(default)]
 	pub count: Patch<u32>,
-	#[serde(rename = "accessLevel", default)]
+	#[serde(default)]
 	pub access_level: Patch<String>,
 }
 
-/// PATCH /api/refs/{ref_id} - Update fields of an existing ref in place.
+/// PATCH /api/refs/{id} - Update fields of an existing ref in place.
 #[axum::debug_handler]
 pub async fn update_ref(
 	State(app): State<App>,
@@ -641,7 +637,6 @@ pub async fn update_ref(
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
 	Path(ref_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<UpdateRefRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<RefResponse>>)> {
 	info!(
@@ -659,7 +654,7 @@ pub async fn update_ref(
 
 	// PATCH is only meaningful for these two; every other type is immutable once minted. Checked
 	// before the type gate so an unsupported type answers 400 rather than 403 — safe, since the
-	// caller already holds the refId and `GET /api/refs/{ref_id}` discloses the type anyway.
+	// caller already holds the refId and `GET /api/refs/{id}` discloses the type anyway.
 	if !matches!(existing.r#type.as_ref(), SHARE_FILE_REF_TYPE | REGISTER_REF_TYPE) {
 		return Err(Error::ValidationError(format!(
 			"PATCH is not supported for refs of type {}",
@@ -766,7 +761,7 @@ pub async fn update_ref(
 
 	let update_opts = UpdateRefOptions {
 		description: req.description,
-		expires_at: req.expires_at,
+		expires_at: req.expires_at.map(Into::into),
 		count: req.count,
 		access_level: access_level_patch,
 	};
@@ -777,10 +772,7 @@ pub async fn update_ref(
 	})?;
 
 	let response_data = RefResponse::from(updated);
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(response_data);
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -832,7 +824,7 @@ mod tests {
 
 	#[test]
 	fn account_scoped_types_answer_to_the_tenant_itself_for_listing_and_revocation() {
-		// Holding one of these IS the account: `POST /api/auth/set-password` accepts a `password`
+		// Holding one of these IS the account: `POST /api/auth/password/set` accepts a `password`
 		// or `welcome` refId, and `idp.activation` activates its identity. On a community tenant
 		// `leader` is held by ordinary members, so leader standing must not reach them. Listing and
 		// revoking only — MINTING is SADM-only.
@@ -843,7 +835,7 @@ mod tests {
 
 	#[test]
 	fn profile_invite_is_server_scoped() {
-		// Not a membership token: `cloudillo_profile::community::put_community_profile` validates a
+		// Not a membership token: `cloudillo_profile::community::post_community` validates a
 		// `profile.invite` ref and then calls `create_tenant`, so the refId buys a NEW TENANT — the
 		// very thing `register` is SADM-gated to prevent. Listing returns `ref_id` verbatim, so a
 		// leader-level gate here would hand any community leader a tenant-creating credential.
@@ -921,7 +913,7 @@ mod tests {
 	#[test]
 	fn a_community_leader_cannot_mint_a_password_ref_for_the_community() {
 		// `leader` is granted to ordinary member profiles on a community tenant, so if `password`
-		// answered to leadership any member could mint one, POST it to /api/auth/set-password and
+		// answered to leadership any member could mint one, POST it to /api/auth/password/set and
 		// take over the community account.
 		let member_leader = auth_as(MEMBER, &["leader"], None);
 		assert!(denied(&require_tenant_self(&member_leader, TENANT, "create ref")));
@@ -984,7 +976,7 @@ mod tests {
 			ref_id: ref_id.to_string(),
 			r#type: SHARE_FILE_REF_TYPE.to_string(),
 			description: None,
-			created_at: Timestamp(0),
+			created_at: ApiTime(0),
 			expires_at: None,
 			count: None,
 			resource_id: Some("f1~doc".to_string()),
@@ -1018,7 +1010,7 @@ mod tests {
 				ref_id: "secret-ref-id".into(),
 				r#type: SHARE_FILE_REF_TYPE.into(),
 				description: None,
-				created_at: Timestamp(0),
+				created_at: ApiTime(0),
 				expires_at: None,
 				count: None,
 				resource_id: Some("f1~doc".into()),

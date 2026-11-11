@@ -10,8 +10,7 @@
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
-use cloudillo_core::prelude::*;
-use cloudillo_types::types::serialize_timestamp_iso;
+use cloudillo_types::types::{ApiTime, Patch};
 
 // Structured sub-types
 //**********************
@@ -51,7 +50,8 @@ pub struct Alarm {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CalendarOutput {
-	pub cal_id: u64,
+	#[serde(rename = "id")]
+	pub cal_id: String,
 	pub name: String,
 	pub description: Option<String>,
 	pub color: Option<String>,
@@ -59,10 +59,8 @@ pub struct CalendarOutput {
 	/// CSV of supported components, e.g. `"VEVENT,VTODO"`.
 	pub components: String,
 	pub ctag: String,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub updated_at: Timestamp,
+	pub created_at: ApiTime,
+	pub updated_at: ApiTime,
 }
 
 #[skip_serializing_none]
@@ -168,8 +166,11 @@ pub struct TodoInput {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CalendarObjectPatch {
-	pub event: Option<EventPatch>,
-	pub todo: Option<TodoPatch>,
+	/// Neither component can be cleared: `null` is refused.
+	#[serde(default)]
+	pub event: Patch<EventPatch>,
+	#[serde(default)]
+	pub todo: Patch<TodoPatch>,
 }
 
 #[skip_serializing_none]
@@ -217,8 +218,9 @@ pub struct TodoPatch {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CalendarObjectOutput {
-	pub co_id: u64,
-	pub cal_id: u64,
+	#[serde(rename = "id")]
+	pub co_id: String,
+	pub cal_id: String,
 	pub uid: String,
 	pub etag: String,
 	/// `VEVENT` or `VTODO`.
@@ -240,10 +242,8 @@ pub struct CalendarObjectOutput {
 	pub exdate: Option<Vec<String>>,
 	/// Present when the stored iCalendar blob could not be parsed.
 	pub parse_error: Option<String>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub updated_at: Timestamp,
+	pub created_at: ApiTime,
+	pub updated_at: ApiTime,
 }
 
 /// Summary row for list endpoints.
@@ -251,8 +251,9 @@ pub struct CalendarObjectOutput {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CalendarObjectListItem {
-	pub co_id: u64,
-	pub cal_id: u64,
+	#[serde(rename = "id")]
+	pub co_id: String,
+	pub cal_id: String,
 	pub uid: String,
 	pub etag: String,
 	pub component: String,
@@ -268,8 +269,7 @@ pub struct CalendarObjectListItem {
 	pub recurrence_id: Option<String>,
 	/// `EXDATE` list (ISO-8601) on masters; `None` when absent.
 	pub exdate: Option<Vec<String>>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub updated_at: Timestamp,
+	pub updated_at: ApiTime,
 }
 
 // Recurring-series split
@@ -325,11 +325,11 @@ pub struct ListObjectsQuery {
 	pub end: Option<String>,
 	pub cursor: Option<String>,
 	pub limit: Option<u32>,
-	/// When true, the response includes recurrence-override rows (each with a `RECURRENCE-ID`)
-	/// alongside the master. Clients that expand recurrence locally need these to overlay
-	/// the right occurrences.
-	#[serde(default)]
-	pub include_exceptions: bool,
+	/// Expansions, comma-separated. `include=exceptions` adds recurrence-override rows (each
+	/// with a `RECURRENCE-ID`) alongside the master. Clients that expand recurrence locally
+	/// need these to overlay the right occurrences.
+	#[serde(default, deserialize_with = "cloudillo_types::meta_adapter::deserialize_split")]
+	pub include: Option<Vec<String>>,
 }
 
 // vim: ts=4

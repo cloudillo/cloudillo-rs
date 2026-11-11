@@ -209,6 +209,9 @@ fn post_definition() -> ActionDefinition {
 			map.insert("TEXT".to_string(), "Text post".to_string());
 			map.insert("IMG".to_string(), "Image post".to_string());
 			map.insert("VID".to_string(), "Video post".to_string());
+			// The web client sends VIDEO/DOC (feed/ComposePanel.tsx)
+			map.insert("VIDEO".to_string(), "Video post".to_string());
+			map.insert("DOC".to_string(), "Document post".to_string());
 			map.insert("DEL".to_string(), "Delete post".to_string());
 			map.insert("LDOC".to_string(), "Live document post".to_string());
 			map
@@ -560,6 +563,7 @@ fn comment_definition() -> ActionDefinition {
 		subtypes: Some({
 			let mut map = HashMap::new();
 			map.insert("DEL".to_string(), "Delete comment".to_string());
+			map.insert("UPD".to_string(), "Edit comment".to_string());
 			map
 		}),
 		fields: FieldConstraints {
@@ -631,6 +635,10 @@ fn message_definition() -> ActionDefinition {
 			let mut map = HashMap::new();
 			map.insert("DEL".to_string(), "Delete message".to_string());
 			map.insert("UPD".to_string(), "Edit message".to_string());
+			// Sent by the web client; the hook treats any non-DEL/UPD as a new message
+			map.insert("TEXT".to_string(), "Text message".to_string());
+			map.insert("IMG".to_string(), "Image message".to_string());
+			map.insert("FILE".to_string(), "File message".to_string());
 			map
 		}),
 		fields: FieldConstraints {
@@ -1122,6 +1130,8 @@ fn subs_definition() -> ActionDefinition {
 				"Update subscription (role change, preferences)".to_string(),
 			);
 			map.insert("DEL".to_string(), "Unsubscribe / leave".to_string());
+			// Has its own `SUBS:ROLE` definition; listed for consistency
+			map.insert("ROLE".to_string(), "Change a subscriber's role".to_string());
 			map
 		}),
 		fields: FieldConstraints {

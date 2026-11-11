@@ -10,11 +10,7 @@ use std::fmt::Debug;
 
 use std::collections::HashMap;
 
-use crate::{
-	action_types,
-	prelude::*,
-	types::{serialize_timestamp_iso, serialize_timestamp_iso_opt},
-};
+use crate::{action_types, prelude::*, types::ApiTime};
 
 pub const ACCESS_TOKEN_EXPIRY: i64 = 3600;
 
@@ -70,6 +66,10 @@ pub struct ActionToken {
 	/// Nonce - Proof-of-work nonce for rate limiting (CONN actions only).
 	#[serde(rename = "_", default, skip_serializing_if = "Option::is_none")]
 	pub nonce: Option<Box<str>>,
+
+	/// Critical - names the receiver must understand, or refuse the action (max 16).
+	/// A content field name, `$<claim>` (a wire name of this struct) or `$f:<flag char>`.
+	pub crit: Option<Vec<Box<str>>>,
 }
 
 /// Access tokens are used to authenticate users
@@ -105,11 +105,11 @@ pub struct AuthKey {
 	pub key_id: Box<str>,
 	#[serde(rename = "publicKey")]
 	pub public_key: Box<str>,
-	#[serde(rename = "expiresAt", serialize_with = "serialize_timestamp_iso_opt")]
-	pub expires_at: Option<Timestamp>,
+	#[serde(rename = "expiresAt")]
+	pub expires_at: Option<ApiTime>,
 }
 
-/// A profile signing key as the owner sees it (`GET /api/auth/keys`); never public.
+/// A profile signing key as the owner sees it (`GET /api/auth/signing-keys`); never public.
 ///
 /// `status`: `'A'` active (signs; legacy NULL rows read as `'A'`), `'V'` verify-only
 /// (published, no longer signs), `'R'` revoked (not published).
@@ -118,11 +118,11 @@ pub struct AuthKey {
 #[serde(rename_all = "camelCase")]
 pub struct KeyInfo {
 	pub key_id: Box<str>,
+	/// Wire word `active` / `verifyOnly` / `revoked` (`api_enums::key_status`).
+	#[serde(with = "crate::api_enums::key_status")]
 	pub status: char,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
-	pub expires_at: Option<Timestamp>,
+	pub created_at: ApiTime,
+	pub expires_at: Option<ApiTime>,
 }
 
 /// Represents an auth profile.
@@ -239,13 +239,10 @@ pub struct TenantListItem {
 	pub roles: Option<Box<[Box<str>]>>,
 	pub status: Option<Box<str>>,
 	/// Set while an admin has suspended the tenant (login refused)
-	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
-	pub suspended_at: Option<Timestamp>,
+	pub suspended_at: Option<ApiTime>,
 	/// Account expiry; login refused once reached
-	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
-	pub expires_at: Option<Timestamp>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
+	pub expires_at: Option<ApiTime>,
+	pub created_at: ApiTime,
 }
 
 /// Options for listing tenants
@@ -294,8 +291,7 @@ impl AuditCategory {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditEvent {
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub ts: Timestamp,
+	pub ts: ApiTime,
 	pub tn_id: Option<TnId>,
 	pub actor: Option<Box<str>>,
 	pub event: Box<str>,
@@ -312,7 +308,7 @@ impl AuditEvent {
 	/// `outcome` is `"success"` or `"fail"`.
 	pub fn new(category: AuditCategory, event: &str, outcome: &str) -> Self {
 		Self {
-			ts: Timestamp::now(),
+			ts: ApiTime::now(),
 			tn_id: None,
 			actor: None,
 			event: event.into(),
@@ -386,12 +382,9 @@ pub struct ApiKeyInfo {
 	pub key_prefix: Box<str>,
 	pub name: Option<Box<str>>,
 	pub scopes: Option<Box<str>>,
-	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
-	pub expires_at: Option<Timestamp>,
-	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
-	pub last_used_at: Option<Timestamp>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
+	pub expires_at: Option<ApiTime>,
+	pub last_used_at: Option<ApiTime>,
+	pub created_at: ApiTime,
 }
 
 /// Options for creating an API key
@@ -456,14 +449,11 @@ pub struct ProxySiteData {
 	pub cert: Option<Box<str>>,
 	#[serde(skip_serializing)]
 	pub cert_key: Option<Box<str>>,
-	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
-	pub cert_expires_at: Option<Timestamp>,
+	pub cert_expires_at: Option<ApiTime>,
 	pub config: ProxySiteConfig,
 	pub created_by: Option<i64>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub updated_at: Timestamp,
+	pub created_at: ApiTime,
+	pub updated_at: ApiTime,
 }
 
 /// Data needed to create a new proxy site
@@ -582,7 +572,7 @@ pub trait AuthAdapter: Debug + Send + Sync {
 	async fn update_tenant_status(&self, tn_id: TnId, status: char) -> ClResult<()>;
 
 	/// Admin suspension, independent of `status`. `true` stamps `suspended_at`; `false`
-	/// (resume) clears both `suspended_at` and `expires_at`. Login, login-token refresh and
+	/// (resume) clears both `suspended_at` and `expires_at`. Login, session renew and
 	/// API-key exchange are refused while suspended; issued access tokens run out (<= 1 h).
 	async fn set_tenant_suspended(&self, tn_id: TnId, suspended: bool) -> ClResult<()>;
 

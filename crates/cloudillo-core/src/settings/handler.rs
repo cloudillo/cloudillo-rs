@@ -7,13 +7,12 @@ use axum::{
 	Json,
 	extract::{ConnectInfo, Path, Query, State},
 	http::StatusCode,
-	response::{IntoResponse, Response},
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
 
 use crate::{
-	extract::{Auth, OptionalRequestId},
+	extract::Auth,
 	prelude::*,
 	settings::types::{PermissionLevel, SettingDefinition, SettingScope, SettingValue},
 };
@@ -50,17 +49,19 @@ impl SettingResponse {
 
 /// Query parameters for listing settings
 #[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ListSettingsQuery {
 	/// Comma-separated list of key prefixes (e.g., "file,limits").
 	/// Each prefix is matched as `<prefix>.%` against stored setting names.
-	pub prefix: Option<String>,
+	#[serde(default, deserialize_with = "cloudillo_types::meta_adapter::deserialize_split")]
+	pub prefix: Option<Vec<String>>,
 	/// Resolution level — mirrors GET /settings/:name:
 	///   - omitted: full resolution chain (tenant overrides global).
 	///   - "global": raw rows from `SHARED_TN` only.
-	///   - "tenant": raw rows from the caller's (or `tenant=` target's) tenant only.
+	///   - "tenant": raw rows from the caller's own tenant only.
+	///
+	/// There is no tenant parameter: settings act on the caller's own tenant only.
 	pub level: Option<String>,
-	/// SADM-only: target tenant idTag for cross-tenant reads. Only meaningful with level=tenant.
-	pub tenant: Option<String>,
 }
 
 /// Settings are read with the standing that writes them (`PermissionLevel::User`): the
@@ -81,7 +82,6 @@ pub async fn list_settings(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Query(query): Query<ListSettingsQuery>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<SettingResponse>>>)> {
 	require_settings_reader(&auth)?;
 	let mut settings_response = Vec::new();
@@ -93,23 +93,8 @@ pub async fn list_settings(
 		return Err(Error::ValidationError("level requires prefix".into()));
 	}
 
-	if let Some(ref prefix) = query.prefix {
-		// Split the comma-joined prefix list, trim, drop empties.
-		let prefixes: Vec<String> = prefix
-			.split(',')
-			.map(|s| s.trim().to_string())
-			.filter(|s| !s.is_empty())
-			.collect();
-
-		// `tenant=` is meaningless with `level=global` (the global row is shared
-		// across all tenants). Reject explicitly rather than silently ignore, to
-		// match the documented intent on `SettingScopeQuery`.
-		if matches!(query.level.as_deref(), Some("global")) && query.tenant.is_some() {
-			return Err(Error::ValidationError("tenant= is not allowed with level=global".into()));
-		}
-
-		// Resolve target tenant (SADM-only when `tenant=` is supplied).
-		let target_tn_id = resolve_target_tn_id(&app, &auth, query.tenant.as_deref()).await?;
+	if let Some(prefixes) = query.prefix {
+		let target_tn_id = auth.tn_id;
 
 		let rows = match query.level.as_deref() {
 			Some("global") => {
@@ -157,9 +142,7 @@ pub async fn list_settings(
 		}
 	}
 
-	let total = settings_response.len();
-	let response = ApiResponse::with_pagination(settings_response, 0, 100, total)
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(settings_response);
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -173,39 +156,12 @@ pub async fn list_settings(
 ///   selection.
 /// - DELETE: omitted is **rejected** (ambiguous); `tenant`/`global` required.
 ///
-/// `tenant` is SADM-only and addresses a different tenant's row by id_tag.
-/// It is meaningless (and ignored) when `level=global`, since the global row
-/// is shared across all tenants.
+/// There is no tenant parameter: every handler acts on the caller's own tenant
+/// (`auth.tn_id`), or on the shared global row under `level=global`.
 #[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct SettingScopeQuery {
 	pub level: Option<String>,
-	pub tenant: Option<String>,
-}
-
-/// Resolve the effective tenant id for a settings operation.
-///
-/// When `target` is `None`, the caller acts on their own tenant — return
-/// `auth.tn_id` directly. When `target` is `Some(id_tag)`, the caller is
-/// requesting cross-tenant access; require SADM and look up the target's
-/// `tn_id` via the auth adapter.
-async fn resolve_target_tn_id(
-	app: &App,
-	auth: &cloudillo_types::auth_adapter::AuthCtx,
-	target: Option<&str>,
-) -> ClResult<TnId> {
-	match target {
-		None => Ok(auth.tn_id),
-		Some(id_tag) => {
-			// Acting on behalf of another tenant is SADM-only. We require this
-			// even when `id_tag == auth.id_tag` so the audit trail is honest:
-			// a non-SADM admin should hit "permission denied", not silently
-			// have their explicit `tenant=self` collapse to the implicit path.
-			if !crate::abac::is_admin(auth) {
-				return Err(Error::PermissionDenied);
-			}
-			app.auth_adapter.read_tn_id(id_tag).await.map_err(|_| Error::NotFound)
-		}
-	}
 }
 
 /// GET /settings/:name - Get a specific setting with metadata
@@ -214,13 +170,12 @@ pub async fn get_setting(
 	Auth(auth): Auth,
 	Path(name): Path<String>,
 	Query(query): Query<SettingScopeQuery>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SettingResponse>>)> {
 	// Get setting definition (supports wildcard patterns like "ui.*")
 	let definition = app.settings_registry.get(&name);
 	// `readable_by_all` keys (instance-wide UI config) are readable by any unscoped
 	// authenticated caller; scoped tokens stay denied (`scope_permits` already refuses them).
-	// `tenant=` and `level=global` below keep their own SADM gates. Unknown keys fall
+	// `level=global` below keeps its own SADM gate. Unknown keys fall
 	// through to the reader check so they answer 403, not 404, to non-readers.
 	if !(auth.scope.is_none() && definition.is_some_and(|d| d.readable_by_all)) {
 		require_settings_reader(&auth)?;
@@ -236,16 +191,14 @@ pub async fn get_setting(
 	//   row is the default everyone resolves through anyway).
 	// - DELETE level=global is SADM-only regardless of scope (clearing the
 	//   global default affects every tenant — see `delete_setting`).
-	// Resolve target tenant if `tenant=` was supplied (SADM-only).
-	let target_tn_id = resolve_target_tn_id(&app, &auth, query.tenant.as_deref()).await?;
+	let target_tn_id = auth.tn_id;
 
 	let value = match query.level.as_deref() {
 		Some("global") => {
 			// Reading the raw global row for a Global-scoped key requires SADM:
 			// regular tenant admins must not see (or rely on) cross-tenant
 			// instance state. Tenant-scoped keys at level=global are allowed —
-			// the global row is just the default for everyone. (`tenant=` is
-			// meaningless here; the global row is shared.)
+			// the global row is just the default for everyone.
 			if definition.scope == SettingScope::Global
 				&& !auth.roles.iter().any(|r| r.as_ref() == "SADM")
 			{
@@ -264,7 +217,7 @@ pub async fn get_setting(
 
 	let response_data = SettingResponse::new(definition.key.clone(), value, definition);
 
-	let response = ApiResponse::new(response_data).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(response_data);
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -282,7 +235,6 @@ pub async fn update_setting(
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Path(name): Path<String>,
 	Query(query): Query<SettingScopeQuery>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<UpdateSettingRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SettingResponse>>)> {
 	// Get setting definition for validation and permission check
@@ -300,10 +252,7 @@ pub async fn update_setting(
 	}
 
 	// Resolve the storage row from the explicit `level=` query, mirroring
-	// `delete_setting`. For `level=global` the row is shared and `tenant=` is
-	// meaningless — skip the cross-tenant lookup entirely so a stray
-	// `tenant=` doesn't trigger a SADM-already-required adapter call whose
-	// result is then ignored.
+	// `delete_setting`: the shared global row, or the caller's own tenant.
 	let target_tn_id = match query.level.as_deref() {
 		Some("global") => {
 			// Writing the shared global row is SADM-only regardless of
@@ -315,7 +264,6 @@ pub async fn update_setting(
 			SHARED_TN
 		}
 		Some("tenant") | None => {
-			let acting_tn_id = resolve_target_tn_id(&app, &auth, query.tenant.as_deref()).await?;
 			// Global-scoped keys have no per-tenant override row — same
 			// rationale as `delete_setting`'s guard.
 			if query.level.as_deref() == Some("tenant") && definition.scope == SettingScope::Global
@@ -324,7 +272,7 @@ pub async fn update_setting(
 					"level=tenant is not valid for Global-scoped setting; use level=global".into(),
 				));
 			}
-			acting_tn_id
+			auth.tn_id
 		}
 		Some(other) => {
 			return Err(Error::ValidationError(format!("unknown level: {}", other)));
@@ -350,7 +298,7 @@ pub async fn update_setting(
 
 	let response_data = SettingResponse::new(definition.key.clone(), value, definition);
 
-	let response = ApiResponse::new(response_data).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(response_data);
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -425,7 +373,7 @@ pub async fn delete_setting(
 					"level=tenant is not valid for Global-scoped setting; use level=global".into(),
 				));
 			}
-			resolve_target_tn_id(&app, &auth, query.tenant.as_deref()).await?
+			auth.tn_id
 		}
 		Some("global") => {
 			// Clearing the raw global row at level=global requires SADM
@@ -434,8 +382,6 @@ pub async fn delete_setting(
 			// keys, `(Tenant, 0)` would silently clear the global default
 			// row that every tenant resolves through — a cross-tenant
 			// privilege escalation. Guard unconditionally at the handler.
-			// `tenant=` is meaningless against the shared global row, so
-			// skip the cross-tenant resolution entirely.
 			if !auth.roles.iter().any(|r| r.as_ref() == "SADM") {
 				return Err(Error::PermissionDenied);
 			}
@@ -510,9 +456,11 @@ pub fn may_access_profile_settings(auth: &AuthCtx, id_tag: &str) -> bool {
 
 /// Query parameters for listing profile settings
 #[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ListProfileSettingsQuery {
 	/// Comma-separated list of name prefixes, each matched as `<prefix>%`.
-	pub prefix: Option<String>,
+	#[serde(default, deserialize_with = "cloudillo_types::meta_adapter::deserialize_split")]
+	pub prefix: Option<Vec<String>>,
 }
 
 /// GET /api/profiles/{id_tag}/settings — all of `{id_tag}`'s settings
@@ -521,7 +469,6 @@ pub async fn list_profile_settings(
 	Auth(auth): Auth,
 	Path(id_tag): Path<String>,
 	Query(query): Query<ListProfileSettingsQuery>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<std::collections::HashMap<String, serde_json::Value>>>)>
 {
 	// The boundary: a URL path segment is untrusted external input becoming a lookup key,
@@ -534,14 +481,12 @@ pub async fn list_profile_settings(
 		return Err(Error::PermissionDenied);
 	}
 
-	let prefixes: Option<Vec<String>> =
-		query.prefix.map(|p| p.split(',').map(str::to_string).collect());
 	let settings = app
 		.meta_adapter
-		.list_profile_settings(auth.tn_id, &id_tag, prefixes.as_deref())
+		.list_profile_settings(auth.tn_id, &id_tag, query.prefix.as_deref())
 		.await?;
 
-	Ok((StatusCode::OK, Json(ApiResponse::new(settings).with_req_id(req_id.unwrap_or_default()))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(settings))))
 }
 
 /// GET /api/profiles/{id_tag}/settings/{name}
@@ -549,7 +494,6 @@ pub async fn get_profile_setting(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Path((id_tag, name)): Path<(String, String)>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	// Canonicalize at the boundary; see `list_profile_settings`.
 	let id_tag = normalize_id_tag(&id_tag).into_owned();
@@ -564,7 +508,7 @@ pub async fn get_profile_setting(
 		.await?
 		.ok_or(Error::NotFound)?;
 
-	Ok((StatusCode::OK, Json(ApiResponse::new(value).with_req_id(req_id.unwrap_or_default()))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(value))))
 }
 
 #[derive(Deserialize)]
@@ -603,14 +547,14 @@ fn check_profile_setting_name_and_size(name: &str, value: &serde_json::Value) ->
 /// PUT /api/profiles/{id_tag}/settings/{name}
 ///
 /// A `{"value": null}` body removes the row (the DELETE method is not offered for this
-/// endpoint — removal is expressed as PUT with a null value).
+/// endpoint — removal is expressed as PUT with a null value). 200 + the effective value either
+/// way; profile settings have no registry default, so after a removal that is `null`.
 pub async fn put_profile_setting(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Path((id_tag, name)): Path<(String, String)>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<UpdateProfileSettingRequest>,
-) -> ClResult<Response> {
+) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	// Canonicalize at the boundary; see `list_profile_settings`.
 	let id_tag = normalize_id_tag(&id_tag).into_owned();
 
@@ -621,19 +565,12 @@ pub async fn put_profile_setting(
 	// After the access check, so an unauthorised caller cannot probe the limits.
 	check_profile_setting_name_and_size(&name, &req.value)?;
 
-	if req.value.is_null() {
-		app.meta_adapter
-			.update_profile_setting(auth.tn_id, &id_tag, &name, None)
-			.await?;
-		return Ok(StatusCode::NO_CONTENT.into_response());
-	}
-
+	let value = (!req.value.is_null()).then(|| req.value.clone());
 	app.meta_adapter
-		.update_profile_setting(auth.tn_id, &id_tag, &name, Some(req.value.clone()))
+		.update_profile_setting(auth.tn_id, &id_tag, &name, value)
 		.await?;
 
-	Ok((StatusCode::OK, Json(ApiResponse::new(req.value).with_req_id(req_id.unwrap_or_default())))
-		.into_response())
+	Ok((StatusCode::OK, Json(ApiResponse::new(req.value))))
 }
 
 #[cfg(test)]

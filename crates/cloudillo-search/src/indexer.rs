@@ -240,7 +240,7 @@ pub async fn index_document(app: &App, tn_id: TnId, file_id: &str) -> ClResult<(
 				// token can prefilter them in SQL. A standalone document is its
 				// own root (its content `file_id`, whatever id the caller named).
 				root_id: Some(file.root_id.as_deref().unwrap_or(file.index_id())),
-				created_at: Some(file.created_at),
+				created_at: Some(file.created_at.into()),
 				fts_cl,
 			},
 			&parts.iter().map(BuiltPart::as_search_part).collect::<Vec<_>>(),

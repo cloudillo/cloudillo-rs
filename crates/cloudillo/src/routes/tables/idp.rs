@@ -13,15 +13,15 @@
 //! | Path | GET | POST | PUT | PATCH | DELETE |
 //! |---|---|---|---|---|---|
 //! | `/api/idp/identities`                          | `management()` ᴱ | `management()` ᴱ | | | |
-//! | `/api/idp/identities/{identity_id}`            | `management()` ᴱ | | | `management()` ᴱ | `management()` ᴱ |
-//! | `/api/idp/identities/{identity_id}/address`    | | | `management()` ᴱ | | |
-//! | `/api/idp/identities/{identity_id}/status`     | `management()` ᴱ | | | | |
-//! | `/api/idp/identities/{identity_id}/resend`     | | `management()` ᴱ | | | |
+//! | `/api/idp/identities/{id}`                     | `management()` ᴱ | | | `management()` ᴱ | `management()` ᴱ |
+//! | `/api/idp/identities/{id}/address`             | | | | `management()` ᴱ | |
+//! | `/api/idp/identities/{id}/status`              | `management()` ᴱ | | | | |
+//! | `/api/idp/identities/{id}/resend`              | | `management()` ᴱ | | | |
 //! | `/api/idp/api-keys`                            | `api_keys()` ᴱ | `api_keys()` ᴱ | | | |
-//! | `/api/idp/api-keys/{api_key_id}`               | `api_keys()` ᴱ | | | | `api_keys()` ᴱ |
+//! | `/api/idp/api-keys/{id}`                       | `api_keys()` ᴱ | | | | `api_keys()` ᴱ |
 //! | `/api/idp/info`                                | `public_discovery()` ᴳ | | | | |
-//! | `/api/idp/check-availability`                  | `public_discovery()` ᴳ | | | | |
-//! | `/api/idp/activate`                            | | `public_discovery()` ᴳ | | | |
+//! | `/api/idp/availability`                        | `public_discovery()` ᴳ | | | | |
+//! | `/api/idp/activations`                         | | `public_discovery()` ᴳ | | | |
 //!
 //! ᴳ public + rate-limited only (the `"general"` bucket), ᴱ `require_auth` only,
 //! handler self-enforces. The guard on each fn is in `routes/protected.rs` /
@@ -29,7 +29,7 @@
 
 use axum::{
 	Router,
-	routing::{get, post, put},
+	routing::{get, patch, post},
 };
 
 use crate::idp::api_keys as idp_api_keys;
@@ -46,17 +46,14 @@ pub(crate) fn management() -> Router<App> {
 	Router::new()
 		.route("/api/idp/identities", get(handler::list_identities).post(handler::create_identity))
 		.route(
-			"/api/idp/identities/{identity_id}",
+			"/api/idp/identities/{id}",
 			get(handler::get_identity_by_id)
 				.delete(handler::delete_identity)
 				.patch(handler::update_identity_settings),
 		)
-		.route("/api/idp/identities/{identity_id}/address", put(handler::update_identity_address))
-		.route("/api/idp/identities/{identity_id}/status", get(handler::get_identity_status))
-		.route(
-			"/api/idp/identities/{identity_id}/resend",
-			post(handler::resend_identity_activation),
-		)
+		.route("/api/idp/identities/{id}/address", patch(handler::update_identity_address))
+		.route("/api/idp/identities/{id}/status", get(handler::get_identity_status))
+		.route("/api/idp/identities/{id}/resend", post(handler::resend_identity_activation))
 }
 
 /// IDP API key management — authentication only; the handlers self-enforce
@@ -68,7 +65,7 @@ pub(crate) fn api_keys() -> Router<App> {
 			post(idp_api_keys::create_api_key).get(idp_api_keys::list_api_keys),
 		)
 		.route(
-			"/api/idp/api-keys/{api_key_id}",
+			"/api/idp/api-keys/{id}",
 			get(idp_api_keys::get_api_key).delete(idp_api_keys::delete_api_key),
 		)
 }
@@ -78,8 +75,8 @@ pub(crate) fn api_keys() -> Router<App> {
 pub(crate) fn public_discovery() -> Router<App> {
 	Router::new()
 		.route("/api/idp/info", get(handler::get_idp_info))
-		.route("/api/idp/check-availability", get(handler::check_identity_availability))
-		.route("/api/idp/activate", post(handler::activate_identity))
+		.route("/api/idp/availability", get(handler::check_identity_availability))
+		.route("/api/idp/activations", post(handler::activate_identity))
 }
 
 // vim: ts=4

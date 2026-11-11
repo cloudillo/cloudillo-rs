@@ -20,7 +20,7 @@ use crate::{
 	hat, helpers,
 	key_cache::KeyFetchCache,
 	native_hooks::ownership::owns_subject,
-	post_store::{self, ProcessingContext},
+	post_store::{self, Effects, Origin, ProcessingContext},
 	prelude::*,
 	subject_ref::{SubjectRef, parse_subject_ref},
 };
@@ -207,7 +207,12 @@ pub async fn verify_action_token(
 				// honoring the owner-declared expiration from the remote profile.
 				if let Err(e) = app
 					.meta_adapter
-					.add_profile_public_key(issuer, key_id, public_key, key.expires_at)
+					.add_profile_public_key(
+						issuer,
+						key_id,
+						public_key,
+						key.expires_at.map(Into::into),
+					)
 					.await
 				{
 					warn!("Failed to cache public key for {}:{}: {}", issuer, key_id, e);
@@ -265,6 +270,8 @@ struct Via<'a> {
 	hat_role: Option<&'a str>,
 	/// The hat's own endorsement, bundled as a mirror's evidence.
 	hat_evidence: Option<&'a str>,
+	/// Live push or history-sync backfill; a bundle keeps its primary's origin.
+	origin: Origin,
 }
 
 /// Process an inbound action token
@@ -275,6 +282,7 @@ pub async fn process_inbound_action_token(
 	token: &str,
 	is_sync: bool,
 	client_address: Option<String>,
+	origin: Origin,
 ) -> ClResult<Option<serde_json::Value>> {
 	let result = process_inbound_action_token_inner(
 		app,
@@ -283,7 +291,7 @@ pub async fn process_inbound_action_token(
 		token,
 		is_sync,
 		client_address.clone(),
-		Via::default(),
+		Via { origin, ..Via::default() },
 	)
 	.await?;
 
@@ -298,8 +306,14 @@ pub async fn process_inbound_action_token(
 	let app_clone = app.clone();
 	let action_id_clone: Box<str> = action_id.into();
 	tokio::spawn(async move {
-		Box::pin(process_related_actions(&app_clone, tn_id, &action_id_clone, client_address))
-			.await;
+		Box::pin(process_related_actions(
+			&app_clone,
+			tn_id,
+			&action_id_clone,
+			client_address,
+			origin,
+		))
+		.await;
 	});
 
 	Ok(result)
@@ -316,6 +330,7 @@ pub async fn process_preapproved_action_token(
 	token: &str,
 	primary: Option<(&str, &str)>,
 	hat_evidence: Option<&str>,
+	origin: Origin,
 ) -> ClResult<Option<serde_json::Value>> {
 	process_inbound_action_token_inner(
 		app,
@@ -324,7 +339,7 @@ pub async fn process_preapproved_action_token(
 		token,
 		false,
 		None,
-		Via { pre_approved: true, primary, hat_evidence, ..Via::default() },
+		Via { pre_approved: true, primary, hat_evidence, origin, ..Via::default() },
 	)
 	.await
 }
@@ -348,6 +363,10 @@ async fn process_inbound_action_token_inner(
 	// 2. Verify action token (signature verification - always required!)
 	let mut action =
 		verify_and_handle_failure(app, tn_id, token, is_conn_action, client_ip.as_ref()).await?;
+
+	// 2a. Backstop for the `/inbox` peek: an unknown type/subtype or `crit` name is refused
+	// before anything is stored or the issuer's status is touched (step 2b).
+	check_supported(app.ext::<Arc<DslEngine>>()?, &action)?;
 
 	// 2b. Only a fresh primary token proves the issuer is alive now and lifts the automatic
 	// "unreachable" suspension. A replayed old token doesn't (it would also bump `synced_at` and
@@ -445,6 +464,7 @@ async fn process_inbound_action_token_inner(
 			pre_approved: via.pre_approved,
 			relayed: relay.is_some(),
 			primary: via.primary.map(|(t, i)| (t.into(), i.into())),
+			effects: via.origin.effects(),
 		},
 	)
 	.await?;
@@ -460,7 +480,8 @@ async fn process_inbound_action_token_inner(
 			issuer = %action.iss,
 			"Processing ephemeral action (forward only, no persistence)"
 		);
-		forward_inbound_action_to_websocket(app, tn_id, action_id, &action).await;
+		forward_inbound_action_to_websocket(app, tn_id, action_id, &action, via.origin.effects())
+			.await;
 		return Ok(None);
 	}
 
@@ -593,8 +614,12 @@ async fn process_inbound_action_token_inner(
 			.collect()
 	});
 
-	let ctx =
-		ProcessingContext::Inbound { client_address, is_sync, pre_approved: via.pre_approved };
+	let ctx = ProcessingContext::Inbound {
+		client_address,
+		is_sync,
+		pre_approved: via.pre_approved,
+		origin: via.origin,
+	};
 	let result = post_store::process_after_store(
 		app,
 		tn_id,
@@ -621,7 +646,7 @@ async fn process_inbound_action_token_inner(
 		&& result.ws_forward_deferred
 		&& result.status.is_none_or(|s| s == 'A')
 	{
-		hat::relay_hatted_action(app, tn_id, us, action_id, &action, role).await?;
+		hat::relay_hatted_action(app, tn_id, us, action_id, &action, role, ctx.effects()).await?;
 	}
 
 	let final_status = result.status.unwrap_or('A');
@@ -748,7 +773,7 @@ fn verify_pow_if_conn(
 		&& let Err(pow_err) = app.rate_limiter.verify_pow(ip, token)
 	{
 		debug!("CONN action from {} requires PoW: {:?}", issuer, pow_err);
-		return Err(Error::PreconditionRequired(format!("Proof of work required: {}", pow_err)));
+		return Err(pow_err.into());
 	}
 	Ok(())
 }
@@ -783,9 +808,27 @@ fn resolve_definition<'a>(
 	app: &'a App,
 	action_type: &str,
 ) -> ClResult<&'a crate::dsl::types::ActionDefinition> {
-	app.ext::<Arc<DslEngine>>()?.definition_for(action_type, None).ok_or_else(|| {
-		Error::ValidationError(format!("Action type not supported: {}", action_type))
-	})
+	app.ext::<Arc<DslEngine>>()?
+		.definition_for(action_type, None)
+		.ok_or_else(|| Error::Unsupported(format!("Action type not supported: {}", action_type)))
+}
+
+/// The strict support check every inbound entry point runs before storing anything: the
+/// type/subtype must be known exactly (`DslEngine::is_known`) and every `crit` name understood
+/// (`DslEngine::check_crit`). `definition_for` stays lenient; this is where strictness lives.
+pub(crate) fn check_supported(dsl: &DslEngine, tok: &ActionToken) -> ClResult<()> {
+	let def = dsl
+		.definition_for(&tok.t, None)
+		.filter(|_| dsl.is_known(&tok.t))
+		.ok_or_else(|| Error::Unsupported(format!("unknown action type: {}", tok.t)))?;
+	dsl.check_crit(def, tok.crit.as_deref())
+		.map_err(|name| Error::Unsupported(format!("unknown crit: {}", name)))
+}
+
+/// Whether a raw, unverified token decodes and passes `check_supported`. Filters related-token
+/// bundles and history-sync items, where one bad token is skipped rather than failing the rest.
+pub(crate) fn token_supported(dsl: &DslEngine, token: &str) -> bool {
+	decode_jwt_no_verify::<ActionToken>(token).is_ok_and(|tok| check_supported(dsl, &tok).is_ok())
 }
 
 /// The issuer's local profile, if any; a blocked, banned or still-Suspended issuer is refused.
@@ -1369,7 +1412,7 @@ struct InboundActionContext<'a> {
 }
 
 /// Store inbound action in database.
-/// Returns `Ok(true)` if stored, `Ok(false)` if duplicate.
+/// Returns `Ok(true)` if stored live, `Ok(false)` if duplicate or superseded on arrival.
 async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) -> ClResult<bool> {
 	let action = ctx.action;
 	let (action_type, sub_type) = helpers::extract_type_and_subtype(&action.t);
@@ -1413,70 +1456,80 @@ async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) -> ClRe
 		channel: ctx.channel,
 	};
 
-	match app.meta_adapter.create_action(ctx.tn_id, &inbound_action, key.as_deref()).await {
-		Ok(meta_adapter::ActionId::AId(_)) => {
-			// Row was created in the meta-adapter's default status ('P', shared
-			// with outbound-pending). Immediately mark it 'V' (verifying) to
-			// distinguish inbound rows whose attachment sync hasn't completed
-			// from outbound-pending rows. 'V' is filtered from client listings
-			// and the federation outbox; activation ('V' → 'A') is deferred to
-			// the end of process_inbound_action_token_inner so the action only
-			// goes live after attachment sync and post-store steps succeed.
-			info!("← STORED: {}", ctx.action_id);
-			let opts = meta_adapter::UpdateActionDataOptions {
-				status: cloudillo_types::types::Patch::Value('V'),
-				..Default::default()
-			};
-			if let Err(e) =
-				app.meta_adapter.update_action_data(ctx.tn_id, ctx.action_id, &opts).await
-			{
-				warn!("  failed to set inbound action status to 'V': {}", e);
+	let live =
+		match app.meta_adapter.create_action(ctx.tn_id, &inbound_action, key.as_deref()).await {
+			Ok(meta_adapter::ActionId::AId(_)) => {
+				// Row was created in the meta-adapter's default status ('P', shared
+				// with outbound-pending). Immediately mark it 'V' (verifying) to
+				// distinguish inbound rows whose attachment sync hasn't completed
+				// from outbound-pending rows. 'V' is filtered from client listings
+				// and the federation outbox; activation ('V' → 'A') is deferred to
+				// the end of process_inbound_action_token_inner so the action only
+				// goes live after attachment sync and post-store steps succeed.
+				info!("← STORED: {}", ctx.action_id);
+				let opts = meta_adapter::UpdateActionDataOptions {
+					status: cloudillo_types::types::Patch::Value('V'),
+					..Default::default()
+				};
+				if let Err(e) =
+					app.meta_adapter.update_action_data(ctx.tn_id, ctx.action_id, &opts).await
+				{
+					warn!("  failed to set inbound action status to 'V': {}", e);
+					return Err(e);
+				}
+				true
+			}
+			// Newer-wins: a later same-key row is live, so this one was stored retired ('D').
+			// Its token is kept like any row's; the caller then skips the 'V'/'A' writes, the
+			// hook and every effect (`Ok(false)`).
+			Ok(meta_adapter::ActionId::SupersededOnArrival) => {
+				info!("← STORED retired (a newer same-key action is live): {}", ctx.action_id);
+				false
+			}
+			Ok(meta_adapter::ActionId::ActionId(_)) => {
+				if ctx.is_conn_action
+					&& let Some(ip) = ctx.client_ip
+					&& let Err(pen_err) = app
+						.rate_limiter
+						.increment_pow_counter(ip, PowPenaltyReason::ConnDuplicatePending)
+				{
+					warn!("Failed to increment PoW counter for {}: {}", ip, pen_err);
+				}
+				// Existing row: if it's already active, nothing to do. If it's still
+				// verifying (typical for a verifier-task retry whose previous run
+				// failed during attachment sync), fall through and rerun the rest
+				// of the pipeline so it can finally activate.
+				let existing = app.meta_adapter.get_action(ctx.tn_id, ctx.action_id).await?;
+				match existing.as_ref().and_then(|a| a.status.as_deref()) {
+					Some("A") => {
+						debug!("  duplicate inbound action {} already active", ctx.action_id);
+						return Ok(false);
+					}
+					Some("V" | "P") | None => {
+						debug!("  resuming pending inbound action {}", ctx.action_id);
+					}
+					Some("D") => {
+						debug!(
+							"  inbound action {} already superseded/deleted, skipping",
+							ctx.action_id
+						);
+						return Ok(false);
+					}
+					Some(other) => {
+						debug!(
+							"  duplicate inbound action {} in unexpected status {}",
+							ctx.action_id, other
+						);
+						return Ok(false);
+					}
+				}
+				true
+			}
+			Err(e) => {
+				warn!("  failed to store inbound action: {}", e);
 				return Err(e);
 			}
-		}
-		Ok(meta_adapter::ActionId::ActionId(_)) => {
-			if ctx.is_conn_action
-				&& let Some(ip) = ctx.client_ip
-				&& let Err(pen_err) = app
-					.rate_limiter
-					.increment_pow_counter(ip, PowPenaltyReason::ConnDuplicatePending)
-			{
-				warn!("Failed to increment PoW counter for {}: {}", ip, pen_err);
-			}
-			// Existing row: if it's already active, nothing to do. If it's still
-			// verifying (typical for a verifier-task retry whose previous run
-			// failed during attachment sync), fall through and rerun the rest
-			// of the pipeline so it can finally activate.
-			let existing = app.meta_adapter.get_action(ctx.tn_id, ctx.action_id).await?;
-			match existing.as_ref().and_then(|a| a.status.as_deref()) {
-				Some("A") => {
-					debug!("  duplicate inbound action {} already active", ctx.action_id);
-					return Ok(false);
-				}
-				Some("V" | "P") | None => {
-					debug!("  resuming pending inbound action {}", ctx.action_id);
-				}
-				Some("D") => {
-					debug!(
-						"  inbound action {} already superseded/deleted, skipping",
-						ctx.action_id
-					);
-					return Ok(false);
-				}
-				Some(other) => {
-					debug!(
-						"  duplicate inbound action {} in unexpected status {}",
-						ctx.action_id, other
-					);
-					return Ok(false);
-				}
-			}
-		}
-		Err(e) => {
-			warn!("  failed to store inbound action: {}", e);
-			return Err(e);
-		}
-	}
+		};
 
 	if let Err(e) = app
 		.meta_adapter
@@ -1485,7 +1538,7 @@ async fn store_inbound_action(app: &App, ctx: &InboundActionContext<'_>) -> ClRe
 	{
 		debug!("  failed to store inbound action token: {} (may be duplicate)", e);
 	}
-	Ok(true)
+	Ok(live)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1605,8 +1658,14 @@ async fn forward_inbound_action_to_websocket(
 	tn_id: TnId,
 	action_id: &str,
 	action: &cloudillo_types::auth_adapter::ActionToken,
+	effects: Effects,
 ) {
 	use crate::forward::{self, ForwardActionParams};
+
+	// Push and email fire only as the offline fallback of the live send.
+	if !effects.live {
+		return;
+	}
 
 	let (action_type, subtype) = helpers::extract_type_and_subtype(&action.t);
 
@@ -1665,6 +1724,7 @@ async fn forward_inbound_action_to_websocket(
 			&action.iss,
 			action.p.as_deref(),
 			action.c.as_ref(),
+			effects,
 		)
 		.await;
 		// Offline email notification (presence-suppressed + throttled in the
@@ -1679,6 +1739,7 @@ async fn forward_inbound_action_to_websocket(
 			&action.iss,
 			action.p.as_deref(),
 			action.c.as_ref(),
+			effects,
 		)
 		.await;
 	}
@@ -1726,8 +1787,13 @@ pub(crate) async fn deliver_notification_email(
 	issuer: &str,
 	parent_id: Option<&str>,
 	content: Option<&serde_json::Value>,
+	effects: Effects,
 ) {
 	use crate::forward::{get_email_setting_key, is_email_notifiable};
+
+	if !effects.notify {
+		return;
+	}
 
 	// Admit every type with a per-type setting key; skip DEL/unknown.
 	if !is_email_notifiable(action_type, subtype) {
@@ -1936,9 +2002,14 @@ pub(crate) async fn send_push_notification(
 	issuer: &str,
 	parent_id: Option<&str>,
 	content: Option<&serde_json::Value>,
+	effects: Effects,
 ) {
 	use crate::forward::{get_push_setting_key, notification_path, should_push_notify};
 	use cloudillo_push::{NotificationPayload, send_to_tenant};
+
+	if !effects.notify {
+		return;
+	}
 
 	// Check if this action type should trigger push notifications
 	if !should_push_notify(action_type, subtype) {
@@ -2061,6 +2132,7 @@ async fn process_related_actions(
 	tn_id: TnId,
 	action_id: &str,
 	client_address: Option<String>,
+	origin: Origin,
 ) {
 	// Get related action tokens that were waiting for this action
 	let Ok(related_tokens) = app.meta_adapter.get_related_action_tokens(tn_id, action_id).await
@@ -2181,7 +2253,7 @@ async fn process_related_actions(
 					related_token,
 					false,
 					client_address.clone(),
-					Via { primary, hat_role: Some(role), ..Via::default() },
+					Via { primary, hat_role: Some(role), origin, ..Via::default() },
 				)
 				.await
 				.inspect(|_| subject_admitted = true),
@@ -2197,6 +2269,7 @@ async fn process_related_actions(
 				related_token,
 				primary,
 				evidence,
+				origin,
 			)
 			.await
 		} else {
@@ -2211,7 +2284,7 @@ async fn process_related_actions(
 				related_token,
 				false,
 				client_address.clone(),
-				Via { primary, ..Via::default() },
+				Via { primary, origin, ..Via::default() },
 			)
 			.await
 		};
@@ -2229,8 +2302,16 @@ async fn process_related_actions(
 
 	if subject_admitted && let Some(((nested_id, nested_token), subject)) = nested {
 		let under = Some((&*subject.t, &*subject.iss));
-		match process_preapproved_action_token(app, tn_id, nested_id, nested_token, under, None)
-			.await
+		match process_preapproved_action_token(
+			app,
+			tn_id,
+			nested_id,
+			nested_token,
+			under,
+			None,
+			origin,
+		)
+		.await
 		{
 			Ok(_) => success_count += 1,
 			Err(e) => {

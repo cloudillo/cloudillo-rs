@@ -67,6 +67,8 @@ pub fn scope_permits(scope: Option<&str>, method: &Method, path: &str) -> bool {
 		Some(TokenScope::File { .. }) => {
 			path.starts_with("/api/files/")
 				|| path == "/api/files"
+				|| path.starts_with("/api/uploads/")
+				|| path.starts_with("/api/variants/")
 				// Document-scoped full-text search: an app (or share-link guest)
 				// searching inside the one document it was handed; the handler
 				// confines results to that document's tree and to file/document
@@ -75,7 +77,7 @@ pub fn scope_permits(scope: Option<&str>, method: &Method, path: &str) -> bool {
 				|| path == "/api/search"
 				|| path.starts_with("/ws/rtdb/")
 				|| path.starts_with("/ws/crdt/")
-				// Reachable for the `?via=` cross-document re-scoping branch, which takes
+				// Reachable for the `via` cross-document re-scoping branch, which takes
 				// a scoped bearer; the bare branch rejects scoped tokens in the handler.
 				|| path == "/api/auth/access-token"
 		}
@@ -83,8 +85,7 @@ pub fn scope_permits(scope: Option<&str>, method: &Method, path: &str) -> bool {
 		// radius of a compromised token. Installing or removing apps is the leader's
 		// (`require_leader`), not the publisher's.
 		Some(TokenScope::ApkgPublish) => {
-			path.starts_with("/api/files/apkg/")
-				|| (path == "/api/actions" && method == Method::POST)
+			path == "/api/uploads/apkg" || (path == "/api/actions" && method == Method::POST)
 		}
 		// Not a delegated token — treat it as a capability list.
 		None => {
@@ -139,7 +140,12 @@ mod tests {
 		let s = Some("file:f1~abc:W");
 		assert!(scope_permits(s, &Method::GET, "/api/files/x"));
 		assert!(scope_permits(s, &Method::GET, "/api/files"));
+		assert!(scope_permits(s, &Method::POST, "/api/uploads/default"));
+		assert!(scope_permits(s, &Method::GET, "/api/variants/b1~xyz"));
 		assert!(scope_permits(s, &Method::GET, "/ws/crdt/f1~abc"));
+		// Prefixes, not path stems: the bare collections are not on the file surface.
+		assert!(!scope_permits(s, &Method::POST, "/api/uploads"));
+		assert!(!scope_permits(s, &Method::GET, "/api/variants"));
 		// Must stay reachable for `?via=`; rejecting the bare branch is the handler's job.
 		assert!(scope_permits(s, &Method::POST, "/api/auth/access-token"));
 		// In-document search: the handler confines results to the scoped tree.
@@ -150,7 +156,7 @@ mod tests {
 
 		assert!(!scope_permits(s, &Method::POST, "/api/idp/identities"));
 		assert!(!scope_permits(s, &Method::PUT, "/api/settings/foo"));
-		assert!(!scope_permits(s, &Method::GET, "/api/auth/proxy-token"));
+		assert!(!scope_permits(s, &Method::POST, "/api/auth/proxy-token"));
 		// Claiming a document type is never delegable to an app's own token.
 		assert!(!scope_permits(s, &Method::GET, "/api/doc-formats"));
 		assert!(!scope_permits(s, &Method::PUT, "/api/doc-formats/cloudillo%2Fnotillo"));
@@ -159,7 +165,11 @@ mod tests {
 	#[test]
 	fn apkg_scope_stays_on_the_publish_surface() {
 		let s = Some("apkg:publish");
-		assert!(scope_permits(s, &Method::POST, "/api/files/apkg/upload"));
+		assert!(scope_permits(s, &Method::POST, "/api/uploads/apkg"));
+		// Exact path: neither a sub-path nor the pre-move upload path.
+		assert!(!scope_permits(s, &Method::POST, "/api/uploads/apkg/x"));
+		assert!(!scope_permits(s, &Method::POST, "/api/uploads/default"));
+		assert!(!scope_permits(s, &Method::POST, "/api/files/apkg/upload"));
 		assert!(scope_permits(s, &Method::POST, "/api/actions"));
 		assert!(!scope_permits(s, &Method::GET, "/api/actions"));
 		assert!(!scope_permits(s, &Method::GET, "/api/apps/installed"));

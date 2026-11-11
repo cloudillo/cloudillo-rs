@@ -69,7 +69,7 @@ async fn emit_if_owned(app: &App, context: &HookContext, phase: &str) -> ClResul
 		return Ok(HookResult::default());
 	}
 
-	emit_stat_for_subject(app, tn_id, &context.tenant_tag, subject_id).await;
+	emit_stat_for_subject(app, tn_id, &context.tenant_tag, subject_id, context.effects).await;
 	Ok(HookResult::default())
 }
 

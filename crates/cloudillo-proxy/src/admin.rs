@@ -13,11 +13,11 @@ use serde_with::skip_serializing_none;
 
 use crate::prelude::*;
 use cloudillo_core::acme;
-use cloudillo_core::extract::{Auth, OptionalRequestId};
+use cloudillo_core::extract::Auth;
 use cloudillo_types::auth_adapter::{
 	CreateProxySiteData, ProxySiteConfig, ProxySiteData, UpdateProxySiteData,
 };
-use cloudillo_types::types::{ApiResponse, serialize_timestamp_iso, serialize_timestamp_iso_opt};
+use cloudillo_types::types::{ApiResponse, ApiTime};
 
 fn default_proxy_type() -> String {
 	"basic".to_string()
@@ -40,11 +40,19 @@ pub struct CreateProxySiteRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateProxySiteRequest {
-	pub backend_url: Option<String>,
-	pub status: Option<String>,
-	#[serde(rename = "type")]
-	pub typ: Option<String>,
-	pub config: Option<ProxySiteConfig>,
+	// No field is clearable: `Patch` only to refuse an explicit `null`.
+	#[serde(default)]
+	pub backend_url: Patch<String>,
+	/// `active` | `disabled` → stored `A` | `D`; other words are refused.
+	#[serde(
+		default,
+		deserialize_with = "cloudillo_types::api_enums::proxy_status::patch::deserialize"
+	)]
+	pub status: Patch<char>,
+	#[serde(rename = "type", default)]
+	pub typ: Patch<String>,
+	#[serde(default)]
+	pub config: Patch<ProxySiteConfig>,
 }
 
 /// Response type for proxy site operations
@@ -52,25 +60,24 @@ pub struct UpdateProxySiteRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxySiteResponse {
-	pub site_id: i64,
+	#[serde(rename = "id")]
+	pub site_id: String,
 	pub domain: Box<str>,
 	pub backend_url: Box<str>,
+	#[serde(with = "cloudillo_types::api_enums::proxy_status::text")]
 	pub status: Box<str>,
 	#[serde(rename = "type")]
 	pub typ: Box<str>,
-	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
-	pub cert_expires_at: Option<Timestamp>,
+	pub cert_expires_at: Option<ApiTime>,
 	pub config: ProxySiteConfig,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub updated_at: Timestamp,
+	pub created_at: ApiTime,
+	pub updated_at: ApiTime,
 }
 
 impl From<ProxySiteData> for ProxySiteResponse {
 	fn from(data: ProxySiteData) -> Self {
 		Self {
-			site_id: data.site_id,
+			site_id: data.site_id.to_string(),
 			domain: data.domain,
 			backend_url: data.backend_url,
 			status: data.status,
@@ -121,9 +128,8 @@ pub async fn list_proxy_sites(
 
 	let sites = app.auth_adapter.list_proxy_sites().await?;
 	let sites: Vec<ProxySiteResponse> = sites.into_iter().map(ProxySiteResponse::from).collect();
-	let total = sites.len();
 
-	Ok((StatusCode::OK, Json(ApiResponse::with_pagination(sites, 0, total, total))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(sites))))
 }
 
 /// POST /api/admin/proxy-sites - Create a new proxy site
@@ -182,50 +188,48 @@ pub async fn create_proxy_site(
 	Ok((StatusCode::CREATED, Json(ApiResponse::new(ProxySiteResponse::from(site)))))
 }
 
-/// GET /api/admin/proxy-sites/:site_id - Get a proxy site
+/// GET /api/admin/proxy-sites/{siteId} - Get a proxy site
 #[axum::debug_handler]
 pub async fn get_proxy_site(
 	State(app): State<App>,
 	Path(site_id): Path<i64>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ProxySiteResponse>>)> {
-	info!(site_id = site_id, "GET /api/admin/proxy-sites/:site_id");
+	info!(site_id = site_id, "GET /api/admin/proxy-sites/{{siteId}}");
 
 	let site = app.auth_adapter.read_proxy_site(site_id).await?;
 	Ok((StatusCode::OK, Json(ApiResponse::new(ProxySiteResponse::from(site)))))
 }
 
-/// PATCH /api/admin/proxy-sites/:site_id - Update a proxy site
+/// PATCH /api/admin/proxy-sites/{siteId} - Update a proxy site
 #[axum::debug_handler]
 pub async fn update_proxy_site(
 	State(app): State<App>,
 	Path(site_id): Path<i64>,
 	Json(body): Json<UpdateProxySiteRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ProxySiteResponse>>)> {
-	info!(site_id = site_id, "PATCH /api/admin/proxy-sites/:site_id");
+	info!(site_id = site_id, "PATCH /api/admin/proxy-sites/{{siteId}}");
+
+	// `status: null` is refused by its deserializer (`proxy_status` has no NONE word).
+	if body.backend_url.is_null() || body.typ.is_null() || body.config.is_null() {
+		return Err(Error::ValidationError("backendUrl, type and config cannot be null".into()));
+	}
 
 	// Validate backend URL if provided
-	if let Some(ref url) = body.backend_url {
+	if let Some(url) = body.backend_url.value() {
 		url::Url::parse(url)
 			.map_err(|e| Error::ValidationError(format!("invalid backend URL: {}", e)))?;
 	}
 
-	// Validate status if provided
-	if let Some(ref status) = body.status
-		&& !["A", "D"].contains(&status.as_str())
-	{
-		return Err(Error::ValidationError("status must be A (active) or D (disabled)".into()));
-	}
-
 	// Validate proxy type if provided
-	if let Some(ref typ) = body.typ {
+	if let Some(typ) = body.typ.value() {
 		validate_proxy_type(typ)?;
 	}
 
 	// Validate config compatibility with the effective type
-	if let Some(ref config) = body.config {
+	if let Some(config) = body.config.value() {
 		// If type is being changed, validate against the new type;
 		// otherwise fetch the current site to get the existing type
-		let effective_type = if let Some(ref typ) = body.typ {
+		let effective_type = if let Some(typ) = body.typ.value() {
 			typ.clone()
 		} else {
 			let current = app.auth_adapter.read_proxy_site(site_id).await?;
@@ -234,11 +238,12 @@ pub async fn update_proxy_site(
 		validate_config_for_type(&effective_type, config)?;
 	}
 
+	let status = body.status.value().map(char::to_string);
 	let data = UpdateProxySiteData {
-		backend_url: body.backend_url.as_deref(),
-		status: body.status.as_deref(),
-		proxy_type: body.typ.as_deref(),
-		config: body.config.as_ref(),
+		backend_url: body.backend_url.value().map(String::as_str),
+		status: status.as_deref(),
+		proxy_type: body.typ.value().map(String::as_str),
+		config: body.config.value(),
 	};
 
 	let site = app.auth_adapter.update_proxy_site(site_id, &data).await?;
@@ -251,14 +256,13 @@ pub async fn update_proxy_site(
 	Ok((StatusCode::OK, Json(ApiResponse::new(ProxySiteResponse::from(site)))))
 }
 
-/// DELETE /api/admin/proxy-sites/:site_id - Delete a proxy site
+/// DELETE /api/admin/proxy-sites/{siteId} - Delete a proxy site
 #[axum::debug_handler]
 pub async fn delete_proxy_site(
 	State(app): State<App>,
 	Path(site_id): Path<i64>,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
-	info!(site_id = site_id, "DELETE /api/admin/proxy-sites/:site_id");
+) -> ClResult<StatusCode> {
+	info!(site_id = site_id, "DELETE /api/admin/proxy-sites/{{siteId}}");
 
 	// Read site first to get domain for cache invalidation
 	let site = app.auth_adapter.read_proxy_site(site_id).await?;
@@ -277,17 +281,16 @@ pub async fn delete_proxy_site(
 		certs.remove(cloudillo_types::validation::dns_host_to_unicode_lossy(&domain).as_ref());
 	}
 
-	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /api/admin/proxy-sites/:site_id/renew-cert - Trigger certificate renewal
+/// POST /api/admin/proxy-sites/{siteId}/renew - Trigger certificate renewal
 #[axum::debug_handler]
 pub async fn trigger_cert_renewal(
 	State(app): State<App>,
 	Path(site_id): Path<i64>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ProxySiteResponse>>)> {
-	info!(site_id = site_id, "POST /api/admin/proxy-sites/:site_id/renew-cert");
+	info!(site_id = site_id, "POST /api/admin/proxy-sites/{{siteId}}/renew");
 
 	let site = app.auth_adapter.read_proxy_site(site_id).await?;
 

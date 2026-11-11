@@ -17,6 +17,7 @@ use cloudillo_types::{
 	auth_adapter::{AuthKey, KeyInfo},
 	prelude::*,
 	secret_box::{self, SecretBox},
+	types::ApiTime,
 };
 
 /// Unique per second and sorts after every older id, including the legacy `%y%m%d` ones.
@@ -41,7 +42,7 @@ pub(crate) async fn list_profile_keys(db: &SqlitePool, tn_id: TnId) -> ClResult<
 		Ok(AuthKey {
 			key_id: row.try_get::<Box<str>, _>("key_id")?,
 			public_key: row.try_get::<Box<str>, _>("public_key")?,
-			expires_at: row.try_get::<Option<i64>, _>("expires_at")?.map(Timestamp),
+			expires_at: row.try_get::<Option<i64>, _>("expires_at")?.map(ApiTime),
 		})
 	}))
 }
@@ -64,8 +65,8 @@ pub(crate) async fn list_profile_keys_admin(
 		Ok(KeyInfo {
 			key_id: row.try_get::<Box<str>, _>("key_id")?,
 			status: row.try_get::<String, _>("status")?.chars().next().unwrap_or('A'),
-			created_at: Timestamp(row.try_get::<i64, _>("created_at")?),
-			expires_at: row.try_get::<Option<i64>, _>("expires_at")?.map(Timestamp),
+			created_at: ApiTime(row.try_get::<i64, _>("created_at")?),
+			expires_at: row.try_get::<Option<i64>, _>("expires_at")?.map(ApiTime),
 		})
 	}))
 }
@@ -87,10 +88,14 @@ pub(crate) async fn create_profile_key(
 	let keypair = crypto::generate_key(worker).await.or(Err(Error::DbError))?;
 
 	sqlx::query(
-		"INSERT INTO keys (tn_id, key_id, private_key, public_key, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)"
+		"INSERT INTO keys (tn_id, key_id, private_key, public_key, expires_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())"
 	).bind(tn_id.0).bind(&key_id).bind(sb.encrypt(&keypair.private_key, &key_aad(tn_id, &key_id))?).bind(&keypair.public_key).bind(expires_at.map(|t| t.0)).execute(db).await.db()?;
 
-	Ok(AuthKey { key_id: key_id.into(), public_key: keypair.public_key, expires_at })
+	Ok(AuthKey {
+		key_id: key_id.into(),
+		public_key: keypair.public_key,
+		expires_at: expires_at.map(Into::into),
+	})
 }
 
 /// Create a new active key and demote every active key (legacy NULL rows too) to verify-only
@@ -113,7 +118,8 @@ pub(crate) async fn rotate_profile_key(
 	.db()?;
 	// A second rotate within the same second hits the primary key and fails: retry later.
 	sqlx::query(
-		"INSERT INTO keys (tn_id, key_id, status, private_key, public_key) VALUES (?1, ?2, 'A', ?3, ?4)",
+		"INSERT INTO keys (tn_id, key_id, status, private_key, public_key, created_at) \
+		 VALUES (?1, ?2, 'A', ?3, ?4, unixepoch())",
 	)
 	.bind(tn_id.0)
 	.bind(&key_id)

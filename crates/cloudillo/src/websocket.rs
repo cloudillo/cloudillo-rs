@@ -65,22 +65,45 @@ fn limit_ws(ws: WebSocketUpgrade) -> WebSocketUpgrade {
 
 /// Query parameters for WebSocket file access endpoints
 #[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct AccessQuery {
-	/// Requested access level: "read" or "write"
+	/// Requested access mode: "read", "comment" or "write"
 	/// - "read": Force read-only mode (even if user has write permission)
+	/// - "comment": Require comment permission
 	/// - "write": Require write permission (reject if user only has read)
 	/// - None: Use computed access level based on permissions
+	///
+	/// Read through [`AccessQuery::mode`], which falls back to `access`.
+	pub mode: Option<String>,
+	/// Pre-rename name of `mode`, still sent by stale cached bundles (and alongside `mode` by
+	/// current clients, for older servers). Not a serde alias: an alias rejects a query that
+	/// carries both. Without it a stale bundle's forced read-only would be silently dropped.
+	// Drop once no client sends access= any more
 	pub access: Option<String>,
 	/// Container file_id when opening an embedded file (caps access by share entry)
 	pub via: Option<String>,
-	/// Opt in to the RTDB presence channel: `"1"` or `"true"`.
+	/// Opt in to the RTDB presence channel: `presence=true`.
 	///
 	/// Presence is connection-level, never a subscription — the flag is fixed for the
 	/// socket's lifetime, which is what makes reconnect correct by construction: the
 	/// URL carries it, so a reconnect re-enables presence and gets a fresh roster.
 	/// `get_ws_crdt` shares this struct and ignores the field; CRDT awareness is
 	/// always on there.
-	pub presence: Option<String>,
+	#[serde(default, deserialize_with = "de_flag")]
+	pub presence: bool,
+}
+
+impl AccessQuery {
+	/// Requested access mode: `mode=`, else the legacy `access=`.
+	pub fn mode(&self) -> Option<&str> {
+		self.mode.as_deref().or(self.access.as_deref())
+	}
+}
+
+/// Query-string bool that also takes the legacy `1` (stale bundles send `presence=1`);
+/// anything else is false rather than a 400 for the whole query.
+fn de_flag<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+	Ok(matches!(String::deserialize(d)?.as_str(), "1" | "true"))
 }
 
 /// Helper to close WebSocket with error code
@@ -120,7 +143,7 @@ fn ws_close_write_denied(ws: WebSocketUpgrade) -> Response {
 ///
 /// Returns `Ok(AccessLevel)` or `Err(())` if write access was requested but not available
 fn resolve_access(query: &AccessQuery, computed: AccessLevel) -> Result<AccessLevel, ()> {
-	match query.access.as_deref() {
+	match query.mode() {
 		Some("read") => Ok(AccessLevel::Read), // Force read-only
 		Some("comment") => {
 			// Comment requested: allow if computed is Comment or higher
@@ -318,7 +341,7 @@ pub enum WsKind {
 pub enum WsDeny {
 	/// The file access check failed (not found / denied / internal)
 	Access(FileAccessError),
-	/// `?access=` asked for more than the subject has
+	/// `?mode=` asked for more than the subject has
 	WriteDenied,
 	/// An `s~` store file exists with the other endpoint's type
 	TypeMismatch,
@@ -479,7 +502,7 @@ pub async fn get_ws_bus(
 /// WebSocket upgrade handler for RTDB subscriptions
 ///
 /// Route: `/ws/rtdb/:file_id`
-/// Query params: `?access=read` or `?access=write`, `?presence=1` to opt in to the
+/// Query params: `?mode=read` or `?mode=write`, `?presence=true` to opt in to the
 /// presence channel.
 /// Requires authentication.
 /// Connects to real-time database changes for a specific file.
@@ -497,11 +520,11 @@ pub async fn get_ws_rtdb(
 ) -> Response {
 	use tracing::{info, warn};
 
-	info!("WebSocket RTDB request for file_id: {}, access={:?}", file_id, query.access);
+	info!("WebSocket RTDB request for file_id: {}, mode={:?}", file_id, query.mode());
 
 	let ws = limit_ws(ws);
 	let is_guest = auth.is_none();
-	let presence_enabled = matches!(query.presence.as_deref(), Some("1" | "true"));
+	let presence_enabled = query.presence;
 
 	// Asserted identity: only a credential that names a person may be asserted as a lock
 	// holder or as the author of per-user file activity. A share-link token has no `sub`,
@@ -594,7 +617,7 @@ pub async fn get_ws_rtdb(
 /// WebSocket upgrade handler for CRDT documents
 ///
 /// Route: `/ws/crdt/:doc_id`
-/// Query params: `?access=read` or `?access=write`
+/// Query params: `?mode=read` or `?mode=write`
 /// Supports authenticated and guest (unauthenticated) access.
 /// Guest access is read-only and only allowed for public files.
 /// Checks file access level and passes read_only flag to connection handler.
@@ -611,7 +634,7 @@ pub async fn get_ws_crdt(
 ) -> Response {
 	use tracing::{info, warn};
 
-	info!("WebSocket CRDT request for doc_id: {}, access={:?}", doc_id, query.access);
+	info!("WebSocket CRDT request for doc_id: {}, mode={:?}", doc_id, query.mode());
 
 	let ws = limit_ws(ws);
 	let is_guest = auth.is_none();
@@ -696,7 +719,7 @@ pub async fn get_ws_crdt(
 
 #[cfg(test)]
 mod tests {
-	use super::ws_bus_admission;
+	use super::{AccessQuery, ws_bus_admission};
 	use cloudillo_types::auth_adapter::AuthCtx;
 	use cloudillo_types::types::{Timestamp, TnId};
 
@@ -727,6 +750,26 @@ mod tests {
 		// Another tenant's session, a leader or moderator there included.
 		assert!(!ws_bus_admission(&ctx(None, exp, &["leader"]), "club.test"));
 		assert!(!ws_bus_admission(&ctx(None, exp, &["moderator"]), "club.test"));
+	}
+
+	fn query(q: &str) -> AccessQuery {
+		let uri: axum::http::Uri = format!("/ws?{q}").parse().unwrap();
+		axum::extract::Query::<AccessQuery>::try_from_uri(&uri).unwrap().0
+	}
+
+	#[test]
+	fn access_query_accepts_legacy_and_new_forms() {
+		let q = query("access=read&presence=1");
+		assert_eq!(q.mode(), Some("read"));
+		assert!(q.presence);
+		let q = query("mode=write&presence=true");
+		assert_eq!(q.mode(), Some("write"));
+		assert!(q.presence);
+		let q = query("mode=read&access=read");
+		assert_eq!(q.mode(), Some("read"));
+		let q = query("token=x");
+		assert_eq!(q.mode(), None);
+		assert!(!q.presence);
 	}
 }
 

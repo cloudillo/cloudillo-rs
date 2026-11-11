@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 use cloudillo_core::prelude::*;
-use cloudillo_types::types::serialize_timestamp_iso;
+use cloudillo_types::types::ApiTime;
 
 // Structured sub-types
 //**********************
@@ -116,8 +116,9 @@ pub struct ContactPatch {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContactOutput {
-	pub c_id: u64,
-	pub ab_id: u64,
+	#[serde(rename = "id")]
+	pub c_id: String,
+	pub ab_id: String,
 	pub uid: String,
 	pub etag: String,
 	#[serde(rename = "fn")]
@@ -137,10 +138,8 @@ pub struct ContactOutput {
 	/// Set when the stored vCard blob could not be parsed. Clients should render
 	/// "record unreadable" rather than treating an empty projection as authoritative.
 	pub parse_error: Option<String>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub updated_at: Timestamp,
+	pub created_at: ApiTime,
+	pub updated_at: ApiTime,
 }
 
 /// Summary row for list endpoints (omits emails[]/phones[] detail to keep list responses small).
@@ -148,8 +147,9 @@ pub struct ContactOutput {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContactListItem {
-	pub c_id: u64,
-	pub ab_id: u64,
+	#[serde(rename = "id")]
+	pub c_id: String,
+	pub ab_id: String,
 	pub uid: String,
 	pub etag: String,
 	#[serde(rename = "fn")]
@@ -160,8 +160,7 @@ pub struct ContactListItem {
 	pub photo: Option<String>,
 	pub profile_id_tag: Option<String>,
 	pub profile: Option<ProfileOverlay>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub updated_at: Timestamp,
+	pub updated_at: ApiTime,
 }
 
 // Address book
@@ -171,14 +170,13 @@ pub struct ContactListItem {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddressBookOutput {
-	pub ab_id: u64,
+	#[serde(rename = "id")]
+	pub ab_id: String,
 	pub name: String,
 	pub description: Option<String>,
 	pub ctag: String,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub updated_at: Timestamp,
+	pub created_at: ApiTime,
+	pub updated_at: ApiTime,
 }
 
 #[skip_serializing_none]

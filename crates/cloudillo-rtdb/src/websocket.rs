@@ -6,20 +6,26 @@
 //! The RTDB protocol (`/ws/rtdb/:file_id`) provides real-time updates for
 //! database changes (create/update/delete) associated with a specific file.
 //!
-//! Message Format:
+//! Frame format, shared with `/ws/bus` (see `cloudillo_core::ws_bus` for the close codes):
 //! ```json
-//! {
-//!   "id": "msg-123",
-//!   "type": "subscribe|unsubscribe",
-//!   "payload": { "collections": ["users/*", "posts"] }
-//! }
+//! { "id": "msg-123", "type": "subscribe", "data": { "path": "posts" } }
 //! ```
+//!
+//! `id` is a string; a numeric client id is accepted and stringified. `data` holds the
+//! payload directly; `queryResult` and `getResult` carry the result (array / document or
+//! null) as `data` itself. Errors echo the request id:
+//! `{ "type": "error", "id": "msg-123", "data": { "code": "E-…", "message": "…", "details"? } }`.
+//!
+//! Client types: `transaction`, `query`, `get`, `subscribe`, `unsubscribe`, `createIndex`,
+//! `lock`, `unlock`, `presence`, `ping`. Server types: `ack`, `error`, `transactionResult`,
+//! `queryResult`, `getResult`, `subscribeResult`, `unsubscribeResult`, `createIndexResult`,
+//! `lockResult`, `unlockResult`, `presenceResult`, `pong`, `change`, `presenceChange`.
 
 use crate::prelude::*;
 use crate::presence::{PresenceFrame, PresenceKey, RTDB_PRESENCE, RateBucket, presence_frame};
 use axum::extract::ws::{Message, WebSocket};
 use cloudillo_types::rtdb_adapter::{ChangeEvent, LockMode, project_doc};
-use cloudillo_types::types::AccessLevel;
+use cloudillo_types::types::{AccessLevel, ApiTime};
 use cloudillo_types::utils::random_id;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
@@ -37,38 +43,39 @@ const TRACKING_THROTTLE_SECS: u64 = 60;
 /// A message in the RTDB protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RtdbMessage {
-	/// Unique message ID (for acking) - can be string or number
-	pub id: Value,
+	/// Unique message ID (for acking). Clients still sending a number get it stringified.
+	#[serde(deserialize_with = "deserialize_id")]
+	pub id: String,
 
 	/// Message type (subscribe, unsubscribe, etc.)
 	#[serde(rename = "type")]
 	pub msg_type: String,
 
-	/// All other fields (operations, path, data, etc.) flattened into this map
-	#[serde(flatten)]
-	pub payload: serde_json::Map<String, Value>,
+	/// The payload: an object, except `queryResult` (array) and `getResult` (document or
+	/// null). Absent on input reads as null.
+	#[serde(default)]
+	pub data: Value,
+}
+
+/// Accept a string id, or a number (stringified) from clients predating string ids.
+fn deserialize_id<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+	match Value::deserialize(d)? {
+		Value::String(s) => Ok(s),
+		Value::Number(n) => Ok(n.to_string()),
+		_ => Err(serde::de::Error::custom("id must be a string or a number")),
+	}
 }
 
 impl RtdbMessage {
-	/// Create a new RTDB message with a single field in payload
-	pub fn new(msg_type: impl Into<String>, payload: Value) -> Self {
-		let mut map = serde_json::Map::new();
-		if let Value::Object(obj) = payload {
-			map = obj;
-		}
-		Self {
-			id: Value::String(random_id().unwrap_or_default()),
-			msg_type: msg_type.into(),
-			payload: map,
-		}
+	/// Create a new server-pushed RTDB message with a fresh id
+	pub fn new(msg_type: impl Into<String>, data: Value) -> Self {
+		Self { id: random_id().unwrap_or_default(), msg_type: msg_type.into(), data }
 	}
 
 	/// Create an ack response
-	pub fn ack(id: Value, status: &str) -> Self {
-		let mut map = serde_json::Map::new();
-		map.insert("status".to_string(), Value::String(status.to_string()));
-		map.insert("timestamp".to_string(), Value::Number(now_timestamp().into()));
-		Self { id, msg_type: "ack".to_string(), payload: map }
+	pub fn ack(id: String, status: &str) -> Self {
+		let data = json!({ "status": status, "timestamp": ApiTime::now().to_iso_string() });
+		Self { id, msg_type: "ack".to_string(), data }
 	}
 
 	/// Create an error response, correlated to the request that caused it.
@@ -77,20 +84,22 @@ impl RtdbMessage {
 	/// sent (`libs/rtdb/src/websocket.ts`), so an error carrying the freshly minted
 	/// random id [`RtdbMessage::new`] produces matches nothing and leaves its caller
 	/// hanging until the 30 s timeout.
-	pub fn error(id: Value, code: u16, message: impl Into<String>) -> Self {
-		let mut map = serde_json::Map::new();
-		map.insert("code".to_string(), Value::Number(code.into()));
-		map.insert("message".to_string(), Value::String(message.into()));
-		Self { id, msg_type: "error".to_string(), payload: map }
+	///
+	/// `data` is the REST error body's `error` object (`{code, message, details?}`) from
+	/// [`Error::to_error_response`], so 5xx messages stay generic here too.
+	#[allow(clippy::needless_pass_by_value)] // callers hand over their error; owning reads naturally
+	pub fn error(id: String, err: Error) -> Self {
+		let data = serde_json::to_value(err.to_error_response().1.error).unwrap_or(Value::Null);
+		Self { id, msg_type: "error".to_string(), data }
 	}
 
 	/// Create a response message with explicit fields
 	pub fn response(
-		id: Value,
+		id: String,
 		msg_type: impl Into<String>,
 		fields: serde_json::Map<String, Value>,
 	) -> Self {
-		Self { id, msg_type: msg_type.into(), payload: fields }
+		Self { id, msg_type: msg_type.into(), data: Value::Object(fields) }
 	}
 
 	/// Serialize to JSON and wrap in WebSocket message
@@ -417,8 +426,8 @@ pub async fn handle_rtdb_connection(
 /// An absent, non-array or empty `select` means "whole documents", so a client
 /// cannot accidentally ask for nothing. Non-string entries are dropped rather
 /// than rejected, matching how the surrounding parsers treat malformed options.
-fn parse_select(payload: &serde_json::Map<String, Value>) -> Option<Vec<String>> {
-	let fields: Vec<String> = payload
+fn parse_select(data: &Value) -> Option<Vec<String>> {
+	let fields: Vec<String> = data
 		.get("select")?
 		.as_array()?
 		.iter()
@@ -439,7 +448,7 @@ fn parse_select(payload: &serde_json::Map<String, Value>) -> Option<Vec<String>>
 ///
 /// `msg_id` is the id of the request being checked; the refusal echoes it so the
 /// client can correlate it. See [`RtdbMessage::error`].
-fn check_write_access(conn: &RtdbConnection, msg_id: &Value, path: &str) -> Option<RtdbMessage> {
+fn check_write_access(conn: &RtdbConnection, msg_id: &str, path: &str) -> Option<RtdbMessage> {
 	if conn.access_level.can_write() {
 		return None;
 	}
@@ -449,18 +458,10 @@ fn check_write_access(conn: &RtdbConnection, msg_id: &Value, path: &str) -> Opti
 			if matches!(collection, "t" | "c") {
 				None
 			} else {
-				Some(RtdbMessage::error(
-					msg_id.clone(),
-					403,
-					"Comment access - writes restricted to comment collections",
-				))
+				Some(RtdbMessage::error(msg_id.to_owned(), Error::PermissionDenied))
 			}
 		}
-		_ => Some(RtdbMessage::error(
-			msg_id.clone(),
-			403,
-			"Write access denied - read-only connection",
-		)),
+		_ => Some(RtdbMessage::error(msg_id.to_owned(), Error::PermissionDenied)),
 	}
 }
 
@@ -468,7 +469,7 @@ fn check_write_access(conn: &RtdbConnection, msg_id: &Value, path: &str) -> Opti
 /// Returns an error if any path is not writable.
 fn check_write_access_for_operations(
 	conn: &RtdbConnection,
-	msg_id: &Value,
+	msg_id: &str,
 	operations: &[Value],
 ) -> Option<RtdbMessage> {
 	// Write-or-better can write anything — skip per-path checks
@@ -493,7 +494,7 @@ async fn handle_rtdb_command(
 	match msg.msg_type.as_str() {
 		"transaction" => {
 			// Handle atomic batch operations (create/update/delete)
-			if let Some(operations) = msg.payload.get("operations").and_then(|v| v.as_array()) {
+			if let Some(operations) = msg.data.get("operations").and_then(|v| v.as_array()) {
 				// Check write access for all operation paths
 				if let Some(err) = check_write_access_for_operations(conn, &msg.id, operations) {
 					return err;
@@ -505,11 +506,7 @@ async fn handle_rtdb_command(
 					Ok(t) => t,
 					Err(e) => {
 						warn!("Failed to start transaction: {}", e);
-						return RtdbMessage::error(
-							msg.id.clone(),
-							500,
-							format!("Failed to start transaction: {}", e),
-						);
+						return RtdbMessage::error(msg.id.clone(), e);
 					}
 				};
 				let mut results = Vec::new();
@@ -541,8 +538,7 @@ async fn handle_rtdb_command(
 						drop(txn);
 						return RtdbMessage::error(
 							msg.id.clone(),
-							423,
-							format!("Document locked by {}", lock.user_id),
+							Error::Conflict(format!("Document locked by {}", lock.user_id)),
 						);
 					}
 
@@ -670,8 +666,7 @@ async fn handle_rtdb_command(
 							drop(txn);
 							return RtdbMessage::error(
 								msg.id.clone(),
-								400,
-								"Invalid operation type",
+								Error::ValidationError("Invalid operation type".into()),
 							);
 						}
 					};
@@ -683,11 +678,7 @@ async fn handle_rtdb_command(
 							warn!("Transaction operation failed: {}", e);
 							// Explicitly drop transaction to trigger rollback
 							drop(txn);
-							return RtdbMessage::error(
-								msg.id.clone(),
-								500,
-								format!("Transaction failed: {}", e),
-							);
+							return RtdbMessage::error(msg.id.clone(), e);
 						}
 					}
 				}
@@ -699,11 +690,7 @@ async fn handle_rtdb_command(
 				);
 				if let Err(e) = txn.commit().await {
 					warn!("Transaction commit failed: {}", e);
-					return RtdbMessage::error(
-						msg.id.clone(),
-						500,
-						format!("Transaction commit failed: {}", e),
-					);
+					return RtdbMessage::error(msg.id.clone(), e);
 				}
 
 				// Record file modification (throttled)
@@ -722,7 +709,10 @@ async fn handle_rtdb_command(
 				RtdbMessage::response(msg.id.clone(), "transactionResult", result_map)
 			} else {
 				warn!("RTDB transaction: no operations found");
-				RtdbMessage::error(msg.id.clone(), 400, "Missing operations")
+				RtdbMessage::error(
+					msg.id.clone(),
+					Error::ValidationError("Missing operations".into()),
+				)
 			}
 		}
 
@@ -731,7 +721,7 @@ async fn handle_rtdb_command(
 			use cloudillo_types::rtdb_adapter::{
 				AggregateOptions, QueryFilter, QueryOptions, SortField,
 			};
-			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+			let path = msg.data.get("path").and_then(|v| v.as_str()).unwrap_or("");
 			debug!("RTDB query: path={}", path);
 
 			// Build query options from payload
@@ -744,7 +734,7 @@ async fn handle_rtdb_command(
 			// an older server gets a superset of what it asked for (`select`
 			// ignored, whole documents back), never a rejection, and must not assume
 			// an option took effect without checking the response.
-			if let Some(filter_obj) = msg.payload.get("filter")
+			if let Some(filter_obj) = msg.data.get("filter")
 				&& let Ok(filter) = serde_json::from_value::<QueryFilter>(filter_obj.clone())
 			{
 				opts = opts.with_filter(filter);
@@ -752,7 +742,7 @@ async fn handle_rtdb_command(
 			}
 
 			// Parse sort
-			if let Some(sort_arr) = msg.payload.get("sort").and_then(|v| v.as_array()) {
+			if let Some(sort_arr) = msg.data.get("sort").and_then(|v| v.as_array()) {
 				let mut sort_fields = Vec::new();
 				for item in sort_arr {
 					if let (Some(field), Some(asc)) = (
@@ -770,21 +760,21 @@ async fn handle_rtdb_command(
 			}
 
 			// Parse limit
-			if let Some(limit) = msg.payload.get("limit").and_then(Value::as_u64) {
+			if let Some(limit) = msg.data.get("limit").and_then(Value::as_u64) {
 				let limit_u32 = u32::try_from(limit).unwrap_or_default();
 				opts = opts.with_limit(limit_u32);
 				debug!("RTDB query limit: {}", limit);
 			}
 
 			// Parse offset
-			if let Some(offset) = msg.payload.get("offset").and_then(Value::as_u64) {
+			if let Some(offset) = msg.data.get("offset").and_then(Value::as_u64) {
 				let offset_u32 = u32::try_from(offset).unwrap_or_default();
 				opts = opts.with_offset(offset_u32);
 				debug!("RTDB query offset: {}", offset);
 			}
 
 			// Parse aggregate
-			if let Some(agg_obj) = msg.payload.get("aggregate")
+			if let Some(agg_obj) = msg.data.get("aggregate")
 				&& let Ok(agg) = serde_json::from_value::<AggregateOptions>(agg_obj.clone())
 			{
 				debug!("RTDB query aggregate: groupBy={}", agg.group_by);
@@ -792,7 +782,7 @@ async fn handle_rtdb_command(
 			}
 
 			// Parse select (field projection)
-			if let Some(select) = parse_select(&msg.payload) {
+			if let Some(select) = parse_select(&msg.data) {
 				debug!("RTDB query select: {} fields", select.len());
 				opts = opts.with_select(select);
 			}
@@ -800,21 +790,23 @@ async fn handle_rtdb_command(
 			match app.rtdb_adapter.query(conn.tn_id, &conn.file_id, path, opts).await {
 				Ok(documents) => {
 					debug!("RTDB query result: {} documents", documents.len());
-					let mut result_map = serde_json::Map::new();
-					result_map.insert("data".to_string(), Value::Array(documents));
-					RtdbMessage::response(msg.id.clone(), "queryResult", result_map)
+					RtdbMessage {
+						id: msg.id.clone(),
+						msg_type: "queryResult".into(),
+						data: Value::Array(documents),
+					}
 				}
 				Err(e) => {
 					warn!("Query failed: {}", e);
-					RtdbMessage::error(msg.id.clone(), 500, "Query failed")
+					RtdbMessage::error(msg.id.clone(), e)
 				}
 			}
 		}
 
 		"get" => {
 			// Fetch single document
-			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
-			let select = parse_select(&msg.payload);
+			let path = msg.data.get("path").and_then(|v| v.as_str()).unwrap_or("");
+			let select = parse_select(&msg.data);
 
 			match app.rtdb_adapter.get(conn.tn_id, &conn.file_id, path).await {
 				Ok(document) => {
@@ -826,13 +818,15 @@ async fn handle_rtdb_command(
 						(Some(select), Some(doc)) => Some(project_doc(&doc, select)),
 						(_, doc) => doc,
 					};
-					let mut result_map = serde_json::Map::new();
-					result_map.insert("data".to_string(), document.unwrap_or(Value::Null));
-					RtdbMessage::response(msg.id.clone(), "getResult", result_map)
+					RtdbMessage {
+						id: msg.id.clone(),
+						msg_type: "getResult".into(),
+						data: document.unwrap_or(Value::Null),
+					}
 				}
 				Err(e) => {
 					warn!("Get failed: {}", e);
-					RtdbMessage::error(msg.id.clone(), 404, "Document not found")
+					RtdbMessage::error(msg.id.clone(), e)
 				}
 			}
 		}
@@ -842,33 +836,33 @@ async fn handle_rtdb_command(
 			use cloudillo_types::rtdb_adapter::{
 				AggregateOptions, QueryFilter, QueryOptions, SubscriptionOptions, SubscriptionScope,
 			};
-			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+			let path = msg.data.get("path").and_then(|v| v.as_str()).unwrap_or("");
 			debug!("RTDB subscribe: path={}", path);
 			let subscription_id = format!("sub-{}", random_id().unwrap_or_default());
 
 			// Parse filter from payload
 			let filter = msg
-				.payload
+				.data
 				.get("filter")
 				.and_then(|obj| serde_json::from_value::<QueryFilter>(obj.clone()).ok());
 
 			// Parse aggregate from payload
 			let aggregate = msg
-				.payload
+				.data
 				.get("aggregate")
 				.and_then(|obj| serde_json::from_value::<AggregateOptions>(obj.clone()).ok());
 
 			// Parse select from payload. An aggregate subscription ignores it:
 			// the group-by field would have to survive the projection anyway, and
 			// the events it emits are groups rather than documents.
-			let select = if aggregate.is_some() { None } else { parse_select(&msg.payload) };
+			let select = if aggregate.is_some() { None } else { parse_select(&msg.data) };
 
 			// How much of the path the subscription covers. An absent or
 			// unrecognised value degrades to `Subtree`, which is what every
 			// subscription did before this field existed — a client that predates
 			// it must keep seeing exactly what it saw.
 			let scope = msg
-				.payload
+				.data
 				.get("scope")
 				.and_then(|v| serde_json::from_value::<SubscriptionScope>(v.clone()).ok())
 				.unwrap_or_default();
@@ -1099,7 +1093,7 @@ async fn handle_rtdb_command(
 				}
 				Err(e) => {
 					warn!("Subscribe failed: {}", e);
-					RtdbMessage::error(msg.id.clone(), 500, format!("Subscribe failed: {}", e))
+					RtdbMessage::error(msg.id.clone(), e)
 				}
 			}
 		}
@@ -1107,7 +1101,7 @@ async fn handle_rtdb_command(
 		"unsubscribe" => {
 			// Stop real-time updates
 			let subscription_id =
-				msg.payload.get("subscriptionId").and_then(|v| v.as_str()).unwrap_or("");
+				msg.data.get("subscriptionId").and_then(|v| v.as_str()).unwrap_or("");
 
 			let mut handles = conn.subscription_handles.write().await;
 			if let Some(handle) = handles.remove(subscription_id) {
@@ -1120,14 +1114,13 @@ async fn handle_rtdb_command(
 
 		"createIndex" => {
 			// Create an index on a field for query optimization
-			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
-			let field = msg.payload.get("field").and_then(|v| v.as_str()).unwrap_or("");
+			let path = msg.data.get("path").and_then(|v| v.as_str()).unwrap_or("");
+			let field = msg.data.get("field").and_then(|v| v.as_str()).unwrap_or("");
 
 			if path.is_empty() || field.is_empty() {
 				return RtdbMessage::error(
 					msg.id.clone(),
-					400,
-					"Missing path or field for index creation",
+					Error::ValidationError("Missing path or field for index creation".into()),
 				);
 			}
 
@@ -1149,17 +1142,17 @@ async fn handle_rtdb_command(
 				}
 				Err(e) => {
 					warn!("Create index failed: {}", e);
-					RtdbMessage::error(msg.id.clone(), 500, format!("Create index failed: {}", e))
+					RtdbMessage::error(msg.id.clone(), e)
 				}
 			}
 		}
 
 		"lock" => {
-			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+			let path = msg.data.get("path").and_then(|v| v.as_str()).unwrap_or("");
 			if let Some(err) = check_write_access(conn, &msg.id, path) {
 				return err;
 			}
-			let mode = match msg.payload.get("mode").and_then(|v| v.as_str()) {
+			let mode = match msg.data.get("mode").and_then(|v| v.as_str()) {
 				Some("hard") => LockMode::Hard,
 				_ => LockMode::Soft,
 			};
@@ -1192,13 +1185,13 @@ async fn handle_rtdb_command(
 				}
 				Err(e) => {
 					warn!("Lock failed: {}", e);
-					RtdbMessage::error(msg.id.clone(), 500, format!("Lock failed: {}", e))
+					RtdbMessage::error(msg.id.clone(), e)
 				}
 			}
 		}
 
 		"unlock" => {
-			let path = msg.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+			let path = msg.data.get("path").and_then(|v| v.as_str()).unwrap_or("");
 			if let Some(err) = check_write_access(conn, &msg.id, path) {
 				return err;
 			}
@@ -1213,7 +1206,7 @@ async fn handle_rtdb_command(
 				}
 				Err(e) => {
 					warn!("Unlock failed: {}", e);
-					RtdbMessage::error(msg.id.clone(), 500, format!("Unlock failed: {}", e))
+					RtdbMessage::error(msg.id.clone(), e)
 				}
 			}
 		}
@@ -1228,8 +1221,7 @@ async fn handle_rtdb_command(
 				// nobody will ever receive.
 				return RtdbMessage::error(
 					msg.id.clone(),
-					400,
-					"Presence not enabled for this connection",
+					Error::ValidationError("Presence not enabled for this connection".into()),
 				);
 			}
 
@@ -1238,7 +1230,7 @@ async fn handle_rtdb_command(
 			// therefore tested. Everything here is the I/O it decides on. The rate guard
 			// is a statement temporary, so it is released before `publish` awaits.
 			let outcome = presence_frame(
-				msg.payload.get("state"),
+				msg.data.get("state"),
 				conn.id_tag.as_deref(),
 				&mut *conn.presence_rate.lock().await,
 				Instant::now(),
@@ -1246,7 +1238,10 @@ async fn handle_rtdb_command(
 
 			let state = match outcome {
 				Err(rejection) => {
-					return RtdbMessage::error(msg.id.clone(), rejection.code, rejection.message);
+					return RtdbMessage::error(
+						msg.id.clone(),
+						Error::ValidationError(rejection.message.into()),
+					);
 				}
 				Ok(PresenceFrame::Throttled) => {
 					// Nothing stored and nothing broadcast, so the client has to resend —
@@ -1273,17 +1268,9 @@ async fn handle_rtdb_command(
 			// *fast* against an older server — an uncorrelated refusal would instead
 			// stall the caller for the full 30 s request timeout.
 			warn!("Unknown RTDB command: {}", msg.msg_type);
-			RtdbMessage::error(msg.id.clone(), 400, format!("Unknown command: {}", msg.msg_type))
+			RtdbMessage::error(msg.id.clone(), Error::RtdbUnknownCommand(msg.msg_type.clone()))
 		}
 	}
-}
-
-/// Get current timestamp
-fn now_timestamp() -> u64 {
-	std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
-		.unwrap_or_default()
-		.as_secs()
 }
 
 /// Record file access with throttling (max once per TRACKING_THROTTLE_SECS)
@@ -1368,14 +1355,26 @@ mod tests {
 	#[test]
 	fn echoes_the_request_id() {
 		// `RtdbMessage::new` would mint a random id, correlating with nothing the client
-		// is waiting on. Both id shapes the TS client sends must come back verbatim.
-		for id in [Value::String("req-7".to_owned()), json!(7)] {
-			let msg = RtdbMessage::error(id.clone(), 413, "too large");
-			assert_eq!(msg.id, id);
-			assert_eq!(msg.msg_type, "error");
-			assert_eq!(msg.payload.get("code"), Some(&json!(413)));
-			assert_eq!(msg.payload.get("message"), Some(&json!("too large")));
+		// is waiting on. A numeric id (pre-string clients) comes back stringified.
+		for (raw, id) in [(json!("req-7"), "req-7"), (json!(7), "7")] {
+			let parsed: RtdbMessage =
+				serde_json::from_value(json!({ "id": raw, "type": "bogus" })).unwrap();
+			assert_eq!(parsed.id, id);
+			assert!(parsed.data.is_null());
+			let msg =
+				RtdbMessage::error(parsed.id, Error::RtdbUnknownCommand(parsed.msg_type.clone()));
+			let wire = serde_json::to_value(&msg).unwrap();
+			assert_eq!(wire["id"], json!(id));
+			assert_eq!(wire["type"], json!("error"));
+			assert_eq!(wire["data"]["code"], json!("E-RTDB-UNKNOWNCOMMAND"));
+			assert!(wire["data"]["message"].is_string());
 		}
+	}
+
+	#[test]
+	fn rejects_a_non_scalar_id() {
+		let bad = serde_json::from_value::<RtdbMessage>(json!({ "id": null, "type": "ping" }));
+		assert!(bad.is_err());
 	}
 }
 

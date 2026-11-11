@@ -9,6 +9,7 @@ use crate::utils::Db;
 use cloudillo_types::{
 	auth_adapter::{AuditCategory, AuditEvent, AuditEventRow, AuditQuery},
 	prelude::*,
+	types::ApiTime,
 };
 
 pub(crate) async fn append_audit_event(db: &SqlitePool, ev: &AuditEvent) -> ClResult<()> {
@@ -81,7 +82,7 @@ pub(crate) async fn list_audit_events(
 			Ok(AuditEventRow {
 				id: row.try_get("id")?,
 				event: AuditEvent {
-					ts: Timestamp(row.try_get("ts")?),
+					ts: ApiTime(row.try_get("ts")?),
 					tn_id: row.try_get::<Option<u32>, _>("tn_id")?.map(TnId),
 					actor: row.try_get::<Option<String>, _>("actor")?.map(Into::into),
 					event: row.try_get::<String, _>("event")?.into(),
@@ -123,20 +124,20 @@ mod tests {
 			.unwrap();
 
 		let old = AuditEvent {
-			ts: Timestamp(1000),
+			ts: ApiTime(1000),
 			tn_id: Some(TnId(1)),
 			actor: Some("alice.test".into()),
 			details: Some(serde_json::json!({ "method": "password" })),
 			..AuditEvent::new(AuditCategory::Auth, "auth.login", "fail")
 		};
 		let new = AuditEvent {
-			ts: Timestamp(2000),
+			ts: ApiTime(2000),
 			tn_id: Some(TnId(1)),
 			ip: Some("127.0.0.1".into()),
 			..AuditEvent::new(AuditCategory::Sharing, "sharing.share.create", "success")
 		};
 		let global = AuditEvent {
-			ts: Timestamp(3000),
+			ts: ApiTime(3000),
 			..AuditEvent::new(AuditCategory::Admin, "admin.settings.change", "success")
 		};
 		for ev in [&old, &new, &global] {

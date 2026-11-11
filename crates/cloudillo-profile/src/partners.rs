@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::list::PublicProfile;
 use crate::prelude::*;
 use cloudillo_core::abac;
-use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
+use cloudillo_core::extract::{Auth, IdTag};
 use cloudillo_core::request::ConditionalResult;
 use cloudillo_core::scheduler::{Task, TaskId};
 use cloudillo_core::settings::SettingValue;
@@ -21,7 +21,7 @@ use cloudillo_types::meta_adapter::{
 	ListProfileOptions, PartnerEdge, Profile, ProfileConnectionStatus, ProfileStatus, ProfileType,
 	UpsertProfileFields,
 };
-use cloudillo_types::types::{self, ApiResponse, ProfileBase};
+use cloudillo_types::types::{self, ApiResponse, ApiTime, ProfileBase};
 use cloudillo_types::validation::validate_id_tag;
 
 /// A map older than this is re-synced when opened.
@@ -326,7 +326,6 @@ pub async fn sync_partners(
 	tn_id: TnId,
 	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SyncScheduled>>)> {
 	abac::require_tenant_self(&auth, &tenant_id_tag, "partners")?;
 	// A partial sync backdates synced_at, so it bypasses the cooldown; the per-sync
@@ -336,8 +335,7 @@ pub async fn sync_partners(
 	if scheduled {
 		schedule_partner_sync(&app, tn_id).await;
 	}
-	let response =
-		ApiResponse::new(SyncScheduled { scheduled }).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(SyncScheduled { scheduled });
 	Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
@@ -350,8 +348,8 @@ pub struct PartnerMap {
 	pub partners: Vec<PublicProfile>,
 	/// Every edge whose ends are both on the map (incl. membership↔membership chords).
 	pub edges: Vec<PartnerEdge>,
-	/// Last sync (unix seconds; a partial one is backdated to retry sooner), `None` if never.
-	pub synced_at: Option<i64>,
+	/// Last sync (a partial one is backdated to retry sooner), `None` if never.
+	pub synced_at: Option<ApiTime>,
 	/// A sync was scheduled by this request because the map was stale.
 	pub syncing: bool,
 }
@@ -384,7 +382,6 @@ pub async fn get_partner_map(
 	tn_id: TnId,
 	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<PartnerMap>>)> {
 	abac::require_tenant_self(&auth, &tenant_id_tag, "partners")?;
 
@@ -444,10 +441,10 @@ pub async fn get_partner_map(
 		communities,
 		partners,
 		edges,
-		synced_at: (synced_at > 0).then_some(synced_at),
+		synced_at: (synced_at > 0).then_some(ApiTime(synced_at)),
 		syncing,
 	};
-	let response = ApiResponse::new(map).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(map);
 	Ok((StatusCode::OK, Json(response)))
 }
 

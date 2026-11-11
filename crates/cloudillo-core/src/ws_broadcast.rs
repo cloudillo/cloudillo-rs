@@ -264,7 +264,7 @@ impl Default for BroadcastManager {
 }
 
 /// Get current timestamp
-fn now_timestamp() -> u64 {
+pub fn now_timestamp() -> u64 {
 	std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
 		.unwrap_or_default()
@@ -314,13 +314,13 @@ mod tests {
 
 		let mut rx = manager.register_user(tn_id, "alice", "conn-1").await;
 
-		let msg = BroadcastMessage::new("ACTION", serde_json::json!({ "type": "MSG" }), "system");
+		let msg = BroadcastMessage::new("action", serde_json::json!({ "type": "MSG" }), "system");
 		let result = manager.send_to_user(tn_id, "alice", msg).await;
 
 		assert_eq!(result, DeliveryResult::Delivered(1));
 
 		let received = rx.recv().await.unwrap();
-		assert_eq!(received.cmd, "ACTION");
+		assert_eq!(received.cmd, "action");
 	}
 
 	#[tokio::test]
@@ -331,10 +331,10 @@ mod tests {
 		let mut rx1 = manager.register_user(tn_id, "alice", "conn-1").await;
 		let mut rx2 = manager.register_user(tn_id, "alice", "conn-2").await;
 
-		let msg = BroadcastMessage::new("ACTION", serde_json::json!({}), "system");
+		let msg = BroadcastMessage::new("action", serde_json::json!({}), "system");
 		assert_eq!(manager.send_to_tenant(tn_id, msg).await, 2);
-		assert_eq!(rx1.recv().await.unwrap().cmd, "ACTION");
-		assert_eq!(rx2.recv().await.unwrap().cmd, "ACTION");
+		assert_eq!(rx1.recv().await.unwrap().cmd, "action");
+		assert_eq!(rx2.recv().await.unwrap().cmd, "action");
 	}
 
 	#[tokio::test]
@@ -342,7 +342,7 @@ mod tests {
 		let manager = BroadcastManager::new();
 		let tn_id = TnId(1);
 
-		let msg = BroadcastMessage::new("ACTION", serde_json::json!({ "type": "MSG" }), "system");
+		let msg = BroadcastMessage::new("action", serde_json::json!({ "type": "MSG" }), "system");
 		let result = manager.send_to_user(tn_id, "bob", msg).await;
 
 		assert_eq!(result, DeliveryResult::UserOffline);

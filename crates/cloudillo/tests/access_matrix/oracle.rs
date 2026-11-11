@@ -302,7 +302,7 @@ fn file_listed(w: &Who, f: &FileObj, search: bool) -> Expect {
 	file_query(w, f, search)
 }
 
-/// A targeted file query (`?fileId=`, `?parentId=`, `?status=`): any lifecycle (bar pending
+/// A targeted file query (`?contentId=`, `?parentId=`, `?status=`): any lifecycle (bar pending
 /// under `?parentId=`), under the lifecycle gate; tree and scope confinement as a listing. Rows
 /// are judged, not levels.
 fn file_targeted(w: &Who, f: &FileObj) -> Expect {
@@ -403,13 +403,13 @@ pub fn expected(s: &SubjectFacts, o: &Obj, op: &Op) -> Expect {
 	};
 	match (op, o) {
 		(Op::File(FileOp::List), Obj::File(f)) => file_listed(&w, f, false),
-		// A pending upload is never browsed, not even by its owner; `?fileId=` reaches it.
+		// A pending upload is never browsed, not even by its owner; `?contentId=` reaches it.
 		(Op::File(FileOp::ByParent), Obj::File(f)) if f.spec.life == FileLife::Pending => {
 			absent("list.pending")
 		}
 		(Op::File(FileOp::ById | FileOp::ByParent), Obj::File(f)) => file_targeted(&w, f),
 		(Op::File(FileOp::ByStatus(c)), Obj::File(f)) => match (c, f.spec.life) {
-			// Tombstones are never listable (`?status=D` is refused).
+			// Tombstones are never listable (`?status=deleted` is refused).
 			(_, FileLife::Tombstoned) | ('D', _) => absent("list.status.tombstone"),
 			('P', FileLife::Pending) => file_targeted(&w, f),
 			_ => absent("list.status"),

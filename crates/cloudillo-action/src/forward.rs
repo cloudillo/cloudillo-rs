@@ -12,6 +12,7 @@
 
 use crate::prelude::*;
 use cloudillo_core::ws_broadcast::{BroadcastMessage, DeliveryResult};
+use cloudillo_types::api_enums::{ActionFlags, action_status, visibility};
 use cloudillo_types::meta_adapter::{ActionView, AttachmentView};
 use serde_json::json;
 
@@ -137,7 +138,7 @@ fn build_action_view_message(
 	if let Some(n) = notify {
 		data["notify"] = json!(n);
 	}
-	BroadcastMessage::new("ACTION", data, "system")
+	BroadcastMessage::new("action", data, "system")
 }
 
 /// Forward a full ActionView to the audience user via WebSocket
@@ -175,12 +176,16 @@ pub async fn forward_inbound_action_view(
 
 /// Build a BroadcastMessage for an action from params
 ///
-/// Used by process.rs and task.rs when a full ActionView is not available.
+/// Used by process.rs and task.rs when a full ActionView is not available. Emits the same
+/// field names and values as a serialized [`ActionView`] (`id`, enum words, `flags` object,
+/// `extra`).
 fn build_action_message(params: &ForwardActionParams<'_>) -> BroadcastMessage {
+	let status = params.status.and_then(|s| s.chars().next()).map(action_status::to_word);
+	let visibility = params.visibility.map_or(visibility::NONE, |v| Some(visibility::to_word(v)));
 	BroadcastMessage::new(
-		"ACTION",
+		"action",
 		json!({
-			"actionId": params.action_id,
+			"id": params.action_id,
 			"tempId": params.temp_id,
 			"type": params.action_type,
 			"subType": params.sub_type,
@@ -193,10 +198,10 @@ fn build_action_message(params: &ForwardActionParams<'_>) -> BroadcastMessage {
 			"attachments": params.attachments,
 			"subject": params.subject,
 			"createdAt": params.created_at.to_iso_string(),
-			"status": params.status,
-			"visibility": params.visibility,
-			"flags": params.flags,
-			"x": params.x,
+			"status": status,
+			"visibility": visibility,
+			"flags": ActionFlags::from_letters(params.flags),
+			"extra": params.x,
 		}),
 		"system",
 	)
@@ -457,14 +462,14 @@ mod tests {
 	/// Both forward paths build through here, so neither pushes the tenant's reader state.
 	#[test]
 	fn test_action_view_message_drops_reader_state() {
-		use cloudillo_types::meta_adapter::{ProfileInfo, ProfileType, ReaderState};
+		use cloudillo_types::meta_adapter::{ProfileRef, ProfileType, ReaderState};
 		let view = ActionView {
 			action_id: "a1~msg".into(),
 			typ: "MSG".into(),
 			sub_typ: None,
 			parent_id: None,
 			root_id: None,
-			issuer: ProfileInfo {
+			issuer: ProfileRef {
 				id_tag: "alice.example.com".into(),
 				name: "Alice".into(),
 				typ: ProfileType::Person,
@@ -476,7 +481,7 @@ mod tests {
 			subject: None,
 			subject_profile: None,
 			subject_action: None,
-			created_at: Timestamp(0),
+			created_at: Timestamp(0).into(),
 			received_at: None,
 			expires_at: None,
 			status: Some("A".into()),
@@ -497,8 +502,8 @@ mod tests {
 				archived: false,
 				ignore_all: false,
 				unread_flag: false,
-				created_at: Timestamp(0),
-				updated_at: Timestamp(0),
+				created_at: Timestamp(0).into(),
+				updated_at: Timestamp(0).into(),
 				profile: None,
 				action: None,
 				last: None,
@@ -507,6 +512,7 @@ mod tests {
 			hat: None,
 			channel: None,
 			token: None,
+			delivery_error: None,
 		};
 		assert!(serde_json::to_value(&view).is_ok_and(|v| v.get("readerState").is_some()));
 		let msg = build_action_view_message(&view, Some("@1"), None);

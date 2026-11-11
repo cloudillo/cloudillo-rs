@@ -139,6 +139,7 @@ impl Task<App> for StatEmitTask {
 				self.tn_id,
 				&self.tenant_tag,
 				&self.subject_id,
+				crate::post_store::Effects::ALL,
 			)
 			.await;
 		}

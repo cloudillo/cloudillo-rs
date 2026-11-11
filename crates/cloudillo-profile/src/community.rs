@@ -3,11 +3,7 @@
 
 //! Community profile creation handler
 
-use axum::{
-	Json,
-	extract::{Path, State},
-	http::StatusCode,
-};
+use axum::{Json, extract::State, http::StatusCode};
 
 use crate::prelude::*;
 use cloudillo_core::{
@@ -25,18 +21,28 @@ use cloudillo_types::{
 	utils::derive_name_from_id_tag,
 };
 
-/// PUT /api/profiles/{id_tag} - Create a new community profile
-pub async fn put_community_profile(
+/// Body of `POST /api/communities`: the community's `idTag` plus the shared
+/// [`CreateCommunityRequest`] fields.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostCommunityBody {
+	pub id_tag: String,
+	#[serde(flatten)]
+	pub community: CreateCommunityRequest,
+}
+
+/// POST /api/communities - Create a new community profile (`idTag` in the body)
+pub async fn post_community(
 	State(app): State<App>,
 	Auth(auth): Auth,
-	Path(id_tag): Path<String>,
-	Json(req): Json<CreateCommunityRequest>,
+	Json(body): Json<PostCommunityBody>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CommunityProfileResponse>>)> {
 	#[derive(serde::Serialize)]
 	struct InboxRequest {
 		token: String,
 	}
 
+	let PostCommunityBody { id_tag, community: req } = body;
 	let id_tag_lower = id_tag.to_lowercase();
 	let creator_id_tag = &auth.id_tag;
 	let creator_tn_id = auth.tn_id;
@@ -340,7 +346,7 @@ pub async fn put_community_profile(
 		name: display_name,
 		r#type: "community".to_string(),
 		profile_pic: req.profile_pic,
-		created_at: Timestamp::now(),
+		created_at: Timestamp::now().into(),
 		onboarding: initial_onboarding.map(str::to_string),
 	};
 

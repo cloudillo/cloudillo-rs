@@ -8,11 +8,11 @@ use sqlx::{Row, SqlitePool};
 use crate::utils::{Db, escape_like, inspect, parse_str_list, push_in};
 use cloudillo_types::meta_adapter::{
 	Action, ActionData, ActionId, ActionView, AttachmentView, AudienceType, FinalizeActionOptions,
-	HIDDEN_ACTION_STATUSES, ListActionOptions, ProfileInfo, ProfileRelation, ProfileStatus,
+	HIDDEN_ACTION_STATUSES, ListActionOptions, ProfileRef, ProfileRelation, ProfileStatus,
 	ProfileType, UpdateActionDataOptions,
 };
-use cloudillo_types::prelude::*;
 use cloudillo_types::utils::normalize_id_tag;
+use cloudillo_types::{prelude::*, types::ApiTime};
 
 /// Map a DB visibility column value to the ActionView representation.
 /// Storage uses 'D' for Direct uniformly; ActionView treats Direct as None to
@@ -32,7 +32,7 @@ fn content_text(row: &sqlx::sqlite::SqliteRow) -> Result<Option<String>, sqlx::E
 /// Build `ActionView.hat` from the `ph` join columns (`hat_tag`, `hat_name`,
 /// `hat_profile_pic`). A hat community with no local profile row (a mirror
 /// node) still resolves, named by its id_tag, so attribution never vanishes.
-fn hat_info(row: &sqlx::sqlite::SqliteRow) -> ClResult<Option<ProfileInfo>> {
+fn hat_info(row: &sqlx::sqlite::SqliteRow) -> ClResult<Option<ProfileRef>> {
 	let Some(id_tag) = row.try_get::<Option<Box<str>>, _>("hat_tag").db()? else {
 		return Ok(None);
 	};
@@ -40,7 +40,7 @@ fn hat_info(row: &sqlx::sqlite::SqliteRow) -> ClResult<Option<ProfileInfo>> {
 		.try_get::<Option<Box<str>>, _>("hat_name")
 		.db()?
 		.unwrap_or_else(|| id_tag.clone());
-	Ok(Some(ProfileInfo {
+	Ok(Some(ProfileRef {
 		id_tag,
 		name,
 		typ: ProfileType::Community,
@@ -467,8 +467,8 @@ pub(crate) fn push_draft_guard(
 /// When `opts.visibility_guard` is set (guest `Patch::Null` / viewer
 /// `Patch::Value`), the count applies `push_visibility_guard` — the query-level
 /// ABAC translation of `abac::can_view_item` — so the result is a
-/// post-visibility count. `filter_actions_by_visibility` (`cloudillo-action`) is
-/// the row-list equivalent; the two are kept pinned by the parity tests below.
+/// post-visibility count. `list` applies the same guard; `filter_actions_by_visibility`
+/// (`cloudillo-action`) is the Rust equivalent, kept pinned by the parity tests below.
 /// `Patch::Undefined` (the default for every in-crate test and internal caller)
 /// counts every matching row.
 pub(crate) async fn count(db: &SqlitePool, tn_id: TnId, opts: &ListActionOptions) -> ClResult<i64> {
@@ -563,7 +563,7 @@ pub(crate) async fn list(
 		a.hat_tag, a.channel, ph.name as hat_name, ph.profile_pic as hat_profile_pic,
 		a.content, a.created_at, a.received_at, a.expires_at,
 		own.sub_type as own_reaction,
-		a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.reposts, a.visibility, a.flags, a.x, ",
+		a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.reposts, a.visibility, a.flags, a.x, a.delivery_error, ",
 		crate::reader_state::rs_cols!("rs"),
 		"
 		FROM actions a
@@ -584,6 +584,9 @@ pub(crate) async fn list(
 	query.push_bind(tn_id.0);
 
 	query = push_action_filters(query, opts);
+	// Same SQL guard as `count`, so the keyset cursor and `has_more` the handler takes from
+	// the raw rows never point at a row the viewer may not see. No-op for `Undefined`.
+	query = push_visibility_guard(query, opts);
 
 	// Determine the ordering column. The home feed passes sort="received" so it
 	// orders by ingestion time (received_at); every other caller keeps the
@@ -770,7 +773,7 @@ pub(crate) async fn list(
 			sub_typ: row.try_get::<Option<Box<str>>, _>("sub_type").db()?,
 			parent_id: row.try_get::<Option<Box<str>>, _>("parent_id").db()?,
 			root_id: row.try_get::<Option<Box<str>>, _>("root_id").db()?,
-			issuer: ProfileInfo {
+			issuer: ProfileRef {
 				id_tag: issuer_tag,
 				name: row.try_get::<Box<str>, _>("issuer_name").db()?,
 				typ: match row.try_get::<Option<&str>, _>("issuer_type").db()? {
@@ -780,7 +783,7 @@ pub(crate) async fn list(
 				profile_pic: row.try_get::<Option<Box<str>>, _>("issuer_profile_pic").db()?,
 			},
 			audience: if let Some(audience_tag) = audience_tag {
-				Some(ProfileInfo {
+				Some(ProfileRef {
 					id_tag: audience_tag,
 					name: row.try_get::<Box<str>, _>("audience_name").db()?,
 					typ: match row.try_get::<Option<&str>, _>("audience_type").db()? {
@@ -794,7 +797,7 @@ pub(crate) async fn list(
 			},
 			subject: row.try_get("subject").db()?,
 			subject_profile: match row.try_get::<Option<Box<str>>, _>("subject_id_tag").db()? {
-				Some(id_tag) => Some(ProfileInfo {
+				Some(id_tag) => Some(ProfileRef {
 					id_tag,
 					name: row
 						.try_get::<Option<Box<str>>, _>("subject_name")
@@ -814,9 +817,9 @@ pub(crate) async fn list(
 			subject_action: None,
 			content: content_text(&row).db()?.and_then(|s| serde_json::from_str(&s).ok()),
 			attachments,
-			created_at: row.try_get("created_at").map(Timestamp).db()?,
-			received_at: row.try_get::<Option<i64>, _>("received_at").ok().flatten().map(Timestamp),
-			expires_at: row.try_get("expires_at").map(|ts: Option<i64>| ts.map(Timestamp)).db()?,
+			created_at: row.try_get("created_at").map(ApiTime).db()?,
+			received_at: row.try_get::<Option<i64>, _>("received_at").ok().flatten().map(ApiTime),
+			expires_at: row.try_get("expires_at").map(|ts: Option<i64>| ts.map(ApiTime)).db()?,
 			status: row.try_get("status").db()?,
 			stat,
 			visibility,
@@ -827,10 +830,11 @@ pub(crate) async fn list(
 				.db()?
 				.and_then(|s| serde_json::from_str(&s).ok()),
 			token: None,
+			delivery_error: row.try_get("delivery_error").ok().flatten(),
 		});
 	}
 
-	// Opt-in (includeTokens=true): populate each action's raw signed JWS from
+	// Opt-in (include=tokens): populate each action's raw signed JWS from
 	// action_tokens (e.g. the engagement dialog's signature-verification path).
 	if opts.include_tokens == Some(true) && !actions.is_empty() {
 		let ids: Vec<&str> = actions.iter().map(|a| a.action_id.as_ref()).collect();
@@ -857,11 +861,11 @@ pub(crate) async fn list(
 					}
 				}
 			}
-			Err(e) => warn!("list: includeTokens fetch failed: {e}"),
+			Err(e) => warn!("list: include=tokens fetch failed: {e}"),
 		}
 	}
 
-	// Opt-in (includeSubject=true): embed each row's referenced action (with its
+	// Opt-in (include=subject): embed each row's referenced action (with its
 	// `stat`) so the client renders the shared/referenced post without a second
 	// round-trip. Generic across types (REPOST→post, SUBS→CONV, ...). The inner
 	// get() passes hydrate_subject=false, so hydration is one level only.
@@ -926,19 +930,39 @@ pub(crate) async fn create(
 		}
 	}
 
-	// For inbound actions with a key, delete old actions with the same key first
-	// This handles key-based deduplication for inbound actions (outbound actions
-	// handle this in finalize())
+	// Inbound actions with a key: newer wins. If a live row holding the key was created
+	// later, the incoming one is stored retired ('D'); otherwise it retires the old rows.
+	// The check, the supersede and the insert share one transaction. A same-second tie
+	// (`created_at` is the token `iat`, in seconds) lets the incoming action win.
+	// Outbound actions supersede in finalize().
+	let mut tx = db.begin().await.db()?;
+	let mut superseded_on_arrival = false;
 	if !action.action_id.is_empty()
 		&& let Some(key) = key
 	{
-		info!("Inbound action with key: {}, deleting old entries", key);
-		let mut tx = db.begin().await.db()?;
-		supersede_by_key(&mut tx, tn_id, key, None).await?;
-		tx.commit().await.db()?;
+		// A failed ('F') newer row never wins. Pending ('P'/'V') rows still count as live.
+		// If a pending newer row later fails, the older one stays retired;
+		// re-evaluate the key on verification failure if that matters.
+		let newer: Option<i64> = sqlx::query_scalar(
+			"SELECT 1 FROM actions WHERE tn_id=? AND key=? \
+			 AND coalesce(status, 'A') NOT IN ('D', 'F') AND created_at>? LIMIT 1",
+		)
+		.bind(tn_id.0)
+		.bind(key)
+		.bind(action.created_at.0)
+		.fetch_optional(&mut *tx)
+		.await
+		.db()?;
+		if newer.is_some() {
+			info!("Inbound action with key: {}, a newer one is live; storing it retired", key);
+			superseded_on_arrival = true;
+		} else {
+			info!("Inbound action with key: {}, deleting old entries", key);
+			supersede_by_key(&mut tx, tn_id, key, None).await?;
+		}
 	}
 
-	let status = "P";
+	let status = if superseded_on_arrival { "D" } else { "P" };
 	// Storage uses 'D' for Direct uniformly; ActionView still maps 'D' → None at
 	// the read-side boundary, keeping the wire/token format unchanged.
 	// Never write NULL here — migration 25 (schema.rs) backfilled NULLs to 'D'
@@ -975,10 +999,14 @@ pub(crate) async fn create(
 		.bind(x_json)
 		.bind(action.hat_tag.map(|h| normalize_id_tag(h).into_owned()))
 		.bind(action.channel)
-		.fetch_one(db)
+		.fetch_one(&mut *tx)
 		.await
 		.db()?;
+	tx.commit().await.db()?;
 
+	if superseded_on_arrival {
+		return Ok(ActionId::SupersededOnArrival);
+	}
 	Ok(ActionId::AId(res.get(0)))
 }
 
@@ -1356,6 +1384,24 @@ pub(crate) async fn store_token(
 	Ok(())
 }
 
+/// Set the sender-side terminal delivery error of an action (e.g. `"unsupported"`)
+pub(crate) async fn set_delivery_error(
+	db: &SqlitePool,
+	tn_id: TnId,
+	action_id: &str,
+	error: &str,
+) -> ClResult<()> {
+	sqlx::query("UPDATE actions SET delivery_error=? WHERE tn_id=? AND action_id=?")
+		.bind(error)
+		.bind(tn_id.0)
+		.bind(action_id)
+		.execute(db)
+		.await
+		.db()?;
+
+	Ok(())
+}
+
 /// Delete an action token (an edited / deleted MSG must not keep serving its original text)
 pub(crate) async fn delete_token(db: &SqlitePool, tn_id: TnId, action_id: &str) -> ClResult<()> {
 	sqlx::query("DELETE FROM action_tokens WHERE tn_id = ? AND action_id = ?")
@@ -1628,7 +1674,7 @@ pub(crate) async fn get(
 			a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
 			a.hat_tag, a.channel, ph.name as hat_name, ph.profile_pic as hat_profile_pic,
 			a.content, a.created_at, a.received_at, a.expires_at,
-			a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.reposts, a.visibility, a.flags, a.x, ",
+			a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.reposts, a.visibility, a.flags, a.x, a.delivery_error, ",
 			crate::reader_state::rs_cols!("rs"),
 			"
 			FROM actions a
@@ -1654,7 +1700,7 @@ pub(crate) async fn get(
 			a.subject, ps.id_tag as subject_id_tag, ps.name as subject_name, ps.profile_pic as subject_profile_pic, ps.type as subject_type,
 			a.hat_tag, a.channel, ph.name as hat_name, ph.profile_pic as hat_profile_pic,
 			a.content, a.created_at, a.received_at, a.expires_at,
-			a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.reposts, a.visibility, a.flags, a.x, ",
+			a.attachments, a.status, a.reactions, a.comments, a.comments_ts, a.reposts, a.visibility, a.flags, a.x, a.delivery_error, ",
 			crate::reader_state::rs_cols!("rs"),
 			"
 			FROM actions a
@@ -1810,7 +1856,7 @@ pub(crate) async fn get(
 		sub_typ: row.try_get::<Option<Box<str>>, _>("sub_type").db()?,
 		parent_id: row.try_get::<Option<Box<str>>, _>("parent_id").db()?,
 		root_id: row.try_get::<Option<Box<str>>, _>("root_id").db()?,
-		issuer: ProfileInfo {
+		issuer: ProfileRef {
 			id_tag: issuer_tag,
 			name: row
 				.try_get::<Option<Box<str>>, _>("issuer_name")
@@ -1823,7 +1869,7 @@ pub(crate) async fn get(
 			profile_pic: row.try_get::<Option<Box<str>>, _>("issuer_profile_pic").db()?,
 		},
 		audience: if let Some(audience_tag) = audience_tag {
-			Some(ProfileInfo {
+			Some(ProfileRef {
 				id_tag: audience_tag,
 				name: row
 					.try_get::<Option<Box<str>>, _>("audience_name")
@@ -1840,7 +1886,7 @@ pub(crate) async fn get(
 		},
 		subject: row.try_get("subject").db()?,
 		subject_profile: match row.try_get::<Option<Box<str>>, _>("subject_id_tag").db()? {
-			Some(id_tag) => Some(ProfileInfo {
+			Some(id_tag) => Some(ProfileRef {
 				id_tag,
 				name: row
 					.try_get::<Option<Box<str>>, _>("subject_name")
@@ -1860,9 +1906,9 @@ pub(crate) async fn get(
 		subject_action: None,
 		content: content_text(&row).db()?.and_then(|s| serde_json::from_str(&s).ok()),
 		attachments,
-		created_at: row.try_get("created_at").map(Timestamp).db()?,
-		received_at: row.try_get::<Option<i64>, _>("received_at").ok().flatten().map(Timestamp),
-		expires_at: row.try_get("expires_at").map(|ts: Option<i64>| ts.map(Timestamp)).db()?,
+		created_at: row.try_get("created_at").map(ApiTime).db()?,
+		received_at: row.try_get::<Option<i64>, _>("received_at").ok().flatten().map(ApiTime),
+		expires_at: row.try_get("expires_at").map(|ts: Option<i64>| ts.map(ApiTime)).db()?,
 		status: row.try_get("status").db()?,
 		stat,
 		visibility,
@@ -1873,6 +1919,7 @@ pub(crate) async fn get(
 			.db()?
 			.and_then(|s| serde_json::from_str(&s).ok()),
 		token: None,
+		delivery_error: row.try_get("delivery_error").ok().flatten(),
 	};
 
 	// Embed the shared original for REPOST rows so a single-action fetch (e.g. a
@@ -2492,7 +2539,7 @@ mod tests {
 		assert_eq!(cmnt_count, 1, "CMNT child counted separately from MSG children");
 	}
 
-	// E6/E9: `includeSubject=true` hydrates `subject_action` (with its `stat`) for
+	// `include=subject` hydrates `subject_action` (with its `stat`) for
 	// ANY row whose subject is a real action id (SUBS→CONV as well as REPOST).
 	// Without the flag it's omitted even for a REPOST.
 	#[tokio::test]
@@ -2555,7 +2602,7 @@ mod tests {
 		for a in &listed {
 			assert!(
 				a.subject_action.is_none(),
-				"subject_action omitted without includeSubject (type {})",
+				"subject_action omitted without include=subject (type {})",
 				a.typ
 			);
 		}
@@ -2641,7 +2688,7 @@ mod tests {
 		let opts = ListActionOptions {
 			typ: Some(vec!["MSG".into()]),
 			parent_id: Some("a1~conv".into()),
-			created_after: Some(cloudillo_types::types::Timestamp(200)),
+			created_after: Some(cloudillo_types::types::ApiTime(200)),
 			sort_dir: Some("asc".into()),
 			limit: Some(10),
 			..Default::default()
@@ -2688,7 +2735,7 @@ mod tests {
 			typ: Some(vec!["MSG".into()]),
 			involved: Some("bob.example".into()),
 			viewer_id_tag: Some("alice.example".into()),
-			created_after: Some(cloudillo_types::types::Timestamp(100)),
+			created_after: Some(cloudillo_types::types::ApiTime(100)),
 			sort_dir: Some("asc".into()),
 			limit: Some(10),
 			..Default::default()

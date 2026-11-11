@@ -126,7 +126,7 @@ impl<'a> FileRef<'a> {
 	/// real creator — in particular not in `share_access::is_share_manager`, which reads ownership
 	/// straight off the resulting `AccessLevel`.
 	pub fn from_view(view: &'a FileView, tenant_id_tag: &'a str) -> Self {
-		let tag = |p: Option<&'a meta_adapter::ProfileInfo>| {
+		let tag = |p: Option<&'a meta_adapter::ProfileRef>| {
 			p.map(|p| p.id_tag.as_ref()).filter(|s| !s.is_empty())
 		};
 		Self {
@@ -900,6 +900,23 @@ pub fn single_placement<T>(mut candidates: Vec<(FileView, T)>) -> ClResult<(File
 	}
 }
 
+/// A mutation addresses a placement by its own entry id. `id` having resolved to `view`
+/// through a content or variant id is refused as `NotFound`.
+pub fn require_entry_id(view: &FileView, id: &str) -> ClResult<()> {
+	if *view.entry_id == *id { Ok(()) } else { Err(Error::NotFound) }
+}
+
+/// Like [`require_entry_id`], but the placement's content id also passes (the client sends it
+/// for cross-owner files; an ambiguous one was already refused by [`single_placement`]). A
+/// variant id is still `NotFound`.
+pub fn require_entry_or_content_id(view: &FileView, id: &str) -> ClResult<()> {
+	if *view.entry_id == *id || view.file_id.as_deref() == Some(id) {
+		Ok(())
+	} else {
+		Err(Error::NotFound)
+	}
+}
+
 /// One entry's level, with the opt-in [`action_attachment_level`] when the caller names an action.
 async fn entry_level(
 	app: &App,
@@ -1366,7 +1383,7 @@ mod tests {
 
 	fn entry(entry_id: &str, action_id: Option<&str>) -> (FileView, ()) {
 		let json = serde_json::json!({
-			"entryId": entry_id, "fileId": "f1~c", "fileName": "x", "createdAt": 0, "status": "A",
+			"id": entry_id, "contentId": "f1~c", "fileName": "x", "createdAt": "1970-01-01T00:00:00Z", "status": "active",
 		});
 		let Ok(mut view) = serde_json::from_value::<FileView>(json) else {
 			unreachable!("file view");

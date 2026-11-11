@@ -894,7 +894,9 @@ one_mode! {
 
 		let a_id = match id {
 			ActionId::AId(a_id) => a_id,
-			ActionId::ActionId(_) => panic!("expected an internal a_id"),
+			ActionId::ActionId(_) | ActionId::SupersededOnArrival => {
+				panic!("expected an internal a_id")
+			}
 		};
 		adapter
 			.finalize_action(tn_id, a_id, "a1~post", FinalizeActionOptions::default())

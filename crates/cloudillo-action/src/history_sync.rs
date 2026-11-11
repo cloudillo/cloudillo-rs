@@ -15,8 +15,10 @@ use std::sync::Arc;
 use cloudillo_core::scheduler::{Task, TaskId};
 use cloudillo_types::hasher::hash;
 
+use crate::dsl::DslEngine;
+use crate::post_store::Origin;
 use crate::prelude::*;
-use crate::process::process_inbound_action_token;
+use crate::process::{process_inbound_action_token, token_supported};
 
 /// Default age window in days when the setting is unset
 const DEFAULT_SINCE_DAYS: i64 = 30;
@@ -39,7 +41,9 @@ struct OutboxResponse {
 /// `related` carries the bridged 3rd-party post plus a freshly-minted STAT.
 #[derive(Debug, Deserialize)]
 struct OutboxItem {
-	token: String,
+	/// Optional so one malformed item is skipped (and counted) instead of failing the page.
+	#[serde(default)]
+	token: Option<String>,
 	#[serde(default)]
 	related: Vec<String>,
 }
@@ -125,7 +129,8 @@ impl Task<App> for HistoryFetchTask {
 
 		let now = Timestamp::now().0;
 		let since = now.saturating_sub(since_days.saturating_mul(86400));
-		let path = format!("/outbox?since={}&limit={}", since, limit);
+		let path =
+			format!("/outbox?createdAfter={}&limit={}", Timestamp(since).to_iso_string(), limit);
 
 		let response: OutboxApiResponse =
 			match app.request.get(self.tn_id, &self.peer_id_tag, &path).await {
@@ -146,7 +151,15 @@ impl Task<App> for HistoryFetchTask {
 
 		info!("← HISTORY_SYNC: peer={} received {} items", self.peer_id_tag, items.len());
 
+		let dsl = app.ext::<Arc<DslEngine>>()?;
+		let mut skipped_unsupported = 0usize;
 		for item in items {
+			// Strict known-check before anything is stored: no token, an undecodable one, an
+			// unknown type/subtype or `crit` name skips the item, never the page.
+			let Some(token) = item.token.filter(|t| token_supported(dsl, t)) else {
+				skipped_unsupported += 1;
+				continue;
+			};
 			// Mirror the `/inbox` envelope: pre-store every related token as an
 			// inbound action linked to the primary BEFORE processing the primary.
 			// `process_inbound_action_token` then internally drives
@@ -156,7 +169,7 @@ impl Task<App> for HistoryFetchTask {
 			// the full inbound check. This makes history-sync ingestion the same
 			// protocol as inbox ingestion, including the audience-bridge case where
 			// the primary is an APRV that approves a 3rd-party post in `related`.
-			let primary_id = hash("a", item.token.as_bytes());
+			let primary_id = hash("a", token.as_bytes());
 			// Same cap as `/api/inbox`, and for the same reason: every stored related
 			// token costs a potential outbound key fetch, and this bundle came from a
 			// peer-controlled response body. Skip the item rather than abort the sync —
@@ -173,6 +186,12 @@ impl Task<App> for HistoryFetchTask {
 			}
 			for related_token in &item.related {
 				let related_id = hash("a", related_token.as_bytes());
+				// Same filter as `/api/inbox`: an unsupported related token is dropped, the
+				// primary proceeds.
+				if !token_supported(dsl, related_token) {
+					debug!(related_id = %related_id, "history_sync: skipping unsupported related");
+					continue;
+				}
 				// `create_inbound_action` is `INSERT OR IGNORE` on
 				// (tn_id, action_id), so re-firing the same history sync
 				// (retry, overlapping schedules) is idempotent — duplicates
@@ -199,10 +218,18 @@ impl Task<App> for HistoryFetchTask {
 			debug!("→ ingesting primary {}", primary_id);
 			// No client address, deliberately: this is a tenant-initiated *outbound* sync we
 			// asked for, not an unauthenticated inbound POST, so there is nobody to charge
-			// proof of work or a rate-limit penalty to.
-			if let Err(e) =
-				process_inbound_action_token(app, self.tn_id, &primary_id, &item.token, false, None)
-					.await
+			// proof of work or a rate-limit penalty to. Backfill: a replay runs no live,
+			// notify or propagate effect.
+			if let Err(e) = process_inbound_action_token(
+				app,
+				self.tn_id,
+				&primary_id,
+				&token,
+				false,
+				None,
+				Origin::Backfill,
+			)
+			.await
 			{
 				warn!(
 					primary_id = %primary_id,
@@ -210,6 +237,14 @@ impl Task<App> for HistoryFetchTask {
 					"history_sync: primary ingest failed"
 				);
 			}
+		}
+
+		if skipped_unsupported > 0 {
+			warn!(
+				peer_id_tag = %self.peer_id_tag,
+				skipped_unsupported,
+				"history_sync: skipped items with a missing or unsupported token"
+			);
 		}
 
 		Ok(())

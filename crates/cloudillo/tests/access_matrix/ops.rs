@@ -43,13 +43,13 @@ pub enum FileOp {
 	CreateBlob,
 	CreateCrdt,
 	CreateRtdb,
-	/// `GET /api/files?fileId={id}`: Present = the row is returned.
+	/// `GET /api/files?contentId={id}`: Present = the row is returned.
 	ById,
-	/// `GET /api/files?parentId={parent | __root__}&fileName={name}`: Present = returned.
+	/// `GET /api/files?parentId={parent | __root__}&q={name}`: Present = returned.
 	ByParent,
 	/// `GET /api/files?status={c}` — a per-subject listing ([`list_presence`]).
 	ByStatus(char),
-	/// `DELETE /api/trash` (the whole tenant's trash).
+	/// `POST /api/trash/empty` (the whole tenant's trash).
 	EmptyTrash,
 }
 
@@ -97,7 +97,7 @@ pub enum Op {
 	Action(ActionOp),
 	Outbox,
 	Search,
-	/// ws probe; `?access=` value (`None` = omitted).
+	/// ws probe; `?mode=` value (`None` = omitted).
 	Ws(WsKind, Option<&'static str>),
 	/// Evaluates `fx.mints` — no request, see [`classify_mint`].
 	Mint,
@@ -314,7 +314,7 @@ impl Op {
 			(Op::File(op), Obj::File(f)) => file_req(*op, f),
 			(Op::Action(op), Obj::Action(a)) => action_req(*op, a),
 			(Op::Ws(k, access), Obj::File(f)) => {
-				let q = access.map_or(String::new(), |a| format!("?access={a}"));
+				let q = access.map_or(String::new(), |a| format!("?mode={a}"));
 				(Method::GET, format!("/ws/{}/{}{q}", ws_kind(*k), f.path_id()), Body::empty())
 			}
 			(Op::Probe(m, p), o) => probe_req(m, p, o),
@@ -329,15 +329,17 @@ impl Op {
 	}
 }
 
-/// A tier route with its captures filled from `o` (a file, or an action for `{action_id}`).
+/// A tier route with its captures filled from `o` (a file, or an action, for `{id}`).
 fn probe_req(m: &str, path: &str, o: &Obj) -> (Method, String, Body) {
 	let mut uri = path.replace("{tag}", "zqtag").replace("{preset}", "zqm");
 	uri = uri.replace("{file_name}", "zqm-probe.txt");
+	let read = m == "GET";
 	uri = match o {
+		// A mutation addresses a placement: entry id only.
 		Obj::File(f) => uri
-			.replace("{file_id}", f.path_id())
-			.replace("{variant_id}", f.blob_id.as_deref().unwrap_or_default()),
-		Obj::Action(a) => uri.replace("{action_id}", &a.key()),
+			.replace("{id}", if read { f.path_id() } else { &f.entry_id })
+			.replace("{variantId}", f.blob_id.as_deref().unwrap_or_default()),
+		Obj::Action(a) => uri.replace("{id}", &a.key()),
 	};
 	let method = Method::from_bytes(m.as_bytes()).unwrap();
 	let body = if method == Method::GET { Body::empty() } else { j(json!({})) };
@@ -348,37 +350,39 @@ fn file_req(op: FileOp, f: &FileObj) -> (Method, String, Body) {
 	use FileOp as F;
 	let id = f.path_id();
 	let base = format!("/api/files/{id}");
+	// Mutations address a placement: entry id only (a content id is refused).
+	let wbase = format!("/api/files/{}", f.entry_id);
 	let post = |uri: String| (Method::POST, uri, j(json!({})));
 	match op {
 		F::List | F::ByStatus(_) => panic!("{op:?} is a listing op: use list_presence"),
-		F::ById => (Method::GET, format!("/api/files?fileId={}", f.file_id), Body::empty()),
+		F::ById => (Method::GET, format!("/api/files?contentId={}", f.file_id), Body::empty()),
 		F::ByParent => {
 			let parent = f.parent_id.as_deref().unwrap_or(ROOT_PARENT_ID);
-			let uri = format!("/api/files?parentId={parent}&fileName={}", f.spec.name);
+			let uri = format!("/api/files?parentId={parent}&q={}", f.spec.name);
 			(Method::GET, uri, Body::empty())
 		}
-		F::EmptyTrash => (Method::DELETE, "/api/trash".into(), Body::empty()),
+		F::EmptyTrash => (Method::POST, "/api/trash/empty".into(), Body::empty()),
 		F::Get => (Method::GET, base, Body::empty()),
 		F::Variant => (
 			Method::GET,
-			format!("/api/files/variant/{}", f.blob_id.as_deref().unwrap_or_default()),
+			format!("/api/variants/{}", f.blob_id.as_deref().unwrap_or_default()),
 			Body::empty(),
 		),
 		F::Descriptor => (Method::GET, format!("{base}/descriptor"), Body::empty()),
 		F::Metadata => (Method::GET, format!("{base}/metadata"), Body::empty()),
 		F::Content => (Method::GET, format!("{base}/content/index.html"), Body::empty()),
 		// `{}`: passes the write guard, changes nothing (`update_data` returns early).
-		F::Patch => (Method::PATCH, base, j(json!({}))),
-		F::Delete => (Method::DELETE, base, Body::empty()),
-		F::Restore => post(format!("{base}/restore")),
-		F::Tag => (Method::PUT, format!("{base}/tag/zqtag"), Body::empty()),
-		F::UserData => (Method::PATCH, format!("{base}/user"), j(json!({ "starred": true }))),
+		F::Patch => (Method::PATCH, wbase, j(json!({}))),
+		F::Delete => (Method::DELETE, wbase, Body::empty()),
+		F::Restore => post(format!("{wbase}/restore")),
+		F::Tag => (Method::PUT, format!("{wbase}/tags/zqtag"), Body::empty()),
+		F::UserData => (Method::PATCH, format!("{wbase}/user-data"), j(json!({ "starred": true }))),
 		// Refresh addresses one placement: entry id only.
 		F::Refresh => post(format!("/api/files/{}/refresh", f.entry_id)),
-		F::Duplicate => post(format!("{base}/duplicate")),
+		F::Duplicate => post(format!("{wbase}/duplicate")),
 		F::CreateBlob => (
 			Method::POST,
-			format!("/api/files/file/zqm-new.txt?parentId={id}"),
+			format!("/api/uploads/file?name=zqm-new.txt&parentId={id}"),
 			Body::from(format!("{MARK} new blob")),
 		),
 		F::CreateCrdt | F::CreateRtdb => {
@@ -425,7 +429,7 @@ fn action_req(op: ActionOp, a: &ActionObj) -> (Method, String, Body) {
 			(Method::POST, "/api/actions".into(), j(body))
 		}
 		A::PublishAt => {
-			let at = Timestamp::now().0 + 86400;
+			let at = cloudillo::types::ApiTime(Timestamp::now().0 + 86400).to_iso_string();
 			(Method::POST, format!("{base}/publish"), j(json!({ "publishAt": at })))
 		}
 	}
@@ -471,10 +475,10 @@ pub fn classify(op: Op, status: StatusCode, body: &Value) -> (Actual, Option<Acc
 			(a, level)
 		}
 		Op::Action(ActionOp::CreateDraft) if status.is_success() => {
-			if body.pointer("/data/actionId").is_some() {
+			if body.pointer("/data/id").is_some() {
 				(Actual::Allow, None)
 			} else {
-				(Actual::HarnessError("draft:no-actionId".into()), None)
+				(Actual::HarnessError("draft:no-id".into()), None)
 			}
 		}
 		_ => (status_class(status), None),
@@ -491,7 +495,7 @@ pub fn classify_obj(
 	match op {
 		Op::File(FileOp::ById | FileOp::ByParent) if status.is_success() => {
 			let key = obj_key(o);
-			let hit = rows(body).iter().any(|r| row_id(r, "fileId") == Some(&key));
+			let hit = rows(body).iter().any(|r| row_id(r, "contentId") == Some(&key));
 			(if hit { Actual::Present } else { Actual::Absent }, None)
 		}
 		_ => classify(op, status, body),
@@ -548,9 +552,12 @@ pub async fn list_presence(
 	match op {
 		Op::File(FileOp::List | FileOp::ByStatus(_)) | Op::Action(ActionOp::List) => {
 			let (path, id_key) = match op {
-				Op::File(FileOp::ByStatus(c)) => (format!("/api/files?status={c}&"), "fileId"),
-				Op::File(_) => ("/api/files?".to_owned(), "fileId"),
-				_ => ("/api/actions?".to_owned(), "actionId"),
+				Op::File(FileOp::ByStatus(c)) => {
+					let w = cloudillo_types::api_enums::file_status::to_word(c);
+					(format!("/api/files?status={w}&"), "contentId")
+				}
+				Op::File(_) => ("/api/files?".to_owned(), "contentId"),
+				_ => ("/api/actions?".to_owned(), "id"),
 			};
 			return match list_paged(fx, s, &path, id_key).await {
 				// A refused status filter lists nothing.
@@ -563,20 +570,20 @@ pub async fn list_presence(
 			};
 		}
 		Op::Search => {
-			let mut offset = 0;
+			let mut cursor: Option<String> = None;
 			loop {
-				let uri = format!("/api/search?q={MARK}&limit={SEARCH_PAGE}&offset={offset}");
+				let c = cursor.as_ref().map_or(String::new(), |c| format!("&cursor={c}"));
+				let uri = format!("/api/search?q={MARK}&limit={SEARCH_PAGE}{c}");
 				let body = get(fx, s, &uri).await?;
-				let hits = rows(&body);
-				for h in hits {
+				for h in rows(&body) {
 					if let Some(id) = h.get("objId").and_then(Value::as_str) {
 						out.insert(id.to_owned(), None);
 					}
 				}
-				if hits.len() < SEARCH_PAGE as usize {
+				cursor = body.pointer("/next").and_then(Value::as_str).map(str::to_owned);
+				if cursor.is_none() {
 					break;
 				}
-				offset += SEARCH_PAGE;
 			}
 		}
 		Op::Outbox => {
@@ -619,22 +626,17 @@ pub async fn list_paged(
 				out.insert(id.to_owned(), level_of_row(row));
 			}
 		}
-		cursor = body
-			.pointer("/cursorPagination/nextCursor")
-			.and_then(Value::as_str)
-			.map(str::to_owned);
+		cursor = body.pointer("/next").and_then(Value::as_str).map(str::to_owned);
 		if cursor.is_none() {
 			return Ok(out);
 		}
 	}
 }
 
-/// A row's id under `id_key`; a folder's `fileId` is null, so it falls back to its `entryId`.
+/// A row's id under `id_key`; a folder's `contentId` is null, so it falls back to its `id`.
 fn row_id<'a>(row: &'a Value, id_key: &str) -> Option<&'a str> {
 	row.get(id_key).and_then(Value::as_str).or_else(|| {
-		(id_key == "fileId")
-			.then(|| row.get("entryId").and_then(Value::as_str))
-			.flatten()
+		(id_key == "contentId").then(|| row.get("id").and_then(Value::as_str)).flatten()
 	})
 }
 
@@ -645,10 +647,10 @@ fn level_of_row(row: &Value) -> Option<AccessLevel> {
 		.and_then(AccessLevel::from_str_name)
 }
 
-/// `GET /api/actions?count=true` → `cursorPagination.count`.
+/// `GET /api/actions?count=true` → top-level `total`.
 pub async fn count_actions(fx: &Fixture, s: &Subject) -> Result<u64, Actual> {
 	let body = get(fx, s, "/api/actions?count=true").await?;
-	body.pointer("/cursorPagination/count")
+	body.pointer("/total")
 		.and_then(Value::as_u64)
 		.ok_or_else(|| Actual::HarnessError("count:missing".into()))
 }

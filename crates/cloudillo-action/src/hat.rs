@@ -208,7 +208,11 @@ pub(crate) async fn relay_hatted_action(
 	action_id: &str,
 	action: &ActionToken,
 	role: &str,
+	effects: crate::post_store::Effects,
 ) -> ClResult<()> {
+	if !effects.propagate {
+		return Ok(());
+	}
 	let aprv = CreateAction {
 		typ: "APRV".into(),
 		audience_tag: action.aud.clone(),

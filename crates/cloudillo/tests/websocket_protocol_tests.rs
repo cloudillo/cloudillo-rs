@@ -53,21 +53,20 @@ mod tests {
 		);
 
 		assert_eq!(msg.msg_type, "subscribe");
-		assert_eq!(msg.payload.get("collections").map(|v| v.as_array().is_some()), Some(true));
+		assert_eq!(msg.data.get("collections").map(|v| v.as_array().is_some()), Some(true));
 	}
 
 	/// Test that RTDB acknowledgment messages are created correctly
 	#[test]
 	fn test_rtdb_ack_message() {
 		use cloudillo::rtdb::websocket::RtdbMessage;
-		use serde_json::Value;
 
 		// Test creating an ack message
-		let msg = RtdbMessage::ack(Value::String("msg-456".to_string()), "ok");
+		let msg = RtdbMessage::ack("msg-456".to_string(), "ok");
 
 		assert_eq!(msg.msg_type, "ack");
-		assert_eq!(msg.id.as_str(), Some("msg-456"));
-		assert_eq!(msg.payload.get("status").and_then(|v| v.as_str()), Some("ok"));
+		assert_eq!(msg.id, "msg-456");
+		assert_eq!(msg.data.get("status").and_then(|v| v.as_str()), Some("ok"));
 	}
 
 	/// Test that CRDT message types are compatible with Yjs protocol

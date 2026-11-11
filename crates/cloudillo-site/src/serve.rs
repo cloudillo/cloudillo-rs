@@ -285,6 +285,16 @@ async fn serve_entry(
 				res.headers_mut()
 					.insert(header::CONTENT_ENCODING, HeaderValue::from_static(encoding));
 			}
+			// A fragment arrives without the wrapper's boot seed, so the site context
+			// travels in headers instead (`shell/src/site/fragment.ts`).
+			if target.entry_name.ends_with(FRAGMENT_EXT) {
+				insert_site_context(
+					res.headers_mut(),
+					&site.id_tag,
+					&site.owner_name,
+					&mount.mount_path,
+				);
+			}
 			Ok(Some(res))
 		}
 		Kind::Absolutised => {
@@ -341,6 +351,38 @@ fn generated(
 /// with the weak function ([`matches_etag`]).
 fn generated_etag(body: &str) -> String {
 	format!("W/\"gen-{:08x}\"", short_hash(body))
+}
+
+/// The boot seed's site context as `Cloudillo-Site-*` headers, for a fragment.
+///
+/// The owner name is percent-encoded UTF-8 (header values are ASCII). A value that is
+/// still not a valid header value is left out rather than failing the response.
+fn insert_site_context(headers: &mut HeaderMap, id_tag: &str, owner_name: &str, mount: &str) {
+	let name = percent_encode(owner_name);
+	for (key, value) in [
+		("cloudillo-site-mount", mount),
+		("cloudillo-site-owner", id_tag),
+		("cloudillo-site-owner-name", name.as_str()),
+	] {
+		if let Ok(value) = HeaderValue::from_str(value) {
+			headers.insert(key, value);
+		}
+	}
+}
+
+/// RFC 3986 percent-encoding of everything but the unreserved set.
+fn percent_encode(s: &str) -> String {
+	use std::fmt::Write;
+	let mut out = String::with_capacity(s.len());
+	for b in s.bytes() {
+		if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+			out.push(char::from(b));
+		} else {
+			// Writing into a `String` cannot fail.
+			let _ = write!(out, "%{b:02X}");
+		}
+	}
+	out
 }
 
 /// What the wrapper's server-painted chrome and boot seed say about this request.
@@ -542,6 +584,24 @@ fn is_absolutised_entry(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn fragment_site_context_headers_percent_encode_the_owner_name() {
+		let mut headers = HeaderMap::new();
+		insert_site_context(&mut headers, "alice.example", "Árvíz Tűrő 1", "/blog");
+		assert_eq!(
+			headers.get("cloudillo-site-mount").map(HeaderValue::as_bytes),
+			Some(&b"/blog"[..])
+		);
+		assert_eq!(
+			headers.get("cloudillo-site-owner").map(HeaderValue::as_bytes),
+			Some(&b"alice.example"[..])
+		);
+		assert_eq!(
+			headers.get("cloudillo-site-owner-name").map(HeaderValue::as_bytes),
+			Some(&b"%C3%81rv%C3%ADz%20T%C5%B1r%C5%91%201"[..])
+		);
+	}
 
 	/// The gate has to be `read_gzip`'s own predicate: it refuses a deflated entry
 	/// *declaring* more than `MAX_ENTRY_BYTES`, and labelling the plain fallback

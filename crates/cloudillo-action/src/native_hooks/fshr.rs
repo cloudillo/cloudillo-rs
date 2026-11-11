@@ -113,7 +113,10 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	let entries = if entries.len() > 1 {
 		let mut holder = None;
 		for file in &entries {
-			let shares = app.meta_adapter.list_share_entries(tn_id, 'F', &file.entry_id).await?;
+			let shares = app
+				.meta_adapter
+				.list_share_entries(tn_id, 'F', &file.entry_id, None, None)
+				.await?;
 			if shares.iter().any(|e| {
 				e.subject_type == 'U'
 					&& e.subject_id.as_ref() == audience.as_str()
@@ -182,7 +185,8 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 
 	if is_del {
 		// Remove the share entry
-		let entries = app.meta_adapter.list_share_entries(tn_id, 'F', resource_id).await?;
+		let entries =
+			app.meta_adapter.list_share_entries(tn_id, 'F', resource_id, None, None).await?;
 		for entry in entries {
 			if entry.subject_type == 'U' && entry.subject_id.as_ref() == audience.as_str() {
 				app.meta_adapter.delete_share_entry(tn_id, entry.id).await?;
@@ -201,7 +205,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 	// expiring grant into a permanent one.
 	let existing = app
 		.meta_adapter
-		.list_share_entries(tn_id, 'F', resource_id)
+		.list_share_entries(tn_id, 'F', resource_id, None, None)
 		.await?
 		.into_iter()
 		.find(|e| e.subject_type == 'U' && e.subject_id.as_ref() == audience.as_str());
@@ -218,7 +222,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 		subject_type: 'U',
 		subject_id: audience.clone(),
 		permission,
-		expires_at: existing.and_then(|e| e.expires_at),
+		expires_at: existing.and_then(|e| e.expires_at).map(Into::into),
 	};
 
 	match app

@@ -7,9 +7,9 @@ use sqlx::{Row, SqlitePool};
 
 use crate::utils::Db;
 use cloudillo_types::meta_adapter::FileUserData;
-use cloudillo_types::prelude::*;
 use cloudillo_types::types::AccessLevel;
 use cloudillo_types::utils::normalize_id_tag;
+use cloudillo_types::{prelude::*, types::ApiTime};
 
 /// Record file access for a user (upserts record, updates accessed_at timestamp)
 /// Also updates the global accessed_at on the files table.
@@ -213,8 +213,8 @@ pub(crate) async fn get(
 				access_level_str.and_then(|s| s.chars().next()).map(AccessLevel::from_perm_char);
 
 			Ok(Some(FileUserData {
-				accessed_at: accessed_at.map(Timestamp),
-				modified_at: modified_at.map(Timestamp),
+				accessed_at: accessed_at.map(ApiTime),
+				modified_at: modified_at.map(ApiTime),
 				pinned: pinned != 0,
 				starred: starred != 0,
 				access_level,

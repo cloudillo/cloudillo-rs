@@ -499,7 +499,9 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 				subject: Some(subject.into()),
 				..Default::default()
 			};
-			if let Err(e) = create_action(&app, tn_id, audience, subs_action).await {
+			if context.effects.propagate
+				&& let Err(e) = create_action(&app, tn_id, audience, subs_action).await
+			{
 				error!(
 					"INVT: Failed to create channel SUBS for {} on {}: {}",
 					audience, subject, e
@@ -529,7 +531,10 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 		..Default::default()
 	};
 
-	// Create the subscription on behalf of the invitee
+	// Create the subscription on behalf of the invitee (an emitted action)
+	if !context.effects.propagate {
+		return Ok(HookResult::default());
+	}
 	match create_action(&app, tn_id, audience, subs_action).await {
 		Ok(subs_id) => {
 			info!("INVT: Created SUBS {} for {} on {}", subs_id, audience, subject);
@@ -599,7 +604,9 @@ async fn on_accept_community(
 		audience_tag: Some(community_id_tag.to_string().into()),
 		..Default::default()
 	};
-	if let Err(e) = create_action(app, tn_id, audience, conn_action).await {
+	if context.effects.propagate
+		&& let Err(e) = create_action(app, tn_id, audience, conn_action).await
+	{
 		warn!("INVT (community): Failed to create CONN to community {}: {}", community_id_tag, e);
 	}
 

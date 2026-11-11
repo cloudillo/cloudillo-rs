@@ -111,7 +111,7 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
-	// Who sees the tenant's connections (`GET /api/profiles?connected=`, the `connected`
+	// Who sees the tenant's connections (`GET /api/profiles?connection=`, the `connection`
 	// field); the typed keys override it per connected profile type. Partner contracts
 	// (`GET /api/me/full` `partners`) are public and not governed by it.
 	registry.register(

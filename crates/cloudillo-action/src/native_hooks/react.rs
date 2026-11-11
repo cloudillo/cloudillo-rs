@@ -124,7 +124,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 		return Ok(HookResult::default());
 	}
 
-	emit_stat_for_subject(&app, tn_id, &context.tenant_tag, subject_id).await;
+	emit_stat_for_subject(&app, tn_id, &context.tenant_tag, subject_id, context.effects).await;
 
 	Ok(HookResult::default())
 }
@@ -191,7 +191,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 		return Ok(HookResult::default());
 	}
 
-	emit_stat_for_subject(&app, tn_id, &context.tenant_tag, subject_id).await;
+	emit_stat_for_subject(&app, tn_id, &context.tenant_tag, subject_id, context.effects).await;
 
 	// The post author (we host the subject) auto-tracks their own thread (coalesce).
 	if context.subtype.as_deref() != Some("DEL") {

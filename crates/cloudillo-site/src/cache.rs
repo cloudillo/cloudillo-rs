@@ -718,7 +718,7 @@ pub(crate) fn content_security_policy(id_tag: &str) -> String {
 /// `Ok(None)` and `/` degrades to the shell.
 ///
 /// The nav comes back converted rather than raw so it can sit on the entry as
-/// [`SiteEntry::derived_nav`] and answer `GET /api/sites` with no read of its own.
+/// [`SiteEntry::derived_nav`] and answer `GET /api/site` with no read of its own.
 async fn read_root_mount(app: &App, entry: &SiteEntry) -> (bool, Vec<SiteNavItem>) {
 	let empty = (false, Vec::new());
 	let Some(mount) = entry.resolve_mount("/") else { return empty };

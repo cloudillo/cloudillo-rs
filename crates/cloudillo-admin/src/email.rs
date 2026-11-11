@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use cloudillo_core::extract::Auth;
 use cloudillo_email::{EmailMessage, EmailModule};
-use cloudillo_types::types::{ApiResponse, ErrorResponse};
+use cloudillo_types::types::ApiResponse;
 
 use crate::prelude::*;
 
@@ -55,14 +55,10 @@ pub async fn send_test_email(
 
 	// Validate email format (basic check)
 	if !request.to.contains('@') || !request.to.contains('.') {
-		return Ok((
-			StatusCode::BAD_REQUEST,
-			Json(ErrorResponse::new(
-				"INVALID_EMAIL_FORMAT".to_string(),
-				"Invalid email address format. Email address must contain @ and .".to_string(),
-			)),
-		)
-			.into_response());
+		return Err(Error::InvalidField {
+			field: "to",
+			message: "Invalid email address format. Email address must contain @ and .".into(),
+		});
 	}
 
 	// `EmailSender::send_test` intentionally bypasses the `email.enabled`
@@ -134,20 +130,12 @@ pub async fn send_test_email(
 			// `NotConfigured` is a configuration precondition, not a transient
 			// SMTP delivery failure — surface it as 412 with a distinct error
 			// code so the admin UI can prompt the user to set SMTP host.
-			let (status, code) = match diag.category {
+			Err(match diag.category {
 				cloudillo_email::SmtpCategory::NotConfigured => {
-					(StatusCode::PRECONDITION_FAILED, "SMTP_NOT_CONFIGURED")
+					Error::EmailNotConfigured(diag.message, details)
 				}
-				_ => (StatusCode::SERVICE_UNAVAILABLE, "SMTP_SEND_FAILED"),
-			};
-			Ok((
-				status,
-				Json(
-					ErrorResponse::new(code.to_string(), diag.message.clone())
-						.with_details(details),
-				),
-			)
-				.into_response())
+				_ => Error::EmailSendFailed(diag.message, details),
+			})
 		}
 	}
 }

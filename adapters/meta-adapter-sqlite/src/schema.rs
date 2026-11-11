@@ -388,7 +388,7 @@ async fn migrate_v58_entries(tx: &mut Transaction<'_, Sqlite>) -> Result<(), sql
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 61;
+	const CURRENT_DB_VERSION: i64 = 62;
 
 	let mut tx = db.begin().await?;
 
@@ -732,6 +732,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 														-- 2: 2nd degree, F: Follower, C: Connected
 			flags text,						-- Action flags: R/r (reactions), C/c (comments), O/o (open)
 			x json,
+			delivery_error text,			-- Sender-side terminal delivery failure, e.g. 'unsupported'
 			-- Dual-purpose: for status R (draft) / S (scheduled), holds the
 			-- target publish instant (consumed by ActionCreatorTask + PATCH
 			-- /actions). For status A (active/finalized) and onward, holds
@@ -3141,6 +3142,13 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 				.map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
 		}
 		set_db_version(&mut tx, 61).await;
+	}
+
+	if version < 62 {
+		// Sender marker: a directed delivery the recipient refused as unsupported (422
+		// `E-FED-UNSUPPORTED`) sets `delivery_error = 'unsupported'` (`ActionDeliveryTask`).
+		add_column_if_missing(&mut tx, "actions", "delivery_error", "TEXT").await?;
+		set_db_version(&mut tx, 62).await;
 	}
 
 	// Unversioned and idempotent: a DB that reached v58 on a pre-rename build still has

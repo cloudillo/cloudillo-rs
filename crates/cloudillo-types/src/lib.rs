@@ -11,6 +11,7 @@
 pub mod abac;
 pub mod action_types;
 pub mod address;
+pub mod api_enums;
 pub mod auth_adapter;
 pub mod badges;
 pub mod blob_adapter;

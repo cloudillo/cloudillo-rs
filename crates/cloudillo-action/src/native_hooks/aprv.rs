@@ -10,7 +10,7 @@
 use crate::hooks::{HookContext, HookResult};
 use crate::prelude::*;
 use crate::status;
-use cloudillo_types::meta_adapter::{ProfileInfo, UpdateActionDataOptions};
+use cloudillo_types::meta_adapter::{ProfileRef, UpdateActionDataOptions};
 
 /// APRV on_receive hook - Handle incoming approval
 ///
@@ -36,7 +36,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 	if let Some(ref action) = original_action {
 		// We have the original action - check if we're the issuer
 		// Only the action's audience or hat may approve it (rulings: APRV).
-		let is_tag = |p: &Option<ProfileInfo>| {
+		let is_tag = |p: &Option<ProfileRef>| {
 			p.as_ref().is_some_and(|p| p.id_tag.as_ref() == context.issuer)
 		};
 		if action.issuer.id_tag.as_ref() == context.tenant_tag
@@ -84,7 +84,7 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					}
 					_ => false,
 				};
-				if applied {
+				if applied && context.effects.live {
 					// Our own request was never pushed inbound; tell the open UIs to reload.
 					crate::forward::forward_inbound_action_view(&app, tn_id, action, None, None)
 						.await;

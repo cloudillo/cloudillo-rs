@@ -203,7 +203,6 @@ where
 
 fn init_http_service(app: App) -> Router {
 	Router::new()
-		.route("/test", get(async || "test\n"))
 		.route("/.well-known/acme-challenge/{token}", get(acme::get_acme_challenge))
 		.with_state(app)
 }

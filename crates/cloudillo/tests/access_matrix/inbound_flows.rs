@@ -227,7 +227,7 @@ async fn inbound_branches() {
 	assert!(call(&fx.api, put).await.0.is_success(), "PUT profile.badges");
 	assert_eq!(me_issuers().await, vec![r.id_tag.clone()], "badge shown before the block");
 	let uri = format!("/api/profiles/{}", r.id_tag);
-	let block = Body::from(json!({ "status": "B" }).to_string());
+	let block = Body::from(json!({ "status": "blocked" }).to_string());
 	let (st, b) = call(&fx.api, req(ALICE, Method::PATCH, &uri, owner, block)).await;
 	assert!(st.is_success(), "PATCH {uri}: {st} {b}");
 	assert!(me_issuers().await.is_empty(), "blocked issuer's badge still on /api/me");
@@ -1132,17 +1132,22 @@ async fn inbound_edges() {
 		let body = Body::from(json!({ "token": token }).to_string());
 		let mut r = req(ALICE, Method::POST, "/api/inbox/sync", None, body);
 		r.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::new(ip, 443)));
-		call(&fx.api, r).await.0
+		call(&fx.api, r).await
 	};
 	let r = issuer(fx, ALICE, Relation::None, "", "ie-pow-conn").await;
 	let mut t = claims(&r, "CONN");
 	t.aud = Some(ALICE.into());
-	let st = from_ip(sign(&r, &t)).await;
+	let (st, b) = from_ip(sign(&r, &t)).await;
 	check(&mut rep, "IB-64", &r, Deny, if st.as_u16() == 428 { Deny } else { Allow });
+	// The 428 tells the peer what to solve: the registry code plus `{required, suffix}`.
+	assert_eq!(b["error"]["code"], cloudillo::error::codes::RATE_POWREQUIRED, "IB-64: {b}");
+	let details = &b["error"]["details"];
+	assert!(details["required"].as_u64().is_some_and(|n| n > 0), "IB-64 required: {b}");
+	assert!(details["suffix"].as_str().is_some_and(|s| !s.is_empty()), "IB-64 suffix: {b}");
 	let r = issuer(fx, ALICE, Relation::Connected, "", "ie-pow-post").await;
 	let mut t = claims(&r, "POST");
 	t.c = text();
-	let st = from_ip(sign(&r, &t)).await;
+	let (st, _) = from_ip(sign(&r, &t)).await;
 	check(&mut rep, "IB-65", &r, Allow, if st.is_success() { Allow } else { Deny });
 
 	// The token itself: HS256 instead of ES384; a key id the issuer never published; a cached
@@ -1504,8 +1509,8 @@ async fn bdg_issue() {
 		("BI-07", "stranger@club.test", to, "STD", "verified", None, Deny),
 		("BI-08", "m-contributor@club.test", to, "STD", "verified", None, Deny),
 		// Visibility is fixed at 'C': an explicit other one is refused, 'C' itself is fine.
-		("BI-09", mod_, to, "STD", "verified", Some("P"), bad()),
-		("BI-10", mod_, to, "STD", "verified", Some("C"), Allow),
+		("BI-09", mod_, to, "STD", "verified", Some("public"), bad()),
+		("BI-10", mod_, to, "STD", "verified", Some("connected"), Allow),
 		// A follower club has banned gets no badge.
 		("BI-11", mod_, banned, "STD", "verified", None, Deny),
 		// Connected without following is enough; neither is not.
@@ -2198,7 +2203,7 @@ async fn conv_upd_inbound() {
 	// The member's open UIs hear about it.
 	let mut pushed = Deny;
 	while let Ok(m) = rx.try_recv() {
-		if m.cmd == "ACTION" && m.data["subType"] == "UPD" && m.data["subject"] == remote {
+		if m.cmd == "action" && m.data["subType"] == "UPD" && m.data["subject"] == remote {
 			pushed = Allow;
 		}
 	}
@@ -2263,7 +2268,7 @@ async fn conv_redelivery_keeps_read_mark() {
 		"IB-156",
 		&owner,
 		Allow,
-		if read_at == Some(Timestamp(1000)) { Allow } else { Deny },
+		if read_at == Some(Timestamp(1000).into()) { Allow } else { Deny },
 	);
 	rep.finish();
 }
@@ -2545,6 +2550,217 @@ async fn subs_kick_inbound() {
 	let row = meta.get_reader_state(alice, "A:CONV", remote).await.unwrap();
 	check(&mut rep, "IB-155", &owner, Deny, if row.is_some() { Allow } else { Deny });
 	rep.finish();
+}
+
+/// Deny = refused as unsupported (422 `E-FED-UNSUPPORTED`); any other answer = Allow.
+fn unsupported((st, body): (axum::http::StatusCode, serde_json::Value)) -> Actual {
+	if st.as_u16() == 422 && body.to_string().contains("E-FED-UNSUPPORTED") {
+		Actual::Deny
+	} else {
+		Actual::Allow
+	}
+}
+
+/// Actions the node cannot fully understand are refused with 422 `E-FED-UNSUPPORTED` and leave
+/// nothing behind: an unknown type (IB-171), a subtype its base does not list (IB-172/173, no
+/// supersede of the keyed row), an unknown `crit` name (IB-174/176; known names pass, IB-175),
+/// and on `/api/inbox` the same refusal before any signature check (IB-177). An unknown token
+/// inside `related` is dropped while its primary proceeds (IB-178). The fixture runs no
+/// scheduler, so the verifier task `/api/inbox` queues is run here, as it would be.
+#[tokio::test]
+async fn inbound_unsupported_is_refused() {
+	use Actual::{Allow, Deny};
+	use cloudillo::action::task::ActionVerifierTask;
+	use cloudillo_core::scheduler::Task;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let mut rep = Report::new("inbound-unsupported");
+	let r = issuer(fx, ALICE, Relation::Connected, "", "iu-conn").await;
+	let sync =
+		|token: String| async move { unsupported(crate::inbox_post(fx, ALICE, &token).await) };
+	// Deny = no row under the token's action id.
+	let gone = |token: String| async move {
+		let t = meta.get_action_type(alice, &action_hash(&token)).await.unwrap();
+		if t.is_none() { Deny } else { Allow }
+	};
+	let send = |token: String, related: Vec<String>| async move {
+		let body = Body::from(json!({ "token": token, "related": related }).to_string());
+		call(&fx.api, req(ALICE, Method::POST, "/api/inbox", None, body)).await
+	};
+
+	let mut t = claims(&r, "XYZ");
+	t.c = Some(json!(format!("{MARK} unknown type")));
+	let tok = sign(&r, &t);
+	check(&mut rep, "IB-171", &r, Deny, sync(tok.clone()).await);
+	check(&mut rep, "IB-171", &r, Deny, gone(tok).await);
+
+	// REACT:NEW once fell back to REACT and replaced the LIKE sharing its key.
+	let post = "a1~zqm-iu-post";
+	seed_row(fx, alice, &row(post, "POST", ALICE), None).await;
+	let mut t = claims(&r, "REACT:LIKE");
+	t.sub = Some(post.into());
+	check(&mut rep, "IB-172", &r, Allow, deliver(fx, ALICE, &sign(&r, &t)).await);
+	let key = format!("REACT:{post}:{}", r.id_tag);
+	let like = meta.get_action_by_key(alice, &key).await.unwrap().map(|a| a.action_id);
+	t.t = "REACT:NEW".into();
+	let tok = sign(&r, &t);
+	check(&mut rep, "IB-172", &r, Deny, sync(tok.clone()).await);
+	check(&mut rep, "IB-172", &r, Deny, gone(tok).await);
+	let kept = meta.get_action_by_key(alice, &key).await.unwrap().map(|a| a.action_id);
+	check(&mut rep, "IB-172", &r, Allow, if like.is_some() && kept == like { Allow } else { Deny });
+
+	// CONN:XYZ once superseded the relationship row.
+	let conn_id = "a1~zqm-iu-conn";
+	let ckey = format!("CONN:{}:{ALICE}", r.id_tag);
+	seed_row(fx, alice, &row(conn_id, "CONN", &r.id_tag), Some(&ckey)).await;
+	let mut t = claims(&r, "CONN:XYZ");
+	t.aud = Some(ALICE.into());
+	let tok = sign(&r, &t);
+	check(&mut rep, "IB-173", &r, Deny, sync(tok.clone()).await);
+	check(&mut rep, "IB-173", &r, Deny, gone(tok).await);
+	let kept = meta.get_action_by_key(alice, &ckey).await.unwrap().map(|a| a.action_id);
+	check(
+		&mut rep,
+		"IB-173",
+		&r,
+		Allow,
+		if kept.as_deref() == Some(conn_id) { Allow } else { Deny },
+	);
+	let (_, p) = meta.read_profile(alice, &r.id_tag).await.unwrap();
+	check(&mut rep, "IB-173", &r, Allow, if p.connected.is_connected() { Allow } else { Deny });
+
+	// `crit`: an unknown flag char, an unknown claim; known names on the same type pass.
+	for (id, name) in [("IB-174", "$f:Z"), ("IB-176", "$zqm")] {
+		let mut t = claims(&r, "POST");
+		t.c = Some(json!(format!("{MARK} crit {name}")));
+		t.crit = Some(vec![name.into()]);
+		let tok = sign(&r, &t);
+		check(&mut rep, id, &r, Deny, sync(tok.clone()).await);
+		check(&mut rep, id, &r, Deny, gone(tok).await);
+	}
+	let mut t = claims(&r, "POST");
+	t.c = Some(json!(format!("{MARK} crit known")));
+	t.crit = Some(vec!["$iat".into(), "$f:R".into()]);
+	let tok = sign(&r, &t);
+	check(&mut rep, "IB-175", &r, Allow, deliver(fx, ALICE, &tok).await);
+	check(&mut rep, "IB-175", &r, Allow, admitted(fx, alice, &action_hash(&tok)).await);
+
+	// `/api/inbox` refuses on the unverified peek: a forged signature changes nothing.
+	let victim = issuer(fx, ALICE, Relation::Connected, "", "iu-victim").await;
+	let t = claims(&victim, "XYZ");
+	let forged = sign(&crate::fixture::remote("iu-forger"), &t);
+	check(&mut rep, "IB-177", &victim, Deny, unsupported(send(forged.clone(), Vec::new()).await));
+	check(&mut rep, "IB-177", &victim, Deny, gone(forged).await);
+
+	let mut p = claims(&r, "POST");
+	p.c = Some(json!(format!("{MARK} primary of an unknown related")));
+	let primary = sign(&r, &p);
+	let unknown = sign(&r, &claims(&r, "XYZ:ZQM"));
+	let (st, _) = send(primary.clone(), vec![unknown.clone()]).await;
+	check(&mut rep, "IB-178", &r, Allow, status_class(st));
+	ActionVerifierTask::new(alice, primary.as_str().into(), None)
+		.run(&fx.app)
+		.await
+		.unwrap();
+	check(&mut rep, "IB-178", &r, Allow, admitted(fx, alice, &action_hash(&primary)).await);
+	check(&mut rep, "IB-178", &r, Deny, gone(unknown).await);
+	rep.finish();
+}
+
+/// Newer wins on a shared key: a reaction signed earlier but arriving after a newer one is
+/// stored already superseded (`D`), and the newer row keeps the key.
+#[tokio::test]
+async fn older_same_key_arrives_superseded() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let r = issuer(fx, ALICE, Relation::Connected, "", "nw-react").await;
+	let post = "a1~zqm-nw-post";
+	seed_row(fx, alice, &row(post, "POST", ALICE), None).await;
+	let mut t = claims(&r, "REACT:LOVE");
+	t.sub = Some(post.into());
+	let newer = sign(&r, &t);
+	t.t = "REACT:LIKE".into();
+	t.iat = Timestamp(t.iat.0 - 100);
+	let older = sign(&r, &t);
+	assert_eq!(deliver(fx, ALICE, &newer).await, Actual::Allow, "newer delivery");
+	assert_eq!(deliver(fx, ALICE, &older).await, Actual::Allow, "older delivery");
+	let status = status_of(fx, alice, &action_hash(&older)).await;
+	assert_eq!(status.as_deref(), Some("D"), "the older reaction is stored superseded");
+	let key = format!("REACT:{post}:{}", r.id_tag);
+	let live = fx.app.meta_adapter.get_action_by_key(alice, &key).await.unwrap();
+	assert_eq!(live.map(|a| a.action_id.to_string()), Some(action_hash(&newer)), "key holder");
+	assert_eq!(admitted(fx, alice, &action_hash(&newer)).await, Actual::Allow, "newer stays live");
+}
+
+/// History-sync replay (`Origin::Backfill`) writes state only. A member's MSG into alice's
+/// container lands either way; replayed, alice's open UIs hear nothing and no delivery to the
+/// container's subscribers is queued. Live control: the same shape reaches both. History sync
+/// itself needs a remote peer, so the replay is driven through `process_inbound_action_token`.
+/// Push and e-mail have no subscription or mailer in the fixture, so they are unobservable here;
+/// the WS forward and the APRV vouch (propagation) are the reachable effects.
+#[tokio::test]
+async fn backfill_replay_is_state_only() {
+	use cloudillo::meta_adapter::ListTaskOptions;
+	use cloudillo_action::Origin;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let container = obj_id(fx, ALICE, "container-p-tenant-active");
+	let r = issuer(fx, ALICE, Relation::Connected, "", "bf-member").await;
+	let mut s = row("a1~zqm-bf-subs", "SUBS", &r.id_tag);
+	s.audience_tag = Some(ALICE);
+	s.subject = Some(&container);
+	s.x = Some(json!({ "role": "member" }));
+	let key = format!("SUBS:{container}:{}", r.id_tag);
+	seed_row(fx, alice, &s, Some(&key)).await;
+
+	// (action id, WS "action" pushes to alice, tasks queued that name it). The container is
+	// `relay_children`, so propagation is the owner APRV vouching the MSG: a scheduled creator
+	// task whose input carries the MSG id (the raw fan-out is suppressed in its favour).
+	let (r, container) = (&r, container.as_str());
+	let replay = |n: &'static str, origin: Origin| async move {
+		let mut t = claims(r, "MSG");
+		t.p = Some(container.into());
+		t.c = Some(json!(format!("{MARK} replay {n}")));
+		let tok = sign(r, &t);
+		let id = action_hash(&tok);
+		let mut rx = fx.app.broadcast.register_user(alice, ALICE, "zqm-bf-ws").await;
+		cloudillo_action::process_inbound_action_token(
+			&fx.app, alice, &id, &tok, false, None, origin,
+		)
+		.await
+		.unwrap();
+		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+		let mut pushed = 0;
+		while let Ok(m) = rx.try_recv() {
+			if m.cmd == "action" {
+				pushed += 1;
+			}
+		}
+		fx.app.broadcast.unregister_user(alice, ALICE, "zqm-bf-ws").await;
+		let queued = meta
+			.list_tasks(ListTaskOptions::default())
+			.await
+			.unwrap()
+			.into_iter()
+			// Search indexing is `state`, allowed on Backfill.
+			.filter(|t| &*t.kind != "search.object" && t.input.contains(id.as_str()))
+			.count();
+		(id, pushed, queued)
+	};
+
+	let (id, pushed, queued) = replay("live", Origin::Live).await;
+	assert_eq!(status_of(fx, alice, &id).await.as_deref(), Some("A"), "live: stored");
+	assert!(pushed > 0, "live control: alice's UI hears of it");
+	assert!(queued > 0, "live control: propagated (APRV vouch queued)");
+	let (id, pushed, queued) = replay("backfill", Origin::Backfill).await;
+	assert_eq!(status_of(fx, alice, &id).await.as_deref(), Some("A"), "backfill: state lands");
+	assert_eq!(pushed, 0, "backfill pushed to alice's UI");
+	assert_eq!(queued, 0, "backfill propagated");
 }
 
 // vim: ts=4

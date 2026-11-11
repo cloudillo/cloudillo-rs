@@ -29,7 +29,7 @@ pub enum Route {
 	FilePatch,
 	/// `POST /api/files` (CRDT) under the object as parent.
 	FileCreate,
-	/// `PATCH …/user {}`.
+	/// `PATCH …/user-data {}`.
 	FileUser,
 	FileRefresh,
 	FileList,
@@ -42,9 +42,9 @@ pub enum Route {
 	FileDuplicate,
 	/// `GET /api/files/{id}`.
 	FileGet,
-	/// `GET /api/files/variant/{blob}`.
+	/// `GET /api/variants/{blob}`.
 	FileVariant,
-	/// `POST /api/files/file/zqm-new.txt?parentId=` the object (a BLOB upload).
+	/// `POST /api/uploads/file?name=zqm-new.txt&parentId=` the object (a BLOB upload).
 	FileUpload,
 	ActGet,
 	ActPatch,
@@ -61,7 +61,7 @@ pub enum Route {
 	ActCount,
 	Search,
 	Outbox,
-	/// `?access=` value (`None` = omitted).
+	/// `?mode=` value (`None` = omitted).
 	WsCrdt(Option<&'static str>),
 	WsRtdb(Option<&'static str>),
 	/// [`WsCrdt`] / [`WsRtdb`] with the bearer in `?token=` (as browsers connect), no header.
@@ -128,8 +128,8 @@ pub enum Route {
 use Route::*;
 
 /// `(id, subject, object, route, expected)` — `object` is `""` for none. `expected` is
-/// `Allow|Deny|Present|Absent`, optionally `@Level`, or `400`; `Allow*` = any status but
-/// 401/403/404 (FC-37, unreachable upstream).
+/// `Allow|Deny|Present|Absent`, optionally `@Level`, or an HTTP status (`400`, `422`);
+/// `Allow*` = any status but 401/403/404 (FC-37, unreachable upstream).
 pub type Row = (&'static str, &'static str, &'static str, Route, &'static str);
 
 /// One executed cell; G2 rows expand to six.
@@ -402,20 +402,32 @@ pub const FC: &[Row] = &[
 	// alice's key on club's host: refused, where an anonymous caller reads (G2-01 on alice).
 	("FC-79", "apikey-xtenant@club", "tenant-crdt-p-active@club", FileMeta, "Deny"),
 	// A user's share map: self, the tenant account or a leader; links: the tenant account.
-	("FC-80", "stranger@alice", "", Get("/api/shares?subjectType=U&subjectId=g-read.test"), "Deny"),
-	("FC-81", "g_read@alice", "", Get("/api/shares?subjectType=U&subjectId=g-read.test"), "Allow"),
+	(
+		"FC-80",
+		"stranger@alice",
+		"",
+		Get("/api/shares?subjectType=user&subjectId=g-read.test"),
+		"Deny",
+	),
+	(
+		"FC-81",
+		"g_read@alice",
+		"",
+		Get("/api/shares?subjectType=user&subjectId=g-read.test"),
+		"Allow",
+	),
 	(
 		"FC-82",
 		"m_leader@club",
 		"",
-		Get("/api/shares?subjectType=U&subjectId=m-contributor.test"),
+		Get("/api/shares?subjectType=user&subjectId=m-contributor.test"),
 		"Allow",
 	),
 	(
 		"FC-83",
 		"m_contributor@club",
 		"",
-		Get("/api/shares?subjectType=U&subjectId=m-follower.test"),
+		Get("/api/shares?subjectType=user&subjectId=m-follower.test"),
 		"Deny",
 	),
 	("FC-84", "m_leader@club", "", Get(SHARES_L), "Deny"),
@@ -438,6 +450,61 @@ pub const FC: &[Row] = &[
 	("FC-99", "owner-sadm@admin", "", Get("/api/refs?type=register"), "Allow"),
 	// A share link is no account ref: no IdP status behind it.
 	("FC-100", "anon@alice", "", Get("/api/refs/zqref-alice-r/idp-status"), "400"),
+	// Paged share/ref lists: a cursor widens nothing. A well-formed cursor meets the same gate as
+	// the unpaged call (FC-49/50, FC-80, FC-85, FC-90..92); a foreign-kind cursor is refused as
+	// 400 before any gate, so it reveals nothing either; refs refuse scoped credentials first.
+	("FC-254", "stranger@alice", "", Get(SHARES_ALICE_CUR), "Deny"),
+	("FC-255", "follower@alice", "", Get(SHARES_ALICE_CUR), "Deny"),
+	("FC-256", "sharelink-r@alice", "", Get(SHARES_ALICE_CUR), "Deny"),
+	("FC-257", "idp-mgmt@alice", "", Get(SHARES_ALICE_CUR), "Deny"),
+	(
+		"FC-258",
+		"stranger@alice",
+		"",
+		Get(
+			"/api/shares?subjectType=link&subjectId=zqm&cursor=eyJzIjoic2hhcmUiLCJ2IjowLCJpZCI6IiJ9",
+		),
+		"Deny",
+	),
+	(
+		"FC-259",
+		"stranger@alice",
+		"",
+		Get(
+			"/api/shares?subjectType=user&subjectId=alice.test&cursor=eyJzIjoib2Zmc2V0IiwidiI6MCwiaWQiOiIifQ",
+		),
+		"400",
+	),
+	(
+		"FC-260",
+		"owner@alice",
+		"",
+		Get(
+			"/api/shares?subjectType=user&subjectId=alice.test&cursor=eyJzIjoib2Zmc2V0IiwidiI6MCwiaWQiOiIifQ",
+		),
+		"400",
+	),
+	("FC-261", "stranger@alice", "", Get(REFS_CLUB_CUR), "Deny"),
+	("FC-262", "m_leader@club", "", Get(REFS_CLUB_CUR), "Deny"),
+	("FC-263", "idp-mgmt@alice", "", Get(REFS_CLUB_CUR), "Deny"),
+	("FC-264", "sharelink-r@alice", "", Get(REFS_OFFSET_CUR), "Deny"),
+	("FC-265", "owner@alice", "", Get(REFS_OFFSET_CUR), "400"),
+	// club's ref as alice's anchor: the anchor lookup is tenant-scoped, so the page is empty.
+	("FC-266", "owner@alice", "", Fields(REFS_CLUB_CUR, &["id"]), "Clean"),
+	// A mutation names a placement. By content id it is refused for everyone, the owner
+	// included (404 = Deny); a read by the same content id still answers.
+	("FC-267", "owner@alice", "", Call("PATCH", FILE_BY_CONTENT, "{}"), "Deny"),
+	("FC-268", "owner@alice", "", Call("DELETE", FILE_BY_CONTENT, ""), "Deny"),
+	("FC-269", "stranger@alice", "", Call("PATCH", FILE_BY_CONTENT, "{}"), "Deny"),
+	("FC-270", "stranger@alice", "", Call("DELETE", FILE_BY_CONTENT, ""), "Deny"),
+	("FC-271", "follower@alice", "", Call("PATCH", FILE_BY_CONTENT, "{}"), "Deny"),
+	("FC-272", "follower@alice", "", Call("DELETE", FILE_BY_CONTENT, ""), "Deny"),
+	("FC-273", "sharelink-w@alice", "", Call("PATCH", FILE_BY_CONTENT, "{}"), "Deny"),
+	("FC-274", "sharelink-w@alice", "", Call("DELETE", FILE_BY_CONTENT, ""), "Deny"),
+	("FC-275", "idp-mgmt@alice", "", Call("PATCH", FILE_BY_CONTENT, "{}"), "Deny"),
+	("FC-276", "idp-mgmt@alice", "", Call("DELETE", FILE_BY_CONTENT, ""), "Deny"),
+	("FC-277", "owner@alice", "", Get(FILE_META_BY_CONTENT), "Allow"),
+	("FC-278", "owner@alice", "tenant-blob-d-active@alice", FilePatch, "Allow"),
 	// A file's shares are its managers' and readers', never a scoped credential's.
 	("FC-101", "sharelink-a@alice", "root@alice", Get(SHARES_OBJ), "Deny"),
 	("FC-102", "owner-scoped-w@alice", "root@alice", Get(SHARES_OBJ), "Deny"),
@@ -482,7 +549,13 @@ pub const FC: &[Row] = &[
 	// A non-BLOB mirror's FSHR grant: WRITE to the tenant.
 	("FC-134", "owner@alice", "mirroredfshr-crdt-p-active@alice", FileMeta, "Allow@Write"),
 	// FC-135, FC-136: main.rs fshr_grants_follow_the_sub_type.
-	("FC-137", "apkg-publish@alice", "", Call("POST", "/api/files/apkg/zqm.apkg", ""), "Allow*"),
+	(
+		"FC-137",
+		"apkg-publish@alice",
+		"",
+		Call("POST", "/api/uploads/apkg?name=zqm.apkg", ""),
+		"Allow*",
+	),
 	// Tagging is a writer's.
 	("FC-138", "sharelink-w@alice", "tenant-blob-p-active@alice", FileTag, "Deny"),
 	("FC-139", "idp-mgmt@alice", "tenant-blob-p-active@alice", FileTag, "Deny"),
@@ -565,7 +638,7 @@ pub const FC: &[Row] = &[
 	("FC-195", "owner@alice", "root@alice", Get(LIST_PEOPLE), "Allow"),
 	("FC-196", "m_contributor@club", "tenant-blob-d-active@club", Get(LIST_PEOPLE), "Allow"),
 	("FC-197", "m_supporter@club", "tenant-blob-d-active@club", Get(LIST_PEOPLE), "Deny"),
-	// `openedSince` reads the caller's own `accessed_at`: a link token names the tenant.
+	// `openedAfter` reads the caller's own `accessed_at`: a link token names the tenant.
 	("FC-198", "sharelink-r@alice", "root@alice", Get(LIST_OPENED), "Deny"),
 	("FC-199", "folderlink-r@alice", "root@alice", Get(LIST_OPENED), "Deny"),
 	("FC-200", "owner@alice", "root@alice", Get(LIST_OPENED), "Allow"),
@@ -598,7 +671,7 @@ pub const FC: &[Row] = &[
 	// on the room file is its level there, and a reader does not see the share set.
 	("FC-210", "m_moderator@club", ROOM_SHARED, FileListQ("access=people"), "Absent"),
 	("FC-211", "owner@club", ROOM_SHARED, FileListQ("access=people"), "Present"),
-	// `openedSince` and `recursive` keep the gates.
+	// `openedAfter` and `recursive` keep the gates.
 	("FC-212", "anon@alice", "tenant-blob-d-active@alice", FileListQ(OPENED), "Absent"),
 	("FC-213", "stranger@alice", "tenant-blob-d-active@alice", FileListQ(OPENED), "Absent"),
 	("FC-214", "idp-key@alice", "tenant-blob-d-active@alice", FileListQ(OPENED), "Absent"),
@@ -636,14 +709,14 @@ pub const FC: &[Row] = &[
 		"FC-233",
 		"owner@alice",
 		"tenant-blob-d-active@alice",
-		FileListQ("recursive=true&fileId={obj}"),
+		FileListQ("recursive=true&contentId={obj}"),
 		"Present",
 	),
 	(
 		"FC-234",
 		"stranger@alice",
 		"tenant-blob-d-active@alice",
-		FileListQ("recursive=true&fileId={obj}"),
+		FileListQ("recursive=true&contentId={obj}"),
 		"Absent",
 	),
 	// `/access` in the closed room: a hat cannot enter it, so cannot read; the rostered
@@ -659,12 +732,18 @@ pub const FC: &[Row] = &[
 	("FC-241", "hatted-scoped@club", OPEN_FILE, AccessShape, "Deny"),
 	("FC-253", "hatted-scoped@club", "root@club", AccessShape, "none"),
 	("FC-242", "owner-scoped-w@alice", "root@alice", AccessShape, "none"),
-	// Combined filters keep their gates: `access=` is a writer's, `openedSince` the holder's
+	// Combined filters keep their gates: `access=` is a writer's, `openedAfter` the holder's
 	// own; inside a shared folder `tags` still filters (no seeded file carries a tag), and
 	// `access=` stays refused to a file grant.
 	("FC-243", "anon@alice", "root@alice", Get(LIST_PEOPLE), "Deny"),
 	("FC-244", "anon@club", "root@club", Get(LIST_PEOPLE), "Deny"),
-	("FC-245", "hatted@club", "root@club", Get("/api/files?openedSince=1"), "Allow"),
+	(
+		"FC-245",
+		"hatted@club",
+		"root@club",
+		Get("/api/files?openedAfter=1970-01-01T00:00:01Z"),
+		"Allow",
+	),
 	(
 		"FC-246",
 		"g_folder@alice",
@@ -698,20 +777,32 @@ const OPEN_FILE: &str = "cur-chan-open-contrib-file@club";
 /// The subtree of alice's canonical folder (`objects::canon_folder`).
 const FOLDER_TREE: &str = "parentId=f1~zqm-alice-folder-blob-d-active&recursive=true";
 
-const SHARES_L: &str = "/api/shares?subjectType=L&subjectId=zqm";
-const SHARES_OBJ: &str = "/api/files/{obj}/shares";
+/// alice's active blob addressed by its content id (FC-267..277).
+const FILE_BY_CONTENT: &str = "/api/files/f1~zqm-alice-tenant-blob-d-active";
+const FILE_META_BY_CONTENT: &str = "/api/files/f1~zqm-alice-tenant-blob-d-active/metadata";
+const SHARES_L: &str = "/api/shares?subjectType=link&subjectId=zqm";
+const SHARES_OBJ: &str = "/api/files/{entry}/shares";
 const ACCESS: &str = "/api/files/{obj}/access";
 const LIST_PEOPLE: &str = "/api/files?access=people";
-const LIST_OPENED: &str = "/api/files?openedSince=0";
+const LIST_OPENED: &str = "/api/files?openedAfter=1970-01-01T00:00:00Z";
 const RECURSIVE_ROOT: &str = "parentId=__root__&recursive=true";
 const RECURSIVE: &str = "recursive=true";
-const OPENED: &str = "openedSince=0";
+const OPENED: &str = "openedAfter=1970-01-01T00:00:00Z";
 const REFS_ROOT: &str = "/api/refs?type=share.file&resourceId=f1~zqm-alice-tenant-crdt-d-active";
 
-const SHARES_F_ROOT: &str = "/api/shares?subjectType=F&subjectId=f1~zqm-alice-tenant-crdt-d-active";
-const SHARES_F_BLOB: &str = "/api/shares?subjectType=F&subjectId=f1~zqm-alice-tenant-blob-d-active";
+const SHARES_F_ROOT: &str =
+	"/api/shares?subjectType=file&subjectId=f1~zqm-alice-tenant-crdt-d-active";
+const SHARES_F_BLOB: &str =
+	"/api/shares?subjectType=file&subjectId=f1~zqm-alice-tenant-blob-d-active";
 
-const SHARES_ALICE: &str = "/api/shares?subjectType=U&subjectId=alice.test";
+const SHARES_ALICE: &str = "/api/shares?subjectType=user&subjectId=alice.test";
+/// [`SHARES_ALICE`] with a well-formed share cursor past every id (`{s:"share",v:i64::MAX}`).
+const SHARES_ALICE_CUR: &str = "/api/shares?subjectType=user&subjectId=alice.test&cursor=eyJzIjoic2hhcmUiLCJ2Ijo5MjIzMzcyMDM2ODU0Nzc1ODA3LCJpZCI6IiJ9";
+/// `/api/refs` anchored on club's `zqref-club-r` (`{s:"ref",v:null,id:"zqref-club-r"}`).
+const REFS_CLUB_CUR: &str =
+	"/api/refs?cursor=eyJzIjoicmVmIiwidiI6bnVsbCwiaWQiOiJ6cXJlZi1jbHViLXIifQ";
+/// `/api/refs` with a foreign-kind (offset) cursor.
+const REFS_OFFSET_CUR: &str = "/api/refs?cursor=eyJzIjoib2Zmc2V0IiwidiI6MCwiaWQiOiIifQ";
 
 /// Action curated rows.
 pub const AC: &[Row] = &[
@@ -857,7 +948,8 @@ pub const AC: &[Row] = &[
 	// `inbound_flows.rs`, a static body cannot carry one.
 	("AC-121", "m_contributor@club", "", BDG_STD_NO_EXP, "Deny"),
 	("AC-122", "m_follower@club", "", BDG_STD_NO_EXP, "Deny"),
-	("AC-123", "m_moderator@club", "", BDG_DEL, "Deny"),
+	// BDG:DEL is no known subtype: 422 before any permission gate.
+	("AC-123", "m_moderator@club", "", BDG_DEL, "422"),
 	("AC-124", "m_moderator@club", "", BDG_BASE, "Deny"),
 	("AC-125", "m_moderator@club", "", BDG_STD_NO_EXP, "400"),
 	("AC-126", "m_moderator@club", "", BDG_STD_FAR_EXP, "400"),
@@ -875,7 +967,7 @@ pub const AC: &[Row] = &[
 	("AC-136", "idp-mgmt@club", "", BDG_STD_NO_EXP, "Deny"),
 	("AC-137", "idp-key@alice", "", BDG_STD_ALICE, "Deny"),
 	("AC-138", "idp-ident@alice", "", BDG_STD_ALICE, "Deny"),
-	// `POST /api/actions/verify` spends the tenant's outbound budget (`sync`): the tenant
+	// `POST /api/action-verifications` spends the tenant's outbound budget (`sync`): the tenant
 	// account only, never a credential that merely carries its id_tag.
 	("AC-139", "owner@alice", "", VERIFY, "Allow"),
 	("AC-140", "sharelink-r@alice", "", VERIFY, "Deny"),
@@ -886,6 +978,8 @@ pub const AC: &[Row] = &[
 	("AC-145", "g_read@alice", "", VERIFY, "Deny"),
 	("AC-146", "sadm-visit@alice", "", VERIFY, "Deny"),
 	("AC-147", "anon@alice", "", VERIFY, "Deny"),
+	// A lower community role is refused too (`POST /api/action-verifications`).
+	("AC-258", "m_contributor@club", "", VERIFY, "Deny"),
 	("AC-148", "stranger@alice", "", RS_LIST, "Deny"),
 	("AC-149", "idp-mgmt@alice", "", RS_LIST, "Deny"),
 	// MSG:UPD / MSG:DEL (subject = the row's group MSG): the author edits; the CONV creator
@@ -958,6 +1052,15 @@ pub const AC: &[Row] = &[
 	// Carries alice's id_tag without being the tenant: the row that reaches
 	// `actor != tenant_tag`.
 	("AC-240", "idp-key@alice", "post-p-tenant-active@alice", PRES_DM, "Deny"),
+	// Strict types on local create: a subtype its base does not list is refused 422
+	// `E-FED-UNSUPPORTED`, ahead of the server-emitted guard (STAT answers 403 otherwise).
+	("AC-253", "owner@alice", "post-p-tenant-active@alice", STAT_XYZ, "422"),
+	("AC-254", "owner@alice", "", POST_XYZ, "422"),
+	// Refused earlier: share-link scope does not permit `/api/actions`.
+	("AC-255", "sharelink-w@alice", "", POST_XYZ, "Deny"),
+	// The subtypes the client sends are listed (MSG:TEXT, POST:VIDEO).
+	("AC-256", "owner@alice", "container-p-tenant-active@alice", MSG_TEXT, "Allow"),
+	("AC-257", "owner@alice", "", POST_VIDEO, "Allow"),
 ];
 
 /// FSHR to a profile connected to the host (`m-follower.test` on club, `connected.test` on alice),
@@ -1004,7 +1107,8 @@ const RCPT_POST: Route = Call(
 	r#"{"type":"RCPT","audienceTag":"connected.test","content":1700000000}"#,
 );
 /// AC-139..147: an undecodable token, so even `sync` makes no outbound request.
-const VERIFY: Route = Call("POST", "/api/actions/verify", r#"{"tokens":["x.y.z"],"sync":true}"#);
+const VERIFY: Route =
+	Call("POST", "/api/action-verifications", r#"{"tokens":["x.y.z"],"sync":true}"#);
 /// BDG issue bodies (AC-121..138). The audience `m-follower.test` is a connected club member.
 const BDG_STD_NO_EXP: Route = Call(
 	"POST",
@@ -1043,6 +1147,22 @@ const BDG_STD_ALICE: Route = Call(
 );
 const STAT_POST: Route =
 	Call("POST", "/api/actions", r#"{"type":"STAT","parentId":"{obj}","content":{"c":1}}"#);
+/// Unlisted subtypes (strict `DslEngine::is_known`).
+const STAT_XYZ: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"STAT","subType":"XYZ","parentId":"{obj}","content":{"c":1}}"#,
+);
+const POST_XYZ: Route =
+	Call("POST", "/api/actions", r#"{"type":"POST","subType":"XYZ","content":"zqm"}"#);
+/// A chat message into the row object's CONV, as the web client sends it.
+const MSG_TEXT: Route = Call(
+	"POST",
+	"/api/actions",
+	r#"{"type":"MSG","subType":"TEXT","content":"zqm","parentId":"{obj}"}"#,
+);
+const POST_VIDEO: Route =
+	Call("POST", "/api/actions", r#"{"type":"POST","subType":"VIDEO","content":"zqm"}"#);
 const IDP_REG_POST: Route = Call(
 	"POST",
 	"/api/actions",
@@ -1219,7 +1339,7 @@ pub const WS: &[Row] = &[
 		"Allow@Write",
 	),
 	("WS-74", "tampered@alice", "tenant-crdt-p-active@alice", WsQuery(WsKind::Crdt, None), "Deny"),
-	// `?access=comment` needs Comment, and caps a writer at it.
+	// `?mode=comment` needs Comment, and caps a writer at it.
 	("WS-75", "g_read@alice", "tenant-crdt-d-active@alice", WsCrdt(Some("comment")), "Deny"),
 	(
 		"WS-76",
@@ -1312,7 +1432,9 @@ const RS_LIST_BAD_KIND: Route = Get("/api/reader-state?kind=bogus");
 /// one is clamped to now).
 const RS_READ: Route = Call("PATCH", "/api/reader-state/A/{obj}", r#"{"readAt":1700000000}"#);
 /// Same, the notification level (Watching).
-const RS_NOTIFY: Route = Call("PATCH", "/api/reader-state/A/{obj}", r#"{"notify":"W"}"#);
+const RS_NOTIFY: Route = Call("PATCH", "/api/reader-state/A/{obj}", r#"{"notify":"all"}"#);
+/// Same, clearing the notification level back to the kind's default.
+const RS_CLEAR_NOTIFY: Route = Call("PATCH", "/api/reader-state/A/{obj}", r#"{"notify":null}"#);
 /// Same, a flag.
 const RS_PIN: Route = Call("PATCH", "/api/reader-state/A/{obj}", r#"{"pinned":true}"#);
 /// A DM peer with no profile row.
@@ -1321,7 +1443,7 @@ const RS_UNKNOWN_PEER: Route =
 /// An action id with no row.
 const RS_UNKNOWN_ACTION: Route =
 	Call("PATCH", "/api/reader-state/A/zqm-nope", r#"{"pinned":true}"#);
-/// A `notify` outside `W|T|M`.
+/// A `notify` outside `all|mentions|none`.
 const RS_BAD_NOTIFY: Route = Call("PATCH", "/api/reader-state/A/{obj}", r#"{"notify":"X"}"#);
 /// `readAt` is not nullable.
 const RS_NULL_READ: Route = Call("PATCH", "/api/reader-state/A/{obj}", r#"{"readAt":null}"#);
@@ -1394,6 +1516,13 @@ pub const SE: &[Row] = &[
 	("SE-45", "follower@alice", "", RS_LIST, "Deny"),
 	("SE-46", "anon@alice", "", RS_LIST, "Deny"),
 	("SE-47", "owner-scoped-w@alice", "post-p-tenant-active@alice", RS_READ, "Deny"),
+	// `notify: null` clears the level; the same gate as setting it.
+	("SE-48", "owner@alice", "container-p-tenant-active@alice", RS_CLEAR_NOTIFY, "Allow"),
+	("SE-49", "subscriber@alice", "container-s-tenant-active@alice", RS_CLEAR_NOTIFY, "Deny"),
+	("SE-50", "stranger@alice", "container-d-tenant-active@alice", RS_CLEAR_NOTIFY, "Deny"),
+	("SE-51", "owner-scoped-w@alice", "container-p-tenant-active@alice", RS_CLEAR_NOTIFY, "Deny"),
+	("SE-52", "sharelink-w@alice", "container-p-tenant-active@alice", RS_CLEAR_NOTIFY, "Deny"),
+	("SE-53", "idp-key@alice", "container-p-tenant-active@alice", RS_CLEAR_NOTIFY, "Deny"),
 ];
 
 const ADMIN_TENANTS: Route = Call("GET", "/api/admin/tenants", "");
@@ -1423,36 +1552,53 @@ const PROF_SETTINGS: Route = Call("GET", "/api/profiles/m-contributor.test/setti
 const PROF_SETTING_PUT: Route =
 	Call("PUT", "/api/profiles/m-contributor.test/settings/zqm.k", r#"{"value":1}"#);
 const PATCH_FOLLOWER: Route = Call("PATCH", "/api/profiles/follower.test", "{}");
-const HAT_ENDORSE_BOGUS: Route = Get("/api/auth/hat-endorse?peer=alice.test&token=x");
-const EXCHANGE_BOGUS: Route = Get("/api/auth/access-token?token=x");
-const PUT_COMMUNITY: Route = Call("PUT", "/api/profiles/zqm-new.test", r#"{"type":"community"}"#);
+const HAT_ENDORSE_BOGUS: Route =
+	Call("POST", "/api/auth/hat-endorse", r#"{"peer":"alice.test","token":"x"}"#);
+const EXCHANGE_BOGUS: Route = Call("POST", "/api/auth/access-token", r#"{"token":"x"}"#);
+const PUT_COMMUNITY: Route =
+	Call("POST", "/api/communities", r#"{"idTag":"zqm-new.test","type":"community"}"#);
 const PUT_COMMUNITY_BAD_REF: Route = Call(
-	"PUT",
-	"/api/profiles/zqm-new.test",
-	r#"{"type":"community","inviteRef":"zqref-unknown"}"#,
+	"POST",
+	"/api/communities",
+	r#"{"idTag":"zqm-new.test","type":"community","inviteRef":"zqref-unknown"}"#,
 );
 const REFRESH_UNTRACKED: Route = Call("POST", "/api/profiles/zqm-untracked.test/refresh", "");
 const TAGS: Route = Call("GET", "/api/tags", "");
 const FORMATS: Route = Call("GET", "/api/doc-formats", "");
-const FORMAT_PUT: Route =
-	Call("PUT", "/api/doc-formats/zqm%2Fmatrix", r#"{"publisherTag":"zqm.test","appName":"zqm"}"#);
+const FORMAT_PUT: Route = Call(
+	"PUT",
+	"/api/doc-formats/zqm%2Fmatrix",
+	r#"{"publisherIdTag":"zqm.test","appName":"zqm"}"#,
+);
 const FORMAT_DEL: Route = Call("DELETE", "/api/doc-formats/zqm%2Fmatrix", "");
 const ADDR_BOOKS: Route = Call("GET", "/api/address-books", "");
 const CALENDARS: Route = Call("GET", "/api/calendars", "");
-const SITES: Route = Call("GET", "/api/sites", "");
-const PUSH_SUB: Route = Call("POST", "/api/notifications/subscription", "{}");
+const SITES: Route = Call("GET", "/api/site", "");
+const PUSH_SUB: Route = Call("POST", "/api/notifications/subscriptions", "{}");
 const REINDEX: Route = Call("POST", "/api/search/reindex", "");
 const API_KEYS: Route = Call("GET", "/api/auth/api-keys", "");
 const API_KEY_MINT: Route = Call("POST", "/api/auth/api-keys", r#"{"name":"zqm-mint"}"#);
-const WA_REG: Route = Call("GET", "/api/auth/wa/reg", "");
-const PROXY_TOKEN: Route = Call("GET", "/api/auth/proxy-token", "");
-const VAPID: Route = Call("GET", "/api/auth/vapid", "");
+const WA_REG: Route = Call("GET", "/api/auth/passkeys", "");
+const PROXY_TOKEN: Route = Call("POST", "/api/auth/proxy-token", "{}");
+const VAPID: Route = Call("GET", "/api/notifications/vapid-key", "");
 const IDP_IDENTITIES: Route = Call("GET", "/api/idp/identities", "");
-const SHARES_F: &str = "/api/files/f1~zqm-alice-tenant-blob-d-active/shares";
+/// Entry-id routes: rows naming them target `tenant-blob-d-active@alice`.
+const SHARES_F: &str = "/api/files/{entry}/shares";
 const SHARES_GET: Route = Call("GET", SHARES_F, "");
-const SHARES_POST: Route =
-	Call("POST", SHARES_F, r#"{"subjectType":"U","subjectId":"zqm-nobody.test","permission":"R"}"#);
-const UNTAG: Route = Call("DELETE", "/api/files/f1~zqm-alice-tenant-blob-d-active/tag/zqm", "");
+const SHARES_POST: Route = Call(
+	"POST",
+	SHARES_F,
+	r#"{"subjectType":"user","subjectId":"zqm-nobody.test","permission":"read"}"#,
+);
+/// The same share routes through the content id (the client's cross-owner path) and a variant id.
+const SHARES_CID: &str = "/api/files/{obj}/shares";
+const SHARES_CID_POST: Route = Call(
+	"POST",
+	SHARES_CID,
+	r#"{"subjectType":"user","subjectId":"zqm-cid.test","permission":"read"}"#,
+);
+const SHARES_VARIANT: &str = "/api/files/{variant}/shares";
+const UNTAG: Route = Call("DELETE", "/api/files/{entry}/tags/zqm", "");
 const REF_SHARE: Route = Call(
 	"POST",
 	"/api/refs",
@@ -1461,10 +1607,10 @@ const REF_SHARE: Route = Call(
 const REF_WELCOME: Route = Call("POST", "/api/refs", r#"{"type":"welcome"}"#);
 const REF_DEL: Route = Call("DELETE", "/api/refs/zqref-alice-r", "");
 const ME_PATCH: Route = Call("PATCH", "/api/me", r#"{"x":{"zqm":"1"}}"#);
-const IDP_STATUS: Route = Call("GET", "/api/profiles/me/idp-status", "");
+const IDP_STATUS: Route = Call("GET", "/api/me/idp-status", "");
 const ME_IMAGE: Route = Call("PUT", "/api/me/image", "");
 const ME_COVER: Route = Call("PUT", "/api/me/cover", "");
-const IDP_RESEND: Route = Call("POST", "/api/profiles/me/resend-activation", "");
+const IDP_RESEND: Route = Call("POST", "/api/me/idp/resend", "");
 const APPS_INSTALLED: Route = Call("GET", "/api/apps/installed", "");
 const APPS_INSTALL: Route = Call("POST", "/api/apps/install", "{}");
 const REF_FIELDS: Route = Fields("/api/refs/zqref-alice-r", &["resourceId", "accessLevel"]);
@@ -1608,14 +1754,14 @@ pub const MG: &[Row] = &[
 		"MG-581",
 		"owner@alice",
 		"",
-		Call("PATCH", "/api/profiles/follower.test", r#"{"status":"S"}"#),
+		Call("PATCH", "/api/profiles/follower.test", r#"{"status":"suspended"}"#),
 		"400",
 	),
 	(
 		"MG-582",
 		"m_leader@club",
 		"",
-		Call("PATCH", "/api/admin/profiles/m-follower.test", r#"{"status":"S"}"#),
+		Call("PATCH", "/api/admin/profiles/m-follower.test", r#"{"status":"suspended"}"#),
 		"400",
 	),
 	// Token exchange and hat endorsement (both may lift Suspended) authenticate by the PROXY in
@@ -1721,16 +1867,16 @@ pub const MG: &[Row] = &[
 	("MG-112", "anon@alice", "", IDP_IDENTITIES, "Deny"),
 	("MG-113", "sharelink-r@alice", "", IDP_IDENTITIES, "Deny"),
 	// A file's shares: listed from Write, created from Admin.
-	("MG-114", "g_write@alice", "", SHARES_GET, "Allow"),
-	("MG-115", "g_admin@alice", "", SHARES_GET, "Allow"),
-	("MG-116", "g_read@alice", "", SHARES_GET, "Deny"),
-	("MG-117", "stranger@alice", "", SHARES_GET, "Deny"),
-	("MG-118", "g_admin@alice", "", SHARES_POST, "Allow"),
-	("MG-119", "g_write@alice", "", SHARES_POST, "Deny"),
-	("MG-120", "g_read@alice", "", SHARES_POST, "Deny"),
+	("MG-114", "g_write@alice", "tenant-blob-d-active@alice", SHARES_GET, "Allow"),
+	("MG-115", "g_admin@alice", "tenant-blob-d-active@alice", SHARES_GET, "Allow"),
+	("MG-116", "g_read@alice", "tenant-blob-d-active@alice", SHARES_GET, "Deny"),
+	("MG-117", "stranger@alice", "tenant-blob-d-active@alice", SHARES_GET, "Deny"),
+	("MG-118", "g_admin@alice", "tenant-blob-d-active@alice", SHARES_POST, "Allow"),
+	("MG-119", "g_write@alice", "tenant-blob-d-active@alice", SHARES_POST, "Deny"),
+	("MG-120", "g_read@alice", "tenant-blob-d-active@alice", SHARES_POST, "Deny"),
 	// Untagging needs Write (FC-10 for tagging).
-	("MG-121", "g_comment@alice", "", UNTAG, "Deny"),
-	("MG-122", "stranger@alice", "", UNTAG, "Deny"),
+	("MG-121", "g_comment@alice", "tenant-blob-d-active@alice", UNTAG, "Deny"),
+	("MG-122", "stranger@alice", "tenant-blob-d-active@alice", UNTAG, "Deny"),
 	// Refs: a share link is the tenant's to mint; `welcome` is SADM's.
 	("MG-123", "owner@alice", "", REF_SHARE, "Allow"),
 	("MG-124", "g_write@alice", "", REF_SHARE, "Deny"),
@@ -1820,7 +1966,7 @@ pub const MG: &[Row] = &[
 	("MG-200", "owner@alice", "", FLLW_NOBODY, "Allow*"),
 	// A draft goes through the same gate.
 	("MG-201", "m_contributor@club", APRV_TARGET, APRV_DRAFT, "Deny"),
-	// `/api/profiles/batch` skips the scope gate (public data only), never validity.
+	// `/api/profile-lookups` skips the scope gate (public data only), never validity.
 	("MG-202", "sharelink-r@alice", "", BATCH, "Allow"),
 	("MG-203", "apkg-publish@alice", "", BATCH, "Allow"),
 	("MG-204", "apikey-dav@alice", "", BATCH, "Allow"),
@@ -1838,36 +1984,7 @@ pub const MG: &[Row] = &[
 	("MG-225b", "sadm-scoped@admin", "", ADMIN_TENANTS, "Deny"),
 	("MG-226a", "owner-scoped-r@alice", "", ADMIN_PROXY, "Deny"),
 	("MG-226b", "sadm-scoped@admin", "", ADMIN_PROXY, "Deny"),
-	// Another tenant's settings are SADM's alone, at every level.
-	("MG-227", "owner@alice", "", Get("/api/settings/file.sync_max_vis?tenant=club.test"), "Deny"),
-	(
-		"MG-228",
-		"owner@alice",
-		"",
-		Call("PUT", "/api/settings/file.sync_max_vis?tenant=club.test", r#"{"value":"md"}"#),
-		"Deny",
-	),
-	(
-		"MG-229",
-		"owner@alice",
-		"",
-		Call("DELETE", "/api/settings/file.sync_max_vis?level=tenant&tenant=club.test", ""),
-		"Deny",
-	),
-	(
-		"MG-230",
-		"m_leader@club",
-		"",
-		Get("/api/settings/file.sync_max_vis?tenant=alice.test"),
-		"Deny",
-	),
-	(
-		"MG-231",
-		"owner-sadm@admin",
-		"",
-		Get("/api/settings/file.sync_max_vis?tenant=club.test"),
-		"Allow",
-	),
+	// MG-227..231 retired: `/api/settings` has no `?tenant=`, it acts on the caller's own tenant.
 	// The raw global row of a Global-scoped key, and any global listing, are SADM's.
 	("MG-232", "owner@alice", "", Get("/api/settings/backup.keep?level=global"), "Deny"),
 	("MG-233", "owner@alice", "", Get("/api/settings?prefix=file&level=global"), "Deny"),
@@ -1903,13 +2020,19 @@ pub const MG: &[Row] = &[
 		"MG-240",
 		"apkg-publish@alice",
 		"folder@alice",
-		Call("POST", "/api/files/apkg/zqm.apkg?parentId={obj}", ""),
+		Call("POST", "/api/uploads/apkg?name=zqm.apkg&parentId={obj}", ""),
 		"Deny",
 	),
 	// A federated proxy token is the tenant vouching: owner or leader; a bad hat is refused.
-	("MG-241", "stranger@alice", "", Get("/api/auth/proxy-token?idTag=peer.test"), "Deny"),
-	("MG-242", "m_contributor@club", "", Get("/api/auth/proxy-token?idTag=peer.test"), "Deny"),
-	("MG-243", "owner@alice", "", Get("/api/auth/proxy-token?hat=!!bad"), "400"),
+	("MG-241", "stranger@alice", "", PROXY_TO_PEER, "Deny"),
+	("MG-242", "m_contributor@club", "", PROXY_TO_PEER, "Deny"),
+	(
+		"MG-243",
+		"owner@alice",
+		"",
+		Call("POST", "/api/auth/proxy-token", r#"{"hat":"!!bad"}"#),
+		"400",
+	),
 	// A DAV key reaches its own capability only: read-only CardDAV writes and reads no calendar.
 	("MG-244", "apikey-carddav-r@alice", "", Call("POST", "/api/address-books", "{}"), "Deny"),
 	("MG-245", "apikey-carddav-r@alice", "", CALENDARS, "Deny"),
@@ -1917,7 +2040,7 @@ pub const MG: &[Row] = &[
 	// Writes to the account's own credentials (MG-88..103 for reads).
 	("MG-247", "m_leader@club", "", Call("POST", "/api/auth/api-keys", "{}"), "Deny"),
 	// Vacuous: no passkey is seeded, so a missing-row 404 passes as Deny too.
-	("MG-248", "m_leader@club", "", Call("DELETE", "/api/auth/wa/reg/zqm", ""), "Deny"),
+	("MG-248", "m_leader@club", "", Call("DELETE", "/api/auth/passkeys/zqm", ""), "Deny"),
 	// Only `share.file` is a client's to mint; every other type is SADM's.
 	("MG-249", "m_leader@club", "", Call("POST", "/api/refs", r#"{"type":"password"}"#), "Deny"),
 	("MG-250", "owner@alice", "", REF_REGISTER, "Deny"),
@@ -1960,7 +2083,7 @@ pub const MG: &[Row] = &[
 		Call(
 			"PUT",
 			"/api/doc-formats/zqm%2Fheld",
-			r#"{"publisherTag":"zqm.test","appName":"zqm"}"#,
+			r#"{"publisherIdTag":"zqm.test","appName":"zqm"}"#,
 		),
 		"Deny",
 	),
@@ -2004,13 +2127,7 @@ pub const MG: &[Row] = &[
 		"400",
 	),
 	// A share link is no account ref: nothing to re-send.
-	(
-		"MG-277",
-		"anon@alice",
-		"",
-		Call("POST", "/api/refs/zqref-alice-r/resend-activation", ""),
-		"400",
-	),
+	("MG-277", "anon@alice", "", Call("POST", "/api/refs/zqref-alice-r/idp/resend", ""), "400"),
 	// Creating a file's shares: its managers; a scoped credential never; `A` is for users only.
 	("MG-278", "sharelink-a@alice", "root@alice", Call("POST", SHARES_OBJ, SHARE_U), "Deny"),
 	("MG-279", "owner-scoped-w@alice", "root@alice", Call("POST", SHARES_OBJ, SHARE_U), "Deny"),
@@ -2035,7 +2152,7 @@ pub const MG: &[Row] = &[
 		Call(
 			"POST",
 			SHARES_OBJ,
-			r#"{"subjectType":"U","subjectId":"zqm-c.test","permission":"R"}"#,
+			r#"{"subjectType":"user","subjectId":"zqm-c.test","permission":"read"}"#,
 		),
 		"Allow",
 	),
@@ -2043,7 +2160,11 @@ pub const MG: &[Row] = &[
 		"MG-283",
 		"owner@alice",
 		"tenant-blob-d-active@alice",
-		Call("POST", SHARES_OBJ, r#"{"subjectType":"L","subjectId":"zqm","permission":"A"}"#),
+		Call(
+			"POST",
+			SHARES_OBJ,
+			r#"{"subjectType":"link","subjectId":"zqm","permission":"admin"}"#,
+		),
 		"400",
 	),
 	(
@@ -2053,7 +2174,7 @@ pub const MG: &[Row] = &[
 		Call(
 			"POST",
 			SHARES_OBJ,
-			r#"{"subjectType":"F","subjectId":"f1~zqm-alice-tenant-crdt-d-active","permission":"A"}"#,
+			r#"{"subjectType":"file","subjectId":"f1~zqm-alice-tenant-crdt-d-active","permission":"admin"}"#,
 		),
 		"400",
 	),
@@ -2067,7 +2188,7 @@ pub const MG: &[Row] = &[
 		"MG-289",
 		"m_moderator@club",
 		"",
-		Call("POST", "/api/files/file/zqm-chan.txt?channel=@club.test~closed-w", "zqm"),
+		Call("POST", "/api/uploads/file?name=zqm-chan.txt&channel=@club.test~closed-w", "zqm"),
 		"Deny",
 	),
 	("MG-290", "owner@alice", "folder-blob-p-trashed@alice", FileUpload, "Deny"),
@@ -2083,7 +2204,7 @@ pub const MG: &[Row] = &[
 	("MG-297", "idp-key@alice", "", POST_ZQM, "Deny"),
 	("MG-298", "idp-mgmt@alice", "", POST_ZQM, "Deny"),
 	// A community invitation is a moderator's; its revocation the inviter's or a moderator's;
-	// an unknown subtype nobody's.
+	// an unknown subtype is refused as unsupported (422).
 	("MG-299", "m_contributor@club", "", INVT_CLUB, "Deny"),
 	// `zqm-invitee.test` is unknown to club and INVT is not `allow_unknown`: 400 past the gate
 	// (`task.rs` outbound `allow_unknown`); AC-87 is the live Allow.
@@ -2108,7 +2229,7 @@ pub const MG: &[Row] = &[
 			"/api/actions",
 			r#"{"type":"INVT:FOO","subject":"@club.test","audienceTag":"zqm-invitee.test"}"#,
 		),
-		"Deny",
+		"422",
 	),
 	// Pinned, open gap: a bearer in `?token=` is accepted on every authenticated route.
 	("MG-303", "owner@alice", "", GetQ("/api/settings"), "Allow"),
@@ -2142,13 +2263,13 @@ pub const MG: &[Row] = &[
 		"",
 		Call(
 			"POST",
-			"/api/auth/set-password",
+			"/api/auth/password/set",
 			r#"{"refId":"zqref-alice-welcome","newPassword":"zqm-new-0000"}"#,
 		),
 		"Deny",
 	),
 	// SADM reads the admin surface it alone may change (MG-214..224 deny it to everyone else).
-	("MG-313", "owner-sadm@admin", "", Get("/api/admin/cert-status"), "Allow"),
+	("MG-313", "owner-sadm@admin", "", Get("/api/admin/certificates"), "Allow"),
 	("MG-314", "owner-sadm@admin", "", Get("/api/admin/proxy-sites/1"), "Allow"),
 	// The account's own credentials: a leader never manages its community's keys or passkeys
 	// (MG-247 for creating one); the owner reads its own (MG-315..320 deny the rest).
@@ -2161,17 +2282,17 @@ pub const MG: &[Row] = &[
 		"Deny",
 	),
 	("MG-323", "m_leader@club", "", Call("DELETE", "/api/auth/api-keys/6", ""), "Deny"),
-	("MG-324", "m_leader@club", "", Call("POST", "/api/auth/wa/reg", "{}"), "Deny"),
-	("MG-325", "m_leader@club", "", Get("/api/auth/wa/reg/challenge"), "Deny"),
+	("MG-324", "m_leader@club", "", Call("POST", "/api/auth/passkeys", "{}"), "Deny"),
+	("MG-325", "m_leader@club", "", Call("POST", "/api/auth/passkey-challenges", "{}"), "Deny"),
 	("MG-326", "owner@alice", "", Get("/api/auth/api-keys/1"), "Allow"),
-	("MG-327", "owner@alice", "", Get("/api/auth/wa/reg/challenge"), "Allow"),
+	("MG-327", "owner@alice", "", Call("POST", "/api/auth/passkey-challenges", "{}"), "Allow"),
 	("MG-328", "owner@club", "", Get("/api/auth/api-keys/6"), "Allow"),
 	// More of the `require_leader` group. The layer runs before the handler: a contributor's
 	// 403 against the leader's 400 on a non-numeric id is not a missing-row 404.
 	("MG-329", "m_contributor@club", "", SITES_PATCH, "Deny"),
 	("MG-330", "m_leader@club", "", SITES_PATCH, "Allow*"),
-	("MG-331", "m_contributor@club", "", Get("/api/sites/pages"), "Deny"),
-	("MG-332", "m_leader@club", "", Get("/api/sites/pages"), "Allow*"),
+	("MG-331", "m_contributor@club", "", Get("/api/site/pages"), "Deny"),
+	("MG-332", "m_leader@club", "", Get("/api/site/pages"), "Allow*"),
 	("MG-333", "m_contributor@club", "", SITES_PUBLISH, "Deny"),
 	("MG-334", "m_leader@club", "", SITES_PUBLISH, "Allow*"),
 	("MG-335", "m_contributor@club", "", AB_PATCH, "Deny"),
@@ -2202,7 +2323,7 @@ pub const MG: &[Row] = &[
 		"Deny",
 	),
 	// Shares and refs need an authenticated manager; the owner edits a ref of its own.
-	("MG-349", "anon@alice", "", SHARES_POST, "Deny"),
+	("MG-349", "anon@alice", "tenant-blob-d-active@alice", SHARES_POST, "Deny"),
 	(
 		"MG-350",
 		"owner@alice",
@@ -2214,13 +2335,14 @@ pub const MG: &[Row] = &[
 	// `/api/me/full`: a link or a follower sees no owner-tier section (MG-261..264).
 	("MG-352", "sharelink-r@alice", "", ME_FULL, "Clean"),
 	("MG-353", "follower@alice", "", ME_FULL, "Clean"),
-	// A CONN with an empty or unknown subtype is a request in disguise: leader+, not open.
-	("MG-354", "m_contributor@club", "", CONN_EMPTY_SUB, "Deny"),
-	("MG-355", "m_contributor@club", "", CONN_XYZ_SUB, "Deny"),
-	("MG-356", "m_moderator@club", "", CONN_EMPTY_SUB, "Deny"),
-	("MG-357", "m_moderator@club", "", CONN_XYZ_SUB, "Deny"),
-	("MG-358", "m_leader@club", "", CONN_EMPTY_SUB, "Allow*"),
-	("MG-359", "m_leader@club", "", CONN_XYZ_SUB, "Allow*"),
+	// A CONN with an empty or unknown subtype is refused as unsupported (422) for every role,
+	// before the permission gate.
+	("MG-354", "m_contributor@club", "", CONN_EMPTY_SUB, "422"),
+	("MG-355", "m_contributor@club", "", CONN_XYZ_SUB, "422"),
+	("MG-356", "m_moderator@club", "", CONN_EMPTY_SUB, "422"),
+	("MG-357", "m_moderator@club", "", CONN_XYZ_SUB, "422"),
+	("MG-358", "m_leader@club", "", CONN_EMPTY_SUB, "422"),
+	("MG-359", "m_leader@club", "", CONN_XYZ_SUB, "422"),
 	// The subtype in `type` and in `subType` must agree; the gate reads one, the pipeline both.
 	(
 		"MG-360",
@@ -2341,14 +2463,14 @@ pub const MG: &[Row] = &[
 	// passkey is seeded (`webauthn.rs:525`), so the route is reached but has nothing to offer.
 	("MG-454", "anon@alice", "", Get("/.well-known/carddav"), "Allow*"),
 	("MG-455", "anon@alice", "", Get("/.well-known/caldav"), "Allow*"),
-	("MG-456", "anon@alice", "", Get("/api/auth/wa/login/challenge"), "Deny"),
+	("MG-456", "anon@alice", "", Call("POST", "/api/auth/login/passkey/challenge", ""), "Deny"),
 	("MG-457", "owner@alice", "", Call("POST", "/api/auth/logout", "{}"), "Allow"),
 	// A DAV key reaches no push or reindex route (it reads PIM only).
 	(
 		"MG-474",
 		"apikey-dav@alice",
 		"",
-		Call("DELETE", "/api/notifications/subscription/1", ""),
+		Call("DELETE", "/api/notifications/subscriptions/1", ""),
 		"Deny",
 	),
 	("MG-475", "apikey-dav@alice", "", REINDEX, "Deny"),
@@ -2364,7 +2486,7 @@ pub const MG: &[Row] = &[
 	("MG-478", "anon@club", "", PROF_SETTING_PUT, "Deny"),
 	("MG-479", "sharelink-r@club", "", PROF_SETTINGS, "Deny"),
 	("MG-480", "sharelink-r@club", "", PROF_SETTING_PUT, "Deny"),
-	("MG-481", "sharelink-w@alice", "", UNTAG, "Deny"),
+	("MG-481", "sharelink-w@alice", "tenant-blob-d-active@alice", UNTAG, "Deny"),
 	// Another tenant's key and refs are not the owner's, by id.
 	("MG-482", "owner@alice", "", Get("/api/auth/api-keys/6"), "Deny"),
 	("MG-483", "owner@alice", "", Call("DELETE", "/api/auth/api-keys/6", ""), "Deny"),
@@ -2395,7 +2517,7 @@ pub const MG: &[Row] = &[
 	("MG-508", "m_leader@club", "", Get("/api/auth/audit"), "Deny"),
 	("MG-509", "owner-sadm@admin", "", Get("/api/auth/audit"), "Allow"),
 	("MG-510", "owner-sadm@admin", "", Get("/api/admin/audit"), "Allow"),
-	("MG-511", "owner-sadm@admin", "", Get("/api/admin/audit.csv"), "Allow"),
+	("MG-511", "owner-sadm@admin", "", Get("/api/admin/audit"), "Allow"),
 	// `{}` is refused, not read as "clear the expiry".
 	("MG-526", "owner-sadm@admin", "", Call("PATCH", "/api/admin/tenants/trash.test", "{}"), "400"),
 	// The self-lockout guards match the canonical tenant, not the path's spelling. Were they
@@ -2411,7 +2533,7 @@ pub const MG: &[Row] = &[
 		"MG-528",
 		"owner-sadm@admin",
 		"",
-		Call("PATCH", "/api/admin/tenants/ADMIN.TEST", r#"{"expiresAt":4102444800}"#),
+		Call("PATCH", "/api/admin/tenants/ADMIN.TEST", r#"{"expiresAt":"2100-01-01T00:00:00Z"}"#),
 		"400",
 	),
 	// SADM visiting alice passes `require_tenant_self` but is not the account.
@@ -2440,16 +2562,28 @@ pub const MG: &[Row] = &[
 	("MG-535", "sadm-visit@alice", "", Get("/api/auth/audit"), "Deny"),
 	// Signing keys and data export. Rotate, revoke and export Allow write state:
 	// covered by the `signing_key_rotation` and `data_export_flow` scenario tests.
-	("MG-555", "owner@alice", "", Get("/api/auth/keys"), "Allow"),
+	("MG-555", "owner@alice", "", Get("/api/auth/signing-keys"), "Allow"),
 	// No export of alice is ever ready, and the key is unknown: both 404, which reads as Deny.
 	// The 409 on the last active key is in `signing_key_rotation`.
 	("MG-556", "owner@alice", "", Get("/api/export/download"), "Deny"),
-	("MG-557", "owner@alice", "", Call("POST", "/api/auth/keys/zqm/revoke", ""), "Deny"),
+	("MG-557", "owner@alice", "", Call("POST", "/api/auth/signing-keys/zqm/revoke", ""), "Deny"),
 	// SADM visiting alice passes `require_tenant_self`: it may read the key list, but rotate,
 	// revoke and export check `is_tenant_account` (SADM uses the admin twins).
-	("MG-558", "sadm-visit@alice", "", Get("/api/auth/keys"), "Allow"),
-	("MG-559", "sadm-visit@alice", "", Call("POST", "/api/auth/keys/rotate", ""), "Deny"),
-	("MG-560", "sadm-visit@alice", "", Call("POST", "/api/auth/keys/zqm/revoke", ""), "Deny"),
+	("MG-558", "sadm-visit@alice", "", Get("/api/auth/signing-keys"), "Allow"),
+	(
+		"MG-559",
+		"sadm-visit@alice",
+		"",
+		Call("POST", "/api/auth/signing-keys/rotations", ""),
+		"Deny",
+	),
+	(
+		"MG-560",
+		"sadm-visit@alice",
+		"",
+		Call("POST", "/api/auth/signing-keys/zqm/revoke", ""),
+		"Deny",
+	),
 	("MG-561", "sadm-visit@alice", "", Call("POST", "/api/export", ""), "Deny"),
 	("MG-562", "sadm-visit@alice", "", Get("/api/export"), "Deny"),
 	("MG-563", "sadm-visit@alice", "", Get("/api/export/download"), "Deny"),
@@ -2475,12 +2609,92 @@ pub const MG: &[Row] = &[
 		"",
 		Call(
 			"POST",
-			"/api/sites/mounts",
+			"/api/site/mounts",
 			r#"{"docFileId":"f1~zqm-alice-tenant-crdt-d-active","mountPath":"/zqm"}"#,
 		),
 		"400",
 	),
+	// The quota override is SADM's alone (MG-610 covers the rest of [`ADMIN_DENIED`]); set
+	// then clear, so trash keeps no override.
+	("MG-611", "g_read@alice", "", PATCH_QUOTA, "Deny"),
+	("MG-612", "m_contributor@club", "", PATCH_QUOTA, "Deny"),
+	("MG-613", "owner-sadm@admin", "", PATCH_QUOTA, "Allow"),
+	("MG-614", "owner-sadm@admin", "", PATCH_QUOTA_CLEAR, "Allow"),
+	// The renamed rotation and challenge routes keep their guards: the grids cover the other
+	// denied subjects (MG-564 ADMIN, MG-320 OWNER_CRED, MG-568 OWNER_DATA).
+	("MG-615", "g_read@alice", "", ADMIN_ROTATE, "Deny"),
+	("MG-616", "m_contributor@club", "", ADMIN_ROTATE, "Deny"),
+	("MG-617", "g_read@alice", "", Call("POST", "/api/auth/passkey-challenges", "{}"), "Deny"),
+	("MG-618", "idp-key@alice", "", Call("POST", "/api/auth/passkey-challenges", "{}"), "Deny"),
+	("MG-619", "g_read@alice", "", Call("POST", "/api/auth/signing-keys/rotations", ""), "Deny"),
+	// Token minting is POST only: the old GET reaches no handler, so it cannot use a share-link
+	// ref (the consumption side is `access_token_post_only_body_only`).
+	("MG-620", "anon@alice", "", Get("/api/auth/access-token"), "405"),
+	("MG-621", "stranger@alice", "", Get("/api/auth/access-token?refId=zqm"), "405"),
+	("MG-622", "sharelink-r@alice", "", Get("/api/auth/access-token"), "405"),
+	// `/api/profile-lookups`: any valid credential reads it (MG-202..212); a scoped or share-link
+	// credential gets the reduced projection — no relationship field, no tenant-only `badges`.
+	("MG-623", "owner-scoped-r@alice", "", Fields(BATCH_URI, PROFILE_PRIVATE), "Clean"),
+	("MG-624", "owner-scoped-r@alice", "", Fields(BATCH_URI, &["badges"]), "Clean"),
+	("MG-625", "sharelink-r@alice", "", Fields(BATCH_URI, &["badges"]), "Clean"),
+	("MG-626", "stranger@alice", "", BATCH, "Allow"),
+	("MG-627", "follower@alice", "", BATCH, "Allow"),
+	("MG-628", "g_read@alice", "", BATCH, "Allow"),
+	("MG-629", "m_contributor@club", "", BATCH, "Allow"),
+	("MG-630", "idp-key@alice", "", BATCH, "Deny"),
+	// The old batch path is now the `{idTag}` read of a profile named `batch`: no such row, 404.
+	("MG-631", "owner@alice", "", Get("/api/profiles/batch?idTags=connected.test"), "Deny"),
+	// A file named `restore` is an upload, never `…/restore` (owner Allow:
+	// `upload_named_restore_creates_a_file`); everyone short of create rights is refused.
+	("MG-632", "stranger@alice", "", UPLOAD_RESTORE, "Deny"),
+	("MG-633", "follower@alice", "", UPLOAD_RESTORE, "Deny"),
+	("MG-634", "g_read@alice", "", UPLOAD_RESTORE, "Deny"),
+	("MG-635", "sharelink-r@alice", "", UPLOAD_RESTORE, "Deny"),
+	("MG-636", "idp-key@alice", "", UPLOAD_RESTORE, "Deny"),
+	// `POST /api/communities`: an unknown invite is refused
+	// to every caller, before any write (MG-42/43, SADM MG-364).
+	("MG-637", "stranger@alice", "", PUT_COMMUNITY_BAD_REF, "Deny"),
+	("MG-638", "follower@alice", "", PUT_COMMUNITY_BAD_REF, "Deny"),
+	("MG-639", "g_read@alice", "", PUT_COMMUNITY_BAD_REF, "Deny"),
+	("MG-640", "idp-key@alice", "", PUT_COMMUNITY_BAD_REF, "Deny"),
+	("MG-641", "m_contributor@club", "", PUT_COMMUNITY_BAD_REF, "Deny"),
+	("MG-642", "sharelink-r@alice", "", PUT_COMMUNITY_BAD_REF, "Deny"),
+	// `POST /api/idp/activations`: public, the ref is the credential;
+	// no bearer turns an unknown ref into an activation (IdP off on alice: 404 either way; the
+	// IdP-on path is `idp_activate_never_burns_a_foreign_ref`).
+	("MG-643", "stranger@alice", "", ACTIVATE_UNKNOWN, "Deny"),
+	("MG-644", "follower@alice", "", ACTIVATE_UNKNOWN, "Deny"),
+	("MG-645", "g_read@alice", "", ACTIVATE_UNKNOWN, "Deny"),
+	("MG-646", "sharelink-r@alice", "", ACTIVATE_UNKNOWN, "Deny"),
+	("MG-647", "idp-key@alice", "", ACTIVATE_UNKNOWN, "Deny"),
+	("MG-648", "m_contributor@club", "", ACTIVATE_UNKNOWN, "Deny"),
+	// Share routes take the content id too (cross-owner files: the client has no entry id);
+	// a variant id names no placement.
+	("MG-649", "owner@alice", "tenant-blob-d-active@alice", Get(SHARES_CID), "Allow"),
+	("MG-650", "owner@alice", "tenant-blob-d-active@alice", SHARES_CID_POST, "Allow"),
+	("MG-651", "stranger@alice", "tenant-blob-d-active@alice", Get(SHARES_CID), "Deny"),
+	("MG-652", "stranger@alice", "tenant-blob-d-active@alice", SHARES_CID_POST, "Deny"),
+	("MG-653", "sharelink-r@alice", "tenant-blob-d-active@alice", Get(SHARES_CID), "Deny"),
+	("MG-654", "sharelink-a@alice", "tenant-blob-d-active@alice", SHARES_CID_POST, "Deny"),
+	("MG-655", "owner@alice", "tenant-blob-d-active@alice", Get(SHARES_VARIANT), "404"),
+	(
+		"MG-656",
+		"owner@alice",
+		"tenant-blob-d-active@alice",
+		Call("POST", SHARES_VARIANT, SHARE_U),
+		"404",
+	),
 ];
+
+const PATCH_QUOTA: Route =
+	Call("PATCH", "/api/admin/tenants/trash.test", r#"{"storageQuotaOverride":1073741824}"#);
+const PATCH_QUOTA_CLEAR: Route =
+	Call("PATCH", "/api/admin/tenants/trash.test", r#"{"storageQuotaOverride":null}"#);
+const ADMIN_ROTATE: Route =
+	Call("POST", "/api/admin/tenants/trash.test/signing-keys/rotations", "");
+const UPLOAD_RESTORE: Route = Call("POST", "/api/uploads/file?name=restore", "zqm");
+const ACTIVATE_UNKNOWN: Route =
+	Call("POST", "/api/idp/activations", r#"{"refId":"zqref-unknown"}"#);
 
 const CAL_EV1: &str = "/api/calendars/1/objects/zqm-ev1";
 const CAL_EXCS: &str = "/api/calendars/1/objects/zqm-ev1/exceptions";
@@ -2499,15 +2713,16 @@ const DAV_EV1: &str = "/dav/calendars/zqm-cal/zqm-ev1.ics";
 const VCARD: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:zqm-dav\r\nFN:Zqm\r\nEND:VCARD\r\n";
 
 const DAV_PRINCIPAL: &str = "/dav/principal/";
-const PUT_ZQM_TYPE: Route = Call("PUT", "/api/profiles/zqm-new.test", r#"{"type":"zqm"}"#);
-const UNTAG_OBJ: &str = "/api/files/{obj}/tag/zqm";
+const PUT_ZQM_TYPE: Route =
+	Call("POST", "/api/communities", r#"{"idTag":"zqm-new.test","type":"zqm"}"#);
+const UNTAG_OBJ: &str = "/api/files/{entry}/tags/zqm";
 const REFRESH_CONNECTED: Route = Call("POST", "/api/profiles/connected.test/refresh", "");
-const PROXY_TO_PEER: Route = Get("/api/auth/proxy-token?idTag=peer.test");
+const PROXY_TO_PEER: Route = Call("POST", "/api/auth/proxy-token", r#"{"idTag":"peer.test"}"#);
 const AB_CONTACT_POST: Route = Call("POST", "/api/address-books/zqm/contacts", "{}");
 const CAL_OBJECT_POST: Route = Call("POST", "/api/calendars/zqm/objects", "{}");
-const SITE_MOUNT: Route = Call("POST", "/api/sites/mounts", "{}");
-const SITE_UNMOUNT: Route = Call("DELETE", "/api/sites/mounts", "{}");
-const SITE_ROLLBACK: Route = Call("POST", "/api/sites/rollback", "{}");
+const SITE_MOUNT: Route = Call("POST", "/api/site/mounts", "{}");
+const SITE_UNMOUNT: Route = Call("DELETE", "/api/site/mounts/zqm", "");
+const SITE_ROLLBACK: Route = Call("POST", "/api/site/rollback", "{}");
 const REF_WELCOME2_DEL: Route = Call("DELETE", "/api/refs/zqref-club-welcome2", "");
 const REF_REGISTER_PATCH: Route =
 	Call("PATCH", "/api/refs/zqref-alice-register", r#"{"description":"zqm"}"#);
@@ -2520,15 +2735,15 @@ const CONN_XYZ_SUB: Route = Call(
 	r#"{"type":"CONN","subType":"XYZ","audienceTag":"zqm-nobody.test"}"#,
 );
 
-const SITES_PATCH: Route = Call("PATCH", "/api/sites", "{}");
-const SITES_PUBLISH: Route = Call("POST", "/api/sites/publish", "{}");
+const SITES_PATCH: Route = Call("PATCH", "/api/site", "{}");
+const SITES_PUBLISH: Route = Call("POST", "/api/site/publish", "{}");
 const AB_PATCH: Route = Call("PATCH", "/api/address-books/zqm", "{}");
 const CAL_PATCH: Route = Call("PATCH", "/api/calendars/zqm", "{}");
-const PUSH_SUB_DEL: Route = Call("DELETE", "/api/notifications/subscription/zqm", "");
+const PUSH_SUB_DEL: Route = Call("DELETE", "/api/notifications/subscriptions/zqm", "");
 const PROF_SETTING_GET: Route = Get("/api/profiles/m-contributor.test/settings/zqm.k");
 
 const REF_IDP_STATUS: Route = Get("/api/refs/zqref-alice-welcome/idp-status");
-const REF_IDP_RESEND: Route = Call("POST", "/api/refs/zqref-alice-welcome/resend-activation", "");
+const REF_IDP_RESEND: Route = Call("POST", "/api/refs/zqref-alice-welcome/idp/resend", "");
 
 const CONN_ACC_NOBODY: Route =
 	Call("POST", "/api/actions", r#"{"type":"CONN:ACC","audienceTag":"zqm-nobody.test"}"#);
@@ -2542,7 +2757,7 @@ const INVT_CLUB: Route = Call(
 const REF_PATCH_W: Route = Call("PATCH", "/api/refs/zqref-alice-r", r#"{"accessLevel":"write"}"#);
 const REF_SHARE_OBJ: Route =
 	Call("POST", "/api/refs", r#"{"type":"share.file","resourceId":"{obj}","accessLevel":"R"}"#);
-const SHARE_U: &str = r#"{"subjectType":"U","subjectId":"zqm-l.test","permission":"R"}"#;
+const SHARE_U: &str = r#"{"subjectType":"user","subjectId":"zqm-l.test","permission":"read"}"#;
 
 const POST_ZQM: Route = Call("POST", "/api/actions", r#"{"type":"POST","content":"zqm"}"#);
 const REF_REGISTER: Route = Call("POST", "/api/refs", r#"{"type":"register"}"#);
@@ -2553,29 +2768,30 @@ const ME_FULL: Route = Fields("/api/me/full", &["x.zqmconn"]);
 /// `/api/admin/*` routes beyond the two listings, each refused to every [`ADMIN_DENIED`]
 /// credential. Ids continue [`MG`]; bodies are empty, as the gate refuses before any handler.
 const ADMIN_ROUTES: &[(&str, Route)] = &[
-	("MG-214", Call("POST", "/api/admin/tenants/trash.test/password-reset", "{}")),
+	("MG-214", Call("POST", "/api/admin/tenants/trash.test/password/reset", "{}")),
 	("MG-215", Call("POST", "/api/admin/tenants/trash.test/purge", "{}")),
 	("MG-216", Call("POST", "/api/admin/email/test", "{}")),
-	("MG-217", Get("/api/admin/cert-status")),
-	("MG-218", Call("POST", "/api/admin/db-maintenance", "{}")),
+	("MG-217", Get("/api/admin/certificates")),
+	("MG-218", Call("POST", "/api/admin/db/maintenance", "{}")),
 	("MG-219", Call("POST", "/api/admin/proxy-sites", "{}")),
 	// The fixture's one proxy site.
 	("MG-220", Get("/api/admin/proxy-sites/1")),
 	("MG-221", Call("PATCH", "/api/admin/proxy-sites/1", "{}")),
 	("MG-222", Call("DELETE", "/api/admin/proxy-sites/1", "")),
-	("MG-223", Call("POST", "/api/admin/proxy-sites/1/renew-cert", "{}")),
-	("MG-224", Call("POST", "/api/admin/invite-community", "{}")),
+	("MG-223", Call("POST", "/api/admin/proxy-sites/1/renew", "{}")),
+	("MG-224", Call("POST", "/api/admin/community-invites", "{}")),
 	("MG-496", Get("/api/admin/audit")),
-	("MG-497", Get("/api/admin/audit.csv")),
-	("MG-498", Call("POST", "/api/admin/tenants/trash.test/mfa-reset", "{}")),
+	("MG-497", Get("/api/admin/audit")),
+	("MG-498", Call("POST", "/api/admin/tenants/trash.test/mfa/reset", "{}")),
 	("MG-499", Call("POST", "/api/admin/tenants/trash.test/suspend", "{}")),
 	("MG-500", Call("POST", "/api/admin/tenants/trash.test/resume", "{}")),
 	("MG-501", Call("PATCH", "/api/admin/tenants/trash.test", r#"{"expiresAt":null}"#)),
 	("MG-516", Get("/api/admin/backup")),
 	("MG-517", Call("POST", "/api/admin/backup", "{}")),
-	("MG-564", Call("POST", "/api/admin/tenants/trash.test/keys/rotate", "")),
-	("MG-565", Call("POST", "/api/admin/tenants/trash.test/keys/zqm/revoke", "")),
+	("MG-564", Call("POST", "/api/admin/tenants/trash.test/signing-keys/rotations", "")),
+	("MG-565", Call("POST", "/api/admin/tenants/trash.test/signing-keys/zqm/revoke", "")),
 	("MG-566", Call("POST", "/api/admin/tenants/trash.test/export", "")),
+	("MG-610", PATCH_QUOTA),
 ];
 
 /// Every credential short of SADM's unscoped session: SADM itself is scoped down last.
@@ -2603,9 +2819,9 @@ const OWNER_CRED_ROUTES: &[(&str, Route)] = &[
 	("MG-316", Call("PATCH", "/api/auth/api-keys/1", r#"{"name":"zqm"}"#)),
 	("MG-317", Call("DELETE", "/api/auth/api-keys/1", "")),
 	("MG-318", Call("POST", "/api/auth/api-keys", "{}")),
-	("MG-319", Call("POST", "/api/auth/wa/reg", "{}")),
-	("MG-320", Get("/api/auth/wa/reg/challenge")),
-	("MG-391", Call("DELETE", "/api/auth/wa/reg/zqm", "")),
+	("MG-319", Call("POST", "/api/auth/passkeys", "{}")),
+	("MG-320", Call("POST", "/api/auth/passkey-challenges", "{}")),
+	("MG-391", Call("DELETE", "/api/auth/passkeys/zqm", "")),
 	("MG-502", Get("/api/auth/totp")),
 	("MG-503", Call("POST", "/api/auth/totp/enroll", r#"{"password":"zqm"}"#)),
 	("MG-504", Call("POST", "/api/auth/totp/confirm", r#"{"code":"123456"}"#)),
@@ -2632,9 +2848,9 @@ const OWNER_CRED_DENIED: &[&str] = &[
 /// refused to everyone but the account. Community members are club rows: the routes are
 /// host-relative. The unknown key id is never reached: the gate refuses first.
 const OWNER_DATA_ROUTES: &[(&str, Route)] = &[
-	("MG-567", Get("/api/auth/keys")),
-	("MG-568", Call("POST", "/api/auth/keys/rotate", "")),
-	("MG-569", Call("POST", "/api/auth/keys/zqm/revoke", "")),
+	("MG-567", Get("/api/auth/signing-keys")),
+	("MG-568", Call("POST", "/api/auth/signing-keys/rotations", "")),
+	("MG-569", Call("POST", "/api/auth/signing-keys/zqm/revoke", "")),
 	("MG-570", Call("POST", "/api/export", "")),
 	("MG-571", Get("/api/export")),
 	("MG-572", Get("/api/export/download")),
@@ -2741,10 +2957,10 @@ const READABLE_ALL_ROUTES: &[(&str, Route)] = &[("MG-553", GET_COMMUNITY), ("MG-
 const READABLE_ALL_DENIED: &[&str] =
 	&["owner-scoped-r@alice", "sharelink-r@alice", "idp-key@alice", "anon@alice"];
 
-/// The site routes beyond `GET /api/sites` (`require_leader`).
+/// The site routes beyond `GET /api/site` (`require_leader`).
 const SITE_ROUTES: &[(&str, Route)] = &[
 	("MG-461", SITES_PATCH),
-	("MG-462", Get("/api/sites/pages")),
+	("MG-462", Get("/api/site/pages")),
 	("MG-463", SITES_PUBLISH),
 	("MG-464", SITE_MOUNT),
 	("MG-465", SITE_UNMOUNT),
@@ -2764,7 +2980,7 @@ const SITE_DENIED: &[&str] = &[
 /// Push, reindex and the contact listing (`require_leader`); `apikey-dav` reads contacts
 /// (MG-246), so it is in neither list (MG-474, 475 for the rest).
 const LEADER_MISC_ROUTES: &[(&str, Route)] = &[
-	("MG-467", Call("DELETE", "/api/notifications/subscription/1", "")),
+	("MG-467", Call("DELETE", "/api/notifications/subscriptions/1", "")),
 	("MG-468", REINDEX),
 	("MG-469", Get("/api/contacts")),
 ];
@@ -2781,8 +2997,8 @@ const LEADER_MISC_DENIED: &[&str] = &[
 /// A file's share by id: its managers'. The manager check runs before the share-id lookup
 /// (`cloudillo-file/src/share.rs:216`), so share 1 need not belong to the file.
 const SHARE_WRITE_ROUTES: &[(&str, Route)] = &[
-	("MG-472", Call("PATCH", "/api/files/f1~zqm-alice-tenant-blob-d-active/shares/1", "{}")),
-	("MG-473", Call("DELETE", "/api/files/f1~zqm-alice-tenant-blob-d-active/shares/1", "")),
+	("MG-472", Call("PATCH", "/api/files/{entry}/shares/1", "{}")),
+	("MG-473", Call("DELETE", "/api/files/{entry}/shares/1", "")),
 ];
 const SHARE_WRITE_DENIED: &[&str] = &[
 	"anon@alice",
@@ -2869,40 +3085,40 @@ const AB_DENIED: &[&str] = &[
 /// `(id, route)` rows of a Deny grid.
 type GridRoutes = &'static [(&'static str, Route)];
 
-/// `(routes, denied subjects)`: every cell is a Deny.
-const GRIDS: &[(GridRoutes, &[&str])] = &[
-	(ADMIN_ROUTES, ADMIN_DENIED),
-	(OWNER_CRED_ROUTES, OWNER_CRED_DENIED),
-	(OWNER_DATA_ROUTES, OWNER_DATA_DENIED),
-	(CHAN_WRITE_ROUTES, CHAN_WRITE_DENIED),
-	(SETTINGS_READ_ROUTES, SETTINGS_READ_DENIED),
-	(ACCOUNT_ROUTES, ACCOUNT_DENIED),
-	(CAL_ROUTES, CAL_DENIED),
-	(AB_ROUTES, AB_DENIED),
-	(SITE_ROUTES, SITE_DENIED),
-	(LEADER_MISC_ROUTES, LEADER_MISC_DENIED),
-	(SETTINGS_WRITE_ROUTES, SETTINGS_WRITE_DENIED),
-	(ADMIN_SETTINGS_ROUTES, ADMIN_SETTINGS_DENIED),
-	(READABLE_ALL_ROUTES, READABLE_ALL_DENIED),
-	(SHARE_WRITE_ROUTES, SHARE_WRITE_DENIED),
-	(CHAN_WRITE_ALICE, CHAN_WRITE_ALICE_DENIED),
+/// `(routes, denied subjects, object)`: every cell is a Deny.
+const GRIDS: &[(GridRoutes, &[&str], &str)] = &[
+	(ADMIN_ROUTES, ADMIN_DENIED, ""),
+	(OWNER_CRED_ROUTES, OWNER_CRED_DENIED, ""),
+	(OWNER_DATA_ROUTES, OWNER_DATA_DENIED, ""),
+	(CHAN_WRITE_ROUTES, CHAN_WRITE_DENIED, ""),
+	(SETTINGS_READ_ROUTES, SETTINGS_READ_DENIED, ""),
+	(ACCOUNT_ROUTES, ACCOUNT_DENIED, ""),
+	(CAL_ROUTES, CAL_DENIED, ""),
+	(AB_ROUTES, AB_DENIED, ""),
+	(SITE_ROUTES, SITE_DENIED, ""),
+	(LEADER_MISC_ROUTES, LEADER_MISC_DENIED, ""),
+	(SETTINGS_WRITE_ROUTES, SETTINGS_WRITE_DENIED, ""),
+	(ADMIN_SETTINGS_ROUTES, ADMIN_SETTINGS_DENIED, ""),
+	(READABLE_ALL_ROUTES, READABLE_ALL_DENIED, ""),
+	(SHARE_WRITE_ROUTES, SHARE_WRITE_DENIED, "tenant-blob-d-active@alice"),
+	(CHAN_WRITE_ALICE, CHAN_WRITE_ALICE_DENIED, ""),
 ];
 
 /// [`MG`] plus the [`GRIDS`].
 pub fn management_cells() -> Vec<Cell> {
 	let mut out = cells(MG);
-	for &(routes, subjects) in GRIDS {
+	for &(routes, subjects, object) in GRIDS {
 		for &(id, route) in routes {
 			for &subject in subjects {
 				let op = format!("{route:?}");
-				out.push(Cell { id, op, subject, object: "", route, want: "Deny" });
+				out.push(Cell { id, op, subject, object, route, want: "Deny" });
 			}
 		}
 	}
 	out
 }
 
-const BATCH_URI: &str = "/api/profiles/batch?idTags=connected.test";
+const BATCH_URI: &str = "/api/profile-lookups?idTags=connected.test";
 const BATCH: Route = Get(BATCH_URI);
 
 const APRV_TARGET: &str = "cur-aprv-target@club";
@@ -3146,15 +3362,15 @@ pub const PT_NOCONTRACT: &str = "zqm-nocontract.test";
 /// statuses; members keep `roles`; others (incl. the derived-follower `m_follower`) see
 /// neither.
 pub const PT: &[Row] = &[
-	("PT-01", "owner@club", "", Profiles("status=B,X"), "Hidden"),
-	("PT-02", "m_leader@club", "", Profiles("status=B,X"), "Hidden"),
-	("PT-03", "m_contributor@club", "", Profiles("status=B,X"), "Roles"),
-	("PT-04", "m_follower@club", "", Profiles("status=B,X"), "Bare"),
-	("PT-05", "stranger@club", "", Profiles("status=B,X"), "Bare"),
-	("PT-06", "anon@club", "", Profiles("status=B,X"), "Deny"),
+	("PT-01", "owner@club", "", Profiles("status=blocked,banned"), "Hidden"),
+	("PT-02", "m_leader@club", "", Profiles("status=blocked,banned"), "Hidden"),
+	("PT-03", "m_contributor@club", "", Profiles("status=blocked,banned"), "Roles"),
+	("PT-04", "m_follower@club", "", Profiles("status=blocked,banned"), "Bare"),
+	("PT-05", "stranger@club", "", Profiles("status=blocked,banned"), "Bare"),
+	("PT-06", "anon@club", "", Profiles("status=blocked,banned"), "Deny"),
 	// A hat is a member.
-	("PT-07", "hatted@club", "", Profiles("status=B,X"), "Roles"),
-	("PT-08", "m_supporter@club", "", Profiles("status=B,X"), "Roles"),
+	("PT-07", "hatted@club", "", Profiles("status=blocked,banned"), "Roles"),
+	("PT-08", "m_supporter@club", "", Profiles("status=blocked,banned"), "Roles"),
 	("PT-10", "m_contributor@club", "", Partners, "Listed"),
 	("PT-11", "stranger@club", "", Partners, "Listed"),
 	("PT-12", "anon@club", "", Partners, "Listed"),
@@ -3216,17 +3432,17 @@ pub const LV_PENDING: &str = "zqm-pending.test";
 /// Followed-only (not connected) community the list-visibility layer seeds on club.
 pub const LV_FOLLOWED: &str = "zqm-followed-comm.test";
 const COMM: &str = "/api/profiles?type=community";
-const COMM_UNCONN: &str = "/api/profiles?type=community&connected=false";
+const COMM_UNCONN: &str = "/api/profiles?type=community&connection=none";
 const HATS: &[&str] = &["hats"];
 const ALICE_CONN: &str = "/api/profiles/connected.test";
 const CLUB_PEER: &str = "/api/profiles/peer.test";
 
-const CONN: &str = "/api/profiles?connected=true";
-const CONN_COMM: &str = "/api/profiles?type=community&connected=true";
-const CONN_PERSON: &str = "/api/profiles?type=person&connected=true";
-const CONN_REQ: &str = "/api/profiles?connected=R";
+const CONN: &str = "/api/profiles?connection=connected";
+const CONN_COMM: &str = "/api/profiles?type=community&connection=connected";
+const CONN_PERSON: &str = "/api/profiles?type=person&connection=connected";
+const CONN_REQ: &str = "/api/profiles?connection=pending";
 const CONNECTED: &[&str] = &["connected"];
-const EVERY_STATUS: &str = "status=A,C,D,N,V,F";
+const EVERY_STATUS: &str = "status=active,confirmation,deleted,notification,verifying,failed";
 
 /// List visibility: relationship-revealing filters and fields, explicit action statuses,
 /// settings reads and an `idp_` management key. alice keeps the default
@@ -3251,7 +3467,7 @@ pub const LV: &[Row] = &[
 	("LV-13", "owner@alice", "", Ids(CONN_REQ), "Listed"),
 	// Every listed profile is a contact: no filter is no bypass.
 	("LV-14", "stranger@alice", "", Ids("/api/profiles"), "Empty"),
-	("LV-15", "stranger@alice", "", Ids("/api/profiles?connected=false"), "Empty"),
+	("LV-15", "stranger@alice", "", Ids("/api/profiles?connection=none"), "Empty"),
 	// club: members from `supporter` (a hat counts), partner communities to everyone.
 	("LV-20", "anon@club", "", Ids(CONN_PERSON), "Deny"),
 	("LV-21", "stranger@club", "", Ids(CONN_PERSON), "Empty"),
@@ -3381,31 +3597,91 @@ pub const LV: &[Row] = &[
 		"Present",
 	),
 	// Listing refs is the tenant's.
-	("LV-194", "stranger@alice", "", Get("/api/refs?filter=all"), "Deny"),
-	("LV-195", "sharelink-r@alice", "", Get("/api/refs?filter=all"), "Deny"),
+	("LV-194", "stranger@alice", "", Get("/api/refs?status=all"), "Deny"),
+	("LV-195", "sharelink-r@alice", "", Get("/api/refs?status=all"), "Deny"),
 	// Search narrowing never widens: a container scope or a tag adds no hit.
-	("LV-196", "stranger@alice", "tenant-crdt-d-active@alice", SearchQ("fileId={obj}"), "Absent"),
-	("LV-197", "owner@alice", "tenant-crdt-d-active@alice", SearchQ("fileId={obj}"), "Present"),
+	(
+		"LV-196",
+		"stranger@alice",
+		"tenant-crdt-d-active@alice",
+		SearchQ("contentId={obj}"),
+		"Absent",
+	),
+	("LV-197", "owner@alice", "tenant-crdt-d-active@alice", SearchQ("contentId={obj}"), "Present"),
 	("LV-198", "stranger@alice", "tenant-blob-d-active@alice", SearchQ("tags=zqm"), "Absent"),
 	("LV-199", "anon@alice", "tenant-blob-d-active@alice", SearchQ("type=file"), "Absent"),
 	// Explicit `status=` never widens the list: deleted / verifying / failed rows stay out,
 	// pending moderation (`C`) is the tenant's and its leaders'.
-	("LV-60", "anon@alice", "post-p-tenant-deleted@alice", ActListQ("status=D"), "Absent"),
-	("LV-61", "stranger@alice", "post-p-tenant-deleted@alice", ActListQ("status=D"), "Absent"),
-	("LV-62", "anon@alice", "post-p-tenant-deleted@alice", ActListQ("status=D,V,F"), "Absent"),
-	("LV-63", "anon@alice", "post-p-tenant-pending@alice", ActListQ("status=C"), "Absent"),
-	("LV-64", "stranger@alice", "post-p-tenant-pending@alice", ActListQ("status=C"), "Absent"),
+	("LV-60", "anon@alice", "post-p-tenant-deleted@alice", ActListQ("status=deleted"), "Absent"),
+	(
+		"LV-61",
+		"stranger@alice",
+		"post-p-tenant-deleted@alice",
+		ActListQ("status=deleted"),
+		"Absent",
+	),
+	(
+		"LV-62",
+		"anon@alice",
+		"post-p-tenant-deleted@alice",
+		ActListQ("status=deleted,verifying,failed"),
+		"Absent",
+	),
+	(
+		"LV-63",
+		"anon@alice",
+		"post-p-tenant-pending@alice",
+		ActListQ("status=confirmation"),
+		"Absent",
+	),
+	(
+		"LV-64",
+		"stranger@alice",
+		"post-p-tenant-pending@alice",
+		ActListQ("status=confirmation"),
+		"Absent",
+	),
 	("LV-65", "anon@alice", "post-p-tenant-deleted@alice", ActListQ(EVERY_STATUS), "Absent"),
 	("LV-66", "stranger@alice", "post-p-tenant-pending@alice", ActListQ(EVERY_STATUS), "Absent"),
-	("LV-67", "anon@alice", "post-p-tenant-dismissed@alice", ActListQ("status=N"), "Present"),
+	(
+		"LV-67",
+		"anon@alice",
+		"post-p-tenant-dismissed@alice",
+		ActListQ("status=notification"),
+		"Present",
+	),
 	("LV-68", "anon@alice", "post-p-tenant-active@alice", ActListQ(EVERY_STATUS), "Present"),
-	("LV-69", "owner@alice", "post-p-tenant-deleted@alice", ActListQ("status=D"), "Absent"),
+	("LV-69", "owner@alice", "post-p-tenant-deleted@alice", ActListQ("status=deleted"), "Absent"),
 	("LV-70", "owner@alice", "post-p-tenant-deleted@alice", ActListQ(EVERY_STATUS), "Absent"),
-	("LV-71", "owner@alice", "post-p-tenant-pending@alice", ActListQ("status=C"), "Present"),
-	("LV-72", "owner@alice", "post-p-tenant-dismissed@alice", ActListQ("status=N"), "Present"),
-	("LV-73", "owner@alice", "post-p-tenant-active@alice", ActListQ("status=A"), "Present"),
-	("LV-74", "m_leader@club", "post-p-tenant-pending@club", ActListQ("status=C"), "Present"),
-	("LV-75", "m_contributor@club", "post-p-tenant-pending@club", ActListQ("status=C"), "Absent"),
+	(
+		"LV-71",
+		"owner@alice",
+		"post-p-tenant-pending@alice",
+		ActListQ("status=confirmation"),
+		"Present",
+	),
+	(
+		"LV-72",
+		"owner@alice",
+		"post-p-tenant-dismissed@alice",
+		ActListQ("status=notification"),
+		"Present",
+	),
+	("LV-73", "owner@alice", "post-p-tenant-active@alice", ActListQ("status=active"), "Present"),
+	(
+		"LV-74",
+		"m_leader@club",
+		"post-p-tenant-pending@club",
+		ActListQ("status=confirmation"),
+		"Present",
+	),
+	(
+		"LV-75",
+		"m_contributor@club",
+		"post-p-tenant-pending@club",
+		ActListQ("status=confirmation"),
+		"Absent",
+	),
 	// Settings are read with the standing that writes them.
 	("LV-80", "stranger@alice", "", Get("/api/settings"), "Deny"),
 	("LV-81", "follower@alice", "", Get("/api/settings?prefix=profile"), "Deny"),
@@ -3423,7 +3699,13 @@ pub const LV: &[Row] = &[
 	("LV-94", "idp-mgmt@alice", "", Fields("/api/profiles", CONNECTED), "Deny"),
 	("LV-95", "idp-mgmt@alice", "tenant-blob-d-active@alice", FileList, "Absent"),
 	("LV-96", "idp-mgmt@alice", "post-d-tenant-active@alice", ActList, "Absent"),
-	("LV-97", "idp-mgmt@alice", "post-p-tenant-pending@alice", ActListQ("status=C"), "Absent"),
+	(
+		"LV-97",
+		"idp-mgmt@alice",
+		"post-p-tenant-pending@alice",
+		ActListQ("status=confirmation"),
+		"Absent",
+	),
 ];
 
 /// [`LV`] boundary rows re-run with alice's `connection_visibility.community` = `verified`:
@@ -3437,7 +3719,7 @@ pub const LV_VERIFIED: &[Row] = &[
 /// oracle decides. Boundary cells of rules the level layers cannot reach.
 pub type OracleRow = (&'static str, &'static str, &'static str, Op);
 
-/// Files: a scoped owner's own pending upload; `DELETE /api/trash` authority (allow cells on
+/// Files: a scoped owner's own pending upload; `POST /api/trash/empty` authority (allow cells on
 /// the disposable `trash` community, each with its own trashed row).
 pub const FO: &[OracleRow] = &[
 	("FO-01", "owner-scoped-r@alice", "docchild-blob-d-pending@alice", Op::File(FileOp::Metadata)),
@@ -3500,39 +3782,39 @@ pub const TIERS: &[(&str, &[&str])] = &[
 	(
 		"file.read",
 		&[
-			"GET /api/files/variant/{variant_id}",
-			"GET /api/files/{file_id}/descriptor",
-			"GET /api/files/{file_id}/metadata",
-			"GET /api/files/{file_id}",
+			"GET /api/variants/{variantId}",
+			"GET /api/files/{id}/descriptor",
+			"GET /api/files/{id}/metadata",
+			"GET /api/files/{id}",
 		],
 	),
 	(
 		"file.write",
 		&[
-			"PATCH /api/files/{file_id}",
-			"DELETE /api/files/{file_id}",
-			"POST /api/files/{file_id}/restore",
-			"PUT /api/files/{file_id}/tag/{tag}",
-			"DELETE /api/files/{file_id}/tag/{tag}",
+			"PATCH /api/files/{id}",
+			"DELETE /api/files/{id}",
+			"POST /api/files/{id}/restore",
+			"PUT /api/files/{id}/tags/{tag}",
+			"DELETE /api/files/{id}/tags/{tag}",
 		],
 	),
 	(
 		"file.create",
 		&[
 			"POST /api/files",
-			"POST /api/files/{preset}/{file_name}",
-			"POST /api/files/{file_id}/duplicate",
+			"POST /api/uploads/{preset}?name={file_name}",
+			"POST /api/files/{id}/duplicate",
 		],
 	),
-	("action.read", &["GET /api/actions/{action_id}"]),
+	("action.read", &["GET /api/actions/{id}"]),
 	(
 		"action.write",
 		&[
-			"DELETE /api/actions/{action_id}",
-			"PATCH /api/actions/{action_id}",
-			"POST /api/actions/{action_id}/publish",
-			"POST /api/actions/{action_id}/cancel",
-			"POST /api/actions/{action_id}/dismiss",
+			"DELETE /api/actions/{id}",
+			"PATCH /api/actions/{id}",
+			"POST /api/actions/{id}/publish",
+			"POST /api/actions/{id}/cancel",
+			"POST /api/actions/{id}/dismiss",
 		],
 	),
 	("action.create", &["POST /api/actions"]),
@@ -3653,10 +3935,20 @@ fn request(s: &Subject, route: Route, tgt: &Tgt) -> Request<Body> {
 		Tgt::Raw(r) => (*r).to_owned(),
 		Tgt::None => "zqm".into(),
 	};
+	// `{entry}`: the placement id mutation routes take; `{obj}` stays the content id.
+	let entry = match tgt {
+		Tgt::Obj(Obj::File(f)) => f.entry_id.clone(),
+		_ => key.clone(),
+	};
+	// `{variant}`: a BLOB's variant id, which resolves to the file but names no placement.
+	let variant = match tgt {
+		Tgt::Obj(Obj::File(f)) => f.blob_id.clone().unwrap_or_default(),
+		_ => String::new(),
+	};
 	let raw = |m: Method, uri: &str, body: Body| req(&s.host, m, uri, bearer(s), body);
 	let j = |v: Value| Body::from(v.to_string());
 	match (route, tgt) {
-		(FileUser, _) => raw(Method::PATCH, &format!("/api/files/{key}/user"), j(json!({}))),
+		(FileUser, _) => raw(Method::PATCH, &format!("/api/files/{entry}/user-data"), j(json!({}))),
 		(ChanCreate(name), _) => raw(Method::POST, "/api/channels", j(json!({ "name": name }))),
 		(ChanPatch(name), _) => {
 			raw(Method::PATCH, &format!("/api/channels/{name}"), j(json!({ "title": MARK })))
@@ -3681,9 +3973,15 @@ fn request(s: &Subject, route: Route, tgt: &Tgt) -> Request<Body> {
 			let body = j(json!({ "hats": ["zqm-hat.test"] }));
 			raw(Method::PATCH, &format!("/api/profiles/{id_tag}"), body)
 		}
-		(Get(uri), _) => raw(Method::GET, &uri.replace("{obj}", &key), Body::empty()),
+		(Get(uri), _) => {
+			let uri = uri.replace("{obj}", &key).replace("{entry}", &entry);
+			let uri = uri.replace("{variant}", &variant);
+			raw(Method::GET, &uri, Body::empty())
+		}
 		(Call(m, uri, body), _) => {
-			let (uri, body) = (uri.replace("{obj}", &key), body.replace("{obj}", &key));
+			let uri = uri.replace("{obj}", &key).replace("{entry}", &entry);
+			let uri = uri.replace("{variant}", &variant);
+			let body = body.replace("{obj}", &key).replace("{entry}", &entry);
 			let body = if body.is_empty() { Body::empty() } else { Body::from(body) };
 			raw(Method::from_bytes(m.as_bytes()).expect("method"), &uri, body)
 		}
@@ -3704,7 +4002,7 @@ fn request(s: &Subject, route: Route, tgt: &Tgt) -> Request<Body> {
 		}
 		(WsQuery(kind, access), Tgt::Obj(Obj::File(file))) => {
 			let kind = if kind == WsKind::Crdt { "crdt" } else { "rtdb" };
-			let access = access.map_or(String::new(), |level| format!("&access={level}"));
+			let access = access.map_or(String::new(), |level| format!("&mode={level}"));
 			let uri = format!("/ws/{kind}/{}?token={}{access}", file.path_id(), tok(s));
 			req(&s.host, Method::GET, &uri, None, Body::empty())
 		}
@@ -3764,12 +4062,12 @@ async fn observe(fx: &Fixture, s: &Subject, route: Route, tgt: &Tgt<'_>) -> Obse
 	let rows = match route {
 		ChanFeed(room) => {
 			let path = format!("/api/actions?channel=@{}~{room}&", s.host);
-			list_paged(fx, s, &path, "actionId").await
+			list_paged(fx, s, &path, "id").await
 		}
-		ActListQ(q) => {
-			list_paged(fx, s, &format!("/api/actions?{}&", fill(q, tgt)), "actionId").await
+		ActListQ(q) => list_paged(fx, s, &format!("/api/actions?{}&", fill(q, tgt)), "id").await,
+		FileListQ(q) => {
+			list_paged(fx, s, &format!("/api/files?{}&", fill(q, tgt)), "contentId").await
 		}
-		FileListQ(q) => list_paged(fx, s, &format!("/api/files?{}&", fill(q, tgt)), "fileId").await,
 		SearchQ(q) => {
 			let uri = format!("/api/search?q={}&limit=100&{}", crate::ops::MARK, fill(q, tgt));
 			crate::ops::get(fx, s, &uri).await.map(|b| {
@@ -3814,7 +4112,8 @@ fn render(want: &str, (a, level, status): Observed) -> Result<String, String> {
 	let denied = matches!(status, 401 | 403 | 404);
 	let s = match a {
 		_ if want == "Allow*" && status != 0 && !denied => "Allow".to_owned(),
-		Actual::HarnessError(_) if want == status.to_string() => return Ok(want.into()),
+		// An exact status pins it, a denial's too ("404" refuses a 403).
+		_ if want == status.to_string() => return Ok(want.into()),
 		Actual::HarnessError(d) => return Err(d),
 		a => format!("{a:?}"),
 	};
@@ -3897,7 +4196,7 @@ async fn profiles(fx: &Fixture, s: &Subject, query: &str) -> Result<String, Stri
 		Err(r) => return r,
 	};
 	let set = |r: &Value, k: &str| !r[k].is_null();
-	let hidden = |r: &Value| matches!(r["status"].as_str(), Some("B" | "X"));
+	let hidden = |r: &Value| matches!(r["status"].as_str(), Some("blocked" | "banned"));
 	let leak = |r: &Value| PROFILE_PRIVATE.iter().any(|k| set(r, k));
 	Ok(if rows.iter().any(hidden) {
 		"Hidden"

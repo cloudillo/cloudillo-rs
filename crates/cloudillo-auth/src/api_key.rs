@@ -15,21 +15,20 @@ use std::net::SocketAddr;
 use crate::audit::{record_auth, verify_own_password};
 
 use cloudillo_core::Auth;
-use cloudillo_core::extract::OptionalRequestId;
 use cloudillo_types::{
 	auth_adapter::{ApiKeyInfo, AuthCtx, CreateApiKeyOptions},
-	types::ApiResponse,
+	types::{ApiResponse, ApiTime},
 };
 
 use crate::prelude::*;
 
 /// Request to create a new API key
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateApiKeyReq {
 	name: Option<String>,
 	scopes: Option<String>,
-	#[serde(rename = "expiresAt")]
-	expires_at: Option<i64>,
+	expires_at: Option<ApiTime>,
 	/// Required for an unscoped key, see [`require_reauth`]
 	reauth: Option<Reauth>,
 }
@@ -46,62 +45,57 @@ pub struct Reauth {
 /// Response for creating an API key (includes plaintext key shown only once)
 #[skip_serializing_none]
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateApiKeyRes {
-	#[serde(rename = "keyId")]
-	key_id: i64,
-	#[serde(rename = "keyPrefix")]
+	#[serde(rename = "id")]
+	key_id: String,
 	key_prefix: String,
-	#[serde(rename = "plaintextKey")]
 	plaintext_key: String,
 	name: Option<String>,
 	scopes: Option<String>,
-	#[serde(rename = "expiresAt")]
-	expires_at: Option<i64>,
-	#[serde(rename = "createdAt")]
-	created_at: i64,
+	expires_at: Option<ApiTime>,
+	created_at: ApiTime,
 }
 
 /// Response for API key list/read operations
 #[skip_serializing_none]
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ApiKeyListItem {
-	#[serde(rename = "keyId")]
-	key_id: i64,
-	#[serde(rename = "keyPrefix")]
+	#[serde(rename = "id")]
+	key_id: String,
 	key_prefix: String,
 	name: Option<String>,
 	scopes: Option<String>,
-	#[serde(rename = "expiresAt")]
-	expires_at: Option<i64>,
-	#[serde(rename = "lastUsedAt")]
-	last_used_at: Option<i64>,
-	#[serde(rename = "createdAt")]
-	created_at: i64,
+	expires_at: Option<ApiTime>,
+	last_used_at: Option<ApiTime>,
+	created_at: ApiTime,
 }
 
 impl From<ApiKeyInfo> for ApiKeyListItem {
 	fn from(info: ApiKeyInfo) -> Self {
 		Self {
-			key_id: info.key_id,
+			key_id: info.key_id.to_string(),
 			key_prefix: info.key_prefix.to_string(),
 			name: info.name.map(|s| s.to_string()),
 			scopes: info.scopes.map(|s| s.to_string()),
-			expires_at: info.expires_at.map(|t| t.0),
-			last_used_at: info.last_used_at.map(|t| t.0),
-			created_at: info.created_at.0,
+			expires_at: info.expires_at,
+			last_used_at: info.last_used_at,
+			created_at: info.created_at,
 		}
 	}
 }
 
 /// Request to update an API key; absent fields keep their stored value
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateApiKeyReq {
 	#[serde(default)]
 	name: Patch<String>,
 	#[serde(default)]
 	scopes: Patch<String>,
-	#[serde(default, rename = "expiresAt")]
-	expires_at: Patch<i64>,
+	#[serde(default)]
+	expires_at: Patch<ApiTime>,
 	/// Required when dropping a key's scopes, see [`require_reauth`]
 	reauth: Option<Reauth>,
 }
@@ -212,13 +206,12 @@ pub async fn create_api_key(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<CreateApiKeyReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CreateApiKeyRes>>)> {
 	info!("Creating API key for tenant {}", auth.id_tag);
 
 	let scopes = non_blank(req.scopes);
-	let mut expires_at = req.expires_at.map(Timestamp);
+	let mut expires_at = req.expires_at.map(Timestamp::from);
 	if scopes.is_none() {
 		if cloudillo_core::middleware::unscoped_key_refused(&app, auth.tn_id).await? {
 			return Err(Error::ValidationError(
@@ -255,13 +248,13 @@ pub async fn create_api_key(
 	.await;
 
 	let response_data = CreateApiKeyRes {
-		key_id: created.info.key_id,
+		key_id: created.info.key_id.to_string(),
 		key_prefix: created.info.key_prefix.to_string(),
 		plaintext_key: created.plaintext_key.to_string(),
 		name: created.info.name.map(|s| s.to_string()),
 		scopes: created.info.scopes.map(|s| s.to_string()),
-		expires_at: created.info.expires_at.map(|t| t.0),
-		created_at: created.info.created_at.0,
+		expires_at: created.info.expires_at,
+		created_at: created.info.created_at,
 	};
 
 	info!(
@@ -269,7 +262,7 @@ pub async fn create_api_key(
 		response_data.key_id, response_data.key_prefix, auth.id_tag
 	);
 
-	let response = ApiResponse::new(response_data).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(response_data);
 	Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -277,13 +270,12 @@ pub async fn create_api_key(
 pub async fn list_api_keys(
 	State(app): State<App>,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ApiKeyListItem>>>)> {
 	let keys = app.auth_adapter.list_api_keys(auth.tn_id).await?;
 
 	let response_data: Vec<ApiKeyListItem> = keys.into_iter().map(Into::into).collect();
 
-	let response = ApiResponse::new(response_data).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(response_data);
 	Ok((StatusCode::OK, Json(response)))
 }
 
@@ -292,13 +284,12 @@ pub async fn get_api_key(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Path(key_id): Path<i64>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ApiKeyListItem>>)> {
 	let key = app.auth_adapter.read_api_key(auth.tn_id, key_id).await?;
 
 	let response_data: ApiKeyListItem = key.into();
 
-	let response = ApiResponse::new(response_data).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(response_data);
 	Ok((StatusCode::OK, Json(response)))
 }
 
@@ -308,7 +299,6 @@ pub async fn update_api_key(
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
 	Path(key_id): Path<i64>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<UpdateApiKeyReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ApiKeyListItem>>)> {
 	info!("Updating API key {} for tenant {}", key_id, auth.id_tag);
@@ -320,7 +310,8 @@ pub async fn update_api_key(
 	let name = merge(req.name, current.name.map(String::from));
 	let was_scoped = current.scopes.as_deref().is_some_and(|s| !s.trim().is_empty());
 	let scopes = non_blank(merge(req.scopes, current.scopes.map(String::from)));
-	let mut expires_at = merge(req.expires_at.map(Timestamp), current.expires_at);
+	let mut expires_at =
+		merge(req.expires_at.map(Timestamp::from), current.expires_at.map(Timestamp::from));
 	if scopes.is_none() && was_scoped {
 		// Dropping the scopes turns the key into an owner login: same bar as minting one.
 		if cloudillo_core::middleware::unscoped_key_refused(&app, auth.tn_id).await? {
@@ -332,7 +323,7 @@ pub async fn update_api_key(
 	}
 	if scopes.is_none() {
 		expires_at =
-			clamp_unscoped_expiry(&app, auth.tn_id, current.created_at, expires_at).await?;
+			clamp_unscoped_expiry(&app, auth.tn_id, current.created_at.into(), expires_at).await?;
 		if expires_at.is_some_and(|t| t <= Timestamp::now()) {
 			return Err(Error::ValidationError(
 				"unscoped key is older than auth.remember_days; create a new key".into(),
@@ -349,7 +340,7 @@ pub async fn update_api_key(
 
 	info!("Updated API key {} for tenant {}", key_id, auth.id_tag);
 
-	let response = ApiResponse::new(response_data).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(response_data);
 	Ok((StatusCode::OK, Json(response)))
 }
 
@@ -359,8 +350,7 @@ pub async fn delete_api_key(
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
 	Path(key_id): Path<i64>,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	info!("Deleting API key {} for tenant {}", key_id, auth.id_tag);
 
 	app.auth_adapter.delete_api_key(auth.tn_id, key_id).await?;
@@ -377,8 +367,7 @@ pub async fn delete_api_key(
 
 	info!("Deleted API key {} for tenant {}", key_id, auth.id_tag);
 
-	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
 // vim: ts=4

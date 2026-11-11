@@ -389,8 +389,8 @@ pub async fn require_auth(
 ///
 /// The share-link token is the worked example because it is the most adversarial: a
 /// credential handed to an untrusted third party for one document, which
-/// `scope_permits` otherwise confines to `/api/files/**`, `/api/search` and the
-/// CRDT/RTDB sockets. Mounting a route here hands that third party the route, with no
+/// `scope_permits` otherwise confines to `/api/files/**`, `/api/uploads/**`,
+/// `/api/variants/**`, `/api/search` and the CRDT/RTDB sockets. Mounting a route here hands that third party the route, with no
 /// ABAC behind it unless the compose site adds one.
 ///
 /// It exists because [`crate::scope::scope_permits`] is a central path list, and growing
@@ -401,7 +401,7 @@ pub async fn require_auth(
 ///
 /// The mounted set is pinned by
 /// `crate::routes::protected::tests::public_data_tier_holds_exactly_the_admitted_tables`
-/// in the `cloudillo` crate. Currently: `GET /api/profiles/batch` — the reduced 4-field
+/// in the `cloudillo` crate. Currently: `GET /api/profile-lookups` — the reduced 4-field
 /// profile projection, which is `GET /api/me` minus `keys`, plus an owner-only `badges`
 /// field the handler fills only for the tenant account itself (`abac::is_tenant_account`),
 /// never for a scoped or share-link token.
@@ -453,8 +453,12 @@ pub async fn optional_auth(
 		req.headers().get(header::AUTHORIZATION).and_then(|h| h.to_str().ok())
 	{
 		auth_header.strip_prefix("Bearer ").map(|token| token.trim().to_string())
-	} else if req.uri().path().starts_with("/ws/") || req.uri().path().starts_with("/api/files/") {
-		// Fallback: try to get token from query parameter (for WebSocket and file endpoints)
+	} else if req.uri().path().starts_with("/ws/")
+		|| req.uri().path().starts_with("/api/files/")
+		|| req.uri().path().starts_with("/api/variants/")
+	{
+		// Fallback: try to get token from query parameter (for WebSocket, file and variant
+		// endpoints — `<img src>` cannot send a header)
 		let query = req.uri().query().unwrap_or("");
 		extract_token_from_query(query)
 	} else {
@@ -714,14 +718,14 @@ mod tests {
 
 		// The whole reason `require_auth_public_data` exists: under `require_auth`
 		// this request is a 403.
-		assert!(!scope_permits(s, &Method::GET, "/api/profiles/batch"));
+		assert!(!scope_permits(s, &Method::GET, "/api/profile-lookups"));
 
 		// ...and `scope.rs` is deliberately untouched, so every other profile route
 		// stays denied to a file-scoped token exactly as before.
 		assert!(!scope_permits(s, &Method::GET, "/api/profiles/alice.example.com"));
 		assert!(!scope_permits(s, &Method::PATCH, "/api/profiles/alice.example.com"));
 		assert!(!scope_permits(s, &Method::POST, "/api/profiles/alice.example.com/refresh"));
-		assert!(!scope_permits(s, &Method::PUT, "/api/profiles/alice.example.com"));
+		assert!(!scope_permits(s, &Method::POST, "/api/communities"));
 		assert!(!scope_permits(s, &Method::GET, "/api/profiles"));
 	}
 }

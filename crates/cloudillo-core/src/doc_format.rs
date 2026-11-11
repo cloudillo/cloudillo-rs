@@ -186,7 +186,7 @@ mod tests {
 			nav_param: Some(nav_param.into()),
 			search: None,
 			x: None,
-			updated_at: Timestamp(0),
+			updated_at: Timestamp(0).into(),
 		}
 	}
 

@@ -16,6 +16,7 @@ use cloudillo_types::{
 		UpdateAddressBookData,
 	},
 	prelude::*,
+	types::ApiTime,
 	utils::normalize_id_tag,
 };
 use sqlx::{Row, SqlitePool};
@@ -56,8 +57,8 @@ pub async fn create_address_book(
 		name: row.get::<String, _>("name").into(),
 		description: row.get::<Option<String>, _>("description").map(Into::into),
 		ctag: row.get::<String, _>("ctag").into(),
-		created_at: Timestamp(row.get::<i64, _>("created_at")),
-		updated_at: Timestamp(row.get::<i64, _>("updated_at")),
+		created_at: ApiTime(row.get::<i64, _>("created_at")),
+		updated_at: ApiTime(row.get::<i64, _>("updated_at")),
 	})
 }
 
@@ -78,8 +79,8 @@ pub async fn list_address_books(db: &SqlitePool, tn_id: TnId) -> ClResult<Vec<Ad
 			name: row.get::<String, _>("name").into(),
 			description: row.get::<Option<String>, _>("description").map(Into::into),
 			ctag: row.get::<String, _>("ctag").into(),
-			created_at: Timestamp(row.get::<i64, _>("created_at")),
-			updated_at: Timestamp(row.get::<i64, _>("updated_at")),
+			created_at: ApiTime(row.get::<i64, _>("created_at")),
+			updated_at: ApiTime(row.get::<i64, _>("updated_at")),
 		})
 		.collect())
 }
@@ -104,8 +105,8 @@ pub async fn get_address_book(
 		name: row.get::<String, _>("name").into(),
 		description: row.get::<Option<String>, _>("description").map(Into::into),
 		ctag: row.get::<String, _>("ctag").into(),
-		created_at: Timestamp(row.get::<i64, _>("created_at")),
-		updated_at: Timestamp(row.get::<i64, _>("updated_at")),
+		created_at: ApiTime(row.get::<i64, _>("created_at")),
+		updated_at: ApiTime(row.get::<i64, _>("updated_at")),
 	}))
 }
 
@@ -129,8 +130,8 @@ pub async fn get_address_book_by_name(
 		name: row.get::<String, _>("name").into(),
 		description: row.get::<Option<String>, _>("description").map(Into::into),
 		ctag: row.get::<String, _>("ctag").into(),
-		created_at: Timestamp(row.get::<i64, _>("created_at")),
-		updated_at: Timestamp(row.get::<i64, _>("updated_at")),
+		created_at: ApiTime(row.get::<i64, _>("created_at")),
+		updated_at: ApiTime(row.get::<i64, _>("updated_at")),
 	}))
 }
 

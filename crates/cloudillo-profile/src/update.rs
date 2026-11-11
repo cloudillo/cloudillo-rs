@@ -10,12 +10,12 @@ use axum::{
 };
 use std::net::SocketAddr;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::prelude::*;
 use cloudillo_core::CreateActionFn;
 use cloudillo_core::audit;
-use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
+use cloudillo_core::extract::{Auth, IdTag};
 use cloudillo_core::roles::{
 	LEADER_LEVEL, can_assign_role, can_manage_member_by_roles, highest_role_level,
 };
@@ -26,12 +26,7 @@ use cloudillo_types::meta_adapter::{
 	UpsertProfileFields,
 };
 use cloudillo_types::roles::parse_hat_roles;
-use cloudillo_types::types::{AdminProfilePatch, ApiResponse, ProfileInfo, ProfilePatch};
-
-#[derive(Serialize)]
-pub struct UpdateProfileResponse {
-	profile: ProfileInfo,
-}
+use cloudillo_types::types::{AdminProfilePatch, ApiResponse, ProfilePatch, ProfileView};
 
 fn profile_type_label(db_type: &str) -> &str {
 	match db_type {
@@ -47,7 +42,7 @@ pub async fn patch_own_profile(
 	IdTag(tenant): IdTag,
 	Auth(auth): Auth,
 	Json(patch): Json<ProfilePatch>,
-) -> ClResult<(StatusCode, Json<UpdateProfileResponse>)> {
+) -> ClResult<(StatusCode, Json<ApiResponse<ProfileView>>)> {
 	let tn_id = auth.tn_id;
 
 	// Validate x field limits
@@ -89,7 +84,7 @@ pub async fn patch_own_profile(
 	let x_map: std::collections::HashMap<String, String> =
 		tenant_data.x.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
 
-	let profile = ProfileInfo {
+	let profile = ProfileView {
 		id_tag: profile_data.id_tag.to_string(),
 		name: profile_data.name.to_string(),
 		r#type: Some(profile_type_label(&profile_data.r#type).to_string()),
@@ -106,7 +101,7 @@ pub async fn patch_own_profile(
 	};
 
 	info!("User {} updated the profile of {}", auth.id_tag, tenant);
-	Ok((StatusCode::OK, Json(UpdateProfileResponse { profile })))
+	Ok((StatusCode::OK, Json(ApiResponse::new(profile))))
 }
 
 /// Send `CONN:UPD` carrying our hat map for `peer` (`None` = map cleared), issued as the tenant.
@@ -165,7 +160,7 @@ fn check_hat_roles_patch(
 /// Blocked/Banned.
 fn refuse_suspended(status: Patch<ProfileStatus>) -> ClResult<()> {
 	if matches!(status, Patch::Value(ProfileStatus::Suspended)) {
-		return Err(Error::ValidationError("status S is set by profile sync only".into()));
+		return Err(Error::ValidationError("status suspended is set by profile sync only".into()));
 	}
 	Ok(())
 }
@@ -184,7 +179,7 @@ pub async fn patch_profile_admin(
 	Auth(auth): Auth,
 	Path(id_tag): Path<String>,
 	Json(patch): Json<AdminProfilePatch>,
-) -> ClResult<(StatusCode, Json<UpdateProfileResponse>)> {
+) -> ClResult<(StatusCode, Json<ApiResponse<ProfileView>>)> {
 	let tn_id = auth.tn_id;
 	refuse_suspended(patch.status)?;
 
@@ -363,9 +358,8 @@ pub async fn patch_profile_admin(
 	let profile_data = app.meta_adapter.get_profile_info(tn_id, &id_tag).await?;
 
 	// `ProfileData.status` is the single-char DB code (`A`/`B`/`M`/`S`/`X`);
-	// `ProfileInfo.status` is the typed enum that serializes to the same code.
-	// Mirror `parse_status_list` in `list.rs`: unrecognized codes → `None` so a
-	// future schema addition doesn't 500 every admin response.
+	// `ProfileView.status` is the typed enum that serializes to the same code.
+	// Unrecognized codes → `None` so a future schema addition doesn't 500 every admin response.
 	let status = profile_data.status.as_deref().and_then(|s| match s {
 		"A" => Some(ProfileStatus::Active),
 		"B" => Some(ProfileStatus::Blocked),
@@ -375,7 +369,7 @@ pub async fn patch_profile_admin(
 		_ => None,
 	});
 
-	let profile = ProfileInfo {
+	let profile = ProfileView {
 		id_tag: profile_data.id_tag.to_string(),
 		name: profile_data.name.to_string(),
 		r#type: Some(profile_type_label(&profile_data.r#type).to_string()),
@@ -392,7 +386,7 @@ pub async fn patch_profile_admin(
 	};
 
 	info!("Admin {} updated profile {}", auth.id_tag, id_tag);
-	Ok((StatusCode::OK, Json(UpdateProfileResponse { profile })))
+	Ok((StatusCode::OK, Json(ApiResponse::new(profile))))
 }
 
 /// Body for PATCH /profile/:idTag.
@@ -439,7 +433,8 @@ fn validate_hats(hats: Vec<Box<str>>) -> ClResult<Vec<Box<str>>> {
 	Ok(out)
 }
 
-/// PATCH /profile/:idTag - Update relationship data with another user
+/// PATCH /api/profiles/{idTag} - Update relationship data with another user; 200 + the updated
+/// [`ProfileView`], the same view `GET /api/profiles/{idTag}` gives.
 ///
 /// `hats` is the tenant account's own UI preference: only the tenant itself may set it, not a
 /// leader the `write` guard admits, nor a role-less credential naming the account.
@@ -449,7 +444,7 @@ pub async fn patch_profile_relationship(
 	Auth(auth): Auth,
 	Path(id_tag): Path<String>,
 	Json(patch): Json<PatchProfileRelationshipRequest>,
-) -> ClResult<StatusCode> {
+) -> ClResult<(StatusCode, Json<ApiResponse<ProfileView>>)> {
 	let tn_id = auth.tn_id;
 	refuse_suspended(patch.status)?;
 	if !patch.hats.is_undefined() {
@@ -487,7 +482,9 @@ pub async fn patch_profile_relationship(
 	}
 
 	info!("User {} updated relationship with {}", auth.id_tag, id_tag);
-	Ok(StatusCode::OK)
+	let profile =
+		crate::list::profile_with_status(&app, tn_id, &tenant_id_tag, &auth, &id_tag).await?;
+	Ok((StatusCode::OK, Json(ApiResponse::new(profile))))
 }
 
 /// POST /profiles/:idTag/refresh — force an immediate re-sync of the caller's
@@ -505,8 +502,7 @@ pub async fn post_profile_refresh(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Path(id_tag): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<ProfileInfo>>)> {
+) -> ClResult<(StatusCode, Json<ApiResponse<ProfileView>>)> {
 	let tn_id = auth.tn_id;
 
 	// Only refresh a profile the caller already tracks (a real relationship),
@@ -536,7 +532,7 @@ pub async fn post_profile_refresh(
 		_ => None,
 	});
 
-	let profile = ProfileInfo {
+	let profile = ProfileView {
 		id_tag: profile_data.id_tag.to_string(),
 		name: profile_data.name.to_string(),
 		r#type: Some(profile_type_label(&profile_data.r#type).to_string()),
@@ -553,10 +549,7 @@ pub async fn post_profile_refresh(
 	};
 
 	info!("User {} forced refresh of profile {}", auth.id_tag, id_tag);
-	let mut response = ApiResponse::new(profile);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(profile);
 	Ok((StatusCode::OK, Json(response)))
 }
 

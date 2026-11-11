@@ -140,27 +140,71 @@ impl<'de> Deserialize<'de> for Timestamp {
 	}
 }
 
-/// Serialize Timestamp as ISO 8601 string for API responses
-pub fn serialize_timestamp_iso<S>(ts: &Timestamp, serializer: S) -> Result<S::Ok, S::Error>
-where
-	S: Serializer,
-{
-	use chrono::{DateTime, SecondsFormat};
-	let dt = DateTime::from_timestamp(ts.0, 0).unwrap_or_default();
-	serializer.serialize_str(&dt.to_rfc3339_opts(SecondsFormat::Secs, true))
+// ApiTime //
+//*********//
+/// A point in time as the REST/WS surface carries it: (de)serializes **only** as an RFC3339
+/// string (UTC, second precision on output; `Z` or any offset accepted on input). Integers are
+/// rejected. Internally Unix seconds, like [`Timestamp`], which stays the type for storage,
+/// scheduler payloads and JWT claims.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ApiTime(pub i64);
+
+impl ApiTime {
+	pub fn now() -> ApiTime {
+		Timestamp::now().into()
+	}
+
+	/// Format as RFC3339 UTC (e.g. "2024-01-15T12:00:00Z"), same as the wire form
+	pub fn to_iso_string(&self) -> String {
+		Timestamp(self.0).to_iso_string()
+	}
 }
 
-/// Serialize Option<Timestamp> as ISO 8601 string for API responses
-pub fn serialize_timestamp_iso_opt<S>(
-	ts: &Option<Timestamp>,
-	serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-	S: Serializer,
-{
-	match ts {
-		Some(ts) => serialize_timestamp_iso(ts, serializer),
-		None => serializer.serialize_none(),
+impl From<Timestamp> for ApiTime {
+	fn from(ts: Timestamp) -> Self {
+		ApiTime(ts.0)
+	}
+}
+
+impl From<ApiTime> for Timestamp {
+	fn from(t: ApiTime) -> Self {
+		Timestamp(t.0)
+	}
+}
+
+impl std::fmt::Display for ApiTime {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(&self.to_iso_string())
+	}
+}
+
+impl Serialize for ApiTime {
+	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		serializer.serialize_str(&self.to_iso_string())
+	}
+}
+
+impl<'de> Deserialize<'de> for ApiTime {
+	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		use serde::de::{Error, Visitor};
+
+		struct ApiTimeVisitor;
+
+		impl Visitor<'_> for ApiTimeVisitor {
+			type Value = ApiTime;
+
+			fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+				write!(f, "an RFC3339 timestamp string")
+			}
+
+			fn visit_str<E: Error>(self, v: &str) -> Result<Self::Value, E> {
+				chrono::DateTime::parse_from_rfc3339(v)
+					.map(|dt| ApiTime(dt.timestamp()))
+					.map_err(|_| E::custom("invalid RFC3339 timestamp"))
+			}
+		}
+
+		deserializer.deserialize_str(ApiTimeVisitor)
 	}
 }
 
@@ -309,7 +353,7 @@ pub struct Profile {
 	pub protocol_version: Option<u32>,
 }
 
-/// Reduced, deliberately public projection returned by `GET /api/profiles/batch` and as
+/// Reduced, deliberately public projection returned by `GET /api/profile-lookups` and as
 /// `/api/me/full` `partners`.
 ///
 /// **Every field but `badges` is already obtainable without authentication** at that
@@ -322,7 +366,7 @@ pub struct Profile {
 /// handler fills it only for the tenant account itself (`abac::is_tenant_account`) and
 /// every other caller gets the field omitted. It is always `None` on `/me/full` `partners`.
 ///
-/// It is **not** `ProfileWithStatus`, which leaks the reading tenant's private
+/// It is **not** [`ProfileView`], which leaks the reading tenant's private
 /// relationship state (`status` including Blocked/Muted/Banned, `connected`,
 /// `following`, `follower`, `trust`, and the `msgState`/`feedState` reader
 /// state), and **not** [`ProfileBase`], which carries `keys`.
@@ -352,8 +396,8 @@ pub struct BadgeView {
 	pub slot: String,
 	/// A level of that slot's catalog, e.g. `"verified"`.
 	pub level: String,
-	/// Expiry, Unix seconds.
-	pub exp: Timestamp,
+	/// Expiry, RFC3339 UTC on the wire.
+	pub exp: ApiTime,
 }
 
 impl From<crate::meta_adapter::Profile<Box<str>>> for PublicProfile {
@@ -438,11 +482,12 @@ pub struct AdminProfilePatch {
 	pub hat_roles: Patch<Option<String>>,
 }
 
-/// Profile information response
+/// A profile as the reading tenant sees it (lists, `GET /profiles/{idTag}`, profile PATCH).
+/// Owner-tier fields are filtered per caller by the handlers.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ProfileInfo {
+pub struct ProfileView {
 	pub id_tag: String,
 	pub name: String,
 	#[serde(rename = "type")]
@@ -456,11 +501,8 @@ pub struct ProfileInfo {
 	/// `"always"` = always authenticate, `"never"` = never, absent = ask.
 	pub trust: Option<crate::meta_adapter::ProfileTrust>,
 	pub roles: Option<Vec<String>>,
-	#[serde(
-		serialize_with = "serialize_timestamp_iso_opt",
-		skip_serializing_if = "Option::is_none"
-	)]
-	pub created_at: Option<Timestamp>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub created_at: Option<ApiTime>,
 	/// Reader's DM state with this peer (`reader_state` row `P:MSG`). Owner-only.
 	/// Serialize-only: `ReaderState` is not `Deserialize`.
 	#[serde(skip_deserializing)]
@@ -504,8 +546,7 @@ pub struct CommunityProfileResponse {
 	#[serde(rename = "type")]
 	pub r#type: String,
 	pub profile_pic: Option<String>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
+	pub created_at: ApiTime,
 	/// Initial value of the new community tenant's `ui.onboarding` setting.
 	/// `Some("verify-idp")` for an IDP-typed community whose IDP identity is
 	/// still pending; `None` for domain-typed (or already-active) communities.
@@ -527,32 +568,6 @@ pub struct TagInfo {
 
 // Phase 1: API Response Envelope & Error Types
 //***********************************************
-
-/// Pagination information for list responses (offset-based - deprecated)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PaginationInfo {
-	pub offset: usize,
-	pub limit: usize,
-	pub total: usize,
-}
-
-/// Cursor-based pagination information for list responses
-///
-/// Provides stable pagination that handles data changes between requests.
-/// The cursor is an opaque base64-encoded JSON containing sort field, value, and last item ID.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CursorPaginationInfo {
-	/// Opaque cursor for fetching next page (None if no more results)
-	pub next_cursor: Option<String>,
-	/// Whether more results are available
-	pub has_more: bool,
-	/// Aggregate row count. `Some` only on a `count=true` response (which pairs it
-	/// with an empty `data` array); `None` on every non-count response.
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub count: Option<i64>,
-}
 
 /// Cursor data structure (encoded as base64 JSON in API)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -595,81 +610,76 @@ impl CursorData {
 	pub fn string_value(&self) -> Option<&str> {
 		self.v.as_str()
 	}
+
+	/// Encoded single-integer cursor `{s:<sort>, v:<n>, id:""}` (offset or i64 keyset)
+	pub fn int(sort: &str, n: i64) -> String {
+		Self::new(sort, n.into(), "").encode()
+	}
+
+	/// Keyset int from an optional `?cursor=` made by [`CursorData::int`] with the same
+	/// `sort`; absent = `None`, foreign/garbled = 400.
+	pub fn parse_int(cursor: Option<&str>, sort: &str) -> crate::error::ClResult<Option<i64>> {
+		cursor
+			.map(|c| {
+				Self::decode(c)
+					.filter(|c| c.s == sort)
+					.and_then(|c| c.timestamp())
+					.ok_or_else(|| crate::error::Error::ValidationError("invalid cursor".into()))
+			})
+			.transpose()
+	}
+
+	/// Encoded cursor for lists with no keyset: `{s:"offset", v:<n>, id:""}`
+	pub fn offset(n: u32) -> String {
+		Self::int("offset", n.into())
+	}
+
+	/// Offset from an optional `?cursor=` made by [`CursorData::offset`]; absent = 0,
+	/// foreign/garbled = 400.
+	pub fn parse_offset(cursor: Option<&str>) -> crate::error::ClResult<u32> {
+		Self::parse_int(cursor, "offset")?.map_or(Ok(0), |n| {
+			u32::try_from(n)
+				.map_err(|_| crate::error::Error::ValidationError("invalid cursor".into()))
+		})
+	}
 }
 
-/// Success response envelope for single objects
+/// Success response envelope: `{ "data": …, "next"?: "<cursor>", "total"?: <int> }`
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiResponse<T> {
 	pub data: T,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub pagination: Option<PaginationInfo>,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub cursor_pagination: Option<CursorPaginationInfo>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub time: Timestamp,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub req_id: Option<String>,
+	/// Opaque cursor for the next page; absent on the last page and on non-list responses
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub next: Option<String>,
+	/// Exact total row count, only where it is exact and cheap
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub total: Option<i64>,
 }
 
 impl<T> ApiResponse<T> {
-	/// Create a new response with data and current time
+	/// Create a response carrying only `data`
 	pub fn new(data: T) -> Self {
-		Self {
-			data,
-			pagination: None,
-			cursor_pagination: None,
-			time: Timestamp::now(),
-			req_id: None,
-		}
+		Self { data, next: None, total: None }
 	}
 
-	/// Create a response with offset-based pagination info (deprecated)
-	pub fn with_pagination(data: T, offset: usize, limit: usize, total: usize) -> Self {
-		Self {
-			data,
-			pagination: Some(PaginationInfo { offset, limit, total }),
-			cursor_pagination: None,
-			time: Timestamp::now(),
-			req_id: None,
-		}
+	/// Create a list page; `next` is `None` on the last page
+	pub fn with_next(data: T, next: Option<String>) -> Self {
+		Self { data, next, total: None }
 	}
 
-	/// Create a response with cursor-based pagination
-	pub fn with_cursor_pagination(data: T, next_cursor: Option<String>, has_more: bool) -> Self {
-		Self {
-			data,
-			pagination: None,
-			cursor_pagination: Some(CursorPaginationInfo { next_cursor, has_more, count: None }),
-			time: Timestamp::now(),
-			req_id: None,
-		}
+	/// Attach an exact total row count
+	pub fn with_total(mut self, total: i64) -> Self {
+		self.total = Some(total);
+		self
 	}
 
-	/// Create an aggregate-count response: `data` is the empty default and the
-	/// count is surfaced only under `cursorPagination.count`. Backs the
-	/// `count=true` flag on `GET /actions`.
-	pub fn with_count(count: i64) -> Self
+	/// Count-only response: empty default `data` plus `total` (backs `count=true`)
+	pub fn count_only(total: i64) -> Self
 	where
 		T: Default,
 	{
-		Self {
-			data: T::default(),
-			pagination: None,
-			cursor_pagination: Some(CursorPaginationInfo {
-				next_cursor: None,
-				has_more: false,
-				count: Some(count),
-			}),
-			time: Timestamp::now(),
-			req_id: None,
-		}
-	}
-
-	/// Add request ID to response
-	pub fn with_req_id(mut self, req_id: String) -> Self {
-		self.req_id = Some(req_id);
-		self
+		Self { data: T::default(), next: None, total: Some(total) }
 	}
 }
 
@@ -1181,6 +1191,83 @@ pub struct CompactReport {
 	pub files: usize,
 	pub bytes_before: u64,
 	pub bytes_after: u64,
+}
+
+#[cfg(test)]
+mod api_time_tests {
+	use super::{ApiTime, Timestamp};
+	use serde_json::json;
+
+	#[test]
+	fn serializes_as_rfc3339_utc() {
+		let v = serde_json::to_value(ApiTime(1_705_320_000)).ok();
+		assert_eq!(v, Some(json!("2024-01-15T12:00:00Z")));
+	}
+
+	#[test]
+	fn round_trips() {
+		let t = ApiTime(1_705_320_000);
+		let back: Option<ApiTime> =
+			serde_json::to_string(&t).ok().and_then(|s| serde_json::from_str(&s).ok());
+		assert_eq!(back, Some(t));
+	}
+
+	#[test]
+	fn accepts_offsets_and_normalizes_to_utc() {
+		let t: Option<ApiTime> = serde_json::from_value(json!("2024-01-15T14:00:00+02:00")).ok();
+		assert_eq!(t, Some(ApiTime(1_705_320_000)));
+	}
+
+	#[test]
+	fn rejects_integers_and_garbage() {
+		assert!(serde_json::from_value::<ApiTime>(json!(1_705_320_000)).is_err());
+		assert!(serde_json::from_value::<ApiTime>(json!("yesterday")).is_err());
+	}
+
+	#[test]
+	fn option_null_and_timestamp_conversion() {
+		let none: Option<Option<ApiTime>> = serde_json::from_value(json!(null)).ok();
+		assert_eq!(none, Some(None));
+		assert_eq!(serde_json::to_value(None::<ApiTime>).ok(), Some(json!(null)));
+		assert_eq!(Timestamp::from(ApiTime::from(Timestamp(42))), Timestamp(42));
+	}
+}
+
+#[cfg(test)]
+mod cursor_tests {
+	use super::CursorData;
+
+	#[test]
+	fn parse_offset_and_int() {
+		assert_eq!(CursorData::parse_offset(None).ok(), Some(0));
+		assert_eq!(CursorData::parse_offset(Some(&CursorData::offset(7))).ok(), Some(7));
+		assert_eq!(CursorData::parse_int(None, "audit").ok(), Some(None));
+		let c = CursorData::int("audit", 42);
+		assert_eq!(CursorData::parse_int(Some(&c), "audit").ok(), Some(Some(42)));
+		assert!(CursorData::parse_int(Some(&c), "share").is_err());
+		assert!(CursorData::parse_offset(Some(&c)).is_err());
+		assert!(CursorData::parse_offset(Some(&CursorData::int("offset", -1))).is_err());
+		assert!(CursorData::parse_offset(Some("garbage!")).is_err());
+	}
+}
+
+#[cfg(test)]
+mod api_response_tests {
+	use super::ApiResponse;
+	use serde_json::json;
+
+	#[test]
+	fn envelope_carries_only_data_next_total() {
+		let plain = serde_json::to_value(ApiResponse::new(1)).ok();
+		assert_eq!(plain, Some(json!({ "data": 1 })));
+		let page = ApiResponse::with_next(vec![1], Some("c".into())).with_total(5);
+		assert_eq!(
+			serde_json::to_value(page).ok(),
+			Some(json!({ "data": [1], "next": "c", "total": 5 }))
+		);
+		let last = serde_json::to_value(ApiResponse::with_next(vec![1], None)).ok();
+		assert_eq!(last, Some(json!({ "data": [1] })));
+	}
 }
 
 // vim: ts=4

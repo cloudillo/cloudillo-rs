@@ -22,6 +22,45 @@ use crate::{
 	subject_ref::{SubjectRef, parse_subject_ref},
 };
 
+/// How an inbound action reached us: pushed live (`/api/inbox`, `/api/inbox/sync`) or
+/// replayed from a peer's outbox by history sync.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Origin {
+	#[default]
+	Live,
+	Backfill,
+}
+
+impl Origin {
+	/// Live = every side effect; Backfill = state only (no WS, no notification, no
+	/// propagation of a replayed action).
+	pub fn effects(self) -> Effects {
+		match self {
+			Self::Live => Effects::ALL,
+			Self::Backfill => Effects { state: true, live: false, notify: false, propagate: false },
+		}
+	}
+}
+
+/// Side-effect classes a processing run may perform. Helpers take it as a required
+/// argument and return early when their class is off.
+#[expect(clippy::struct_excessive_bools, reason = "independent side-effect classes")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Effects {
+	/// DB writes, profile sync, attachment fetch, search indexing.
+	pub state: bool,
+	/// WebSocket forwards to the tenant's sessions.
+	pub live: bool,
+	/// Push and email notifications.
+	pub notify: bool,
+	/// Anything that emits, relays or fans out actions to other nodes.
+	pub propagate: bool,
+}
+
+impl Effects {
+	pub const ALL: Self = Self { state: true, live: true, notify: true, propagate: true };
+}
+
 /// Direction-specific processing context
 #[derive(Debug, Clone)]
 pub enum ProcessingContext {
@@ -40,6 +79,8 @@ pub enum ProcessingContext {
 		/// owner-vouched APRV — `skip_permission_check`). Read by gating hooks
 		/// (e.g. `subs::on_receive`) to accept a relayed copy they'd otherwise reject.
 		pre_approved: bool,
+		/// Live push or history-sync backfill; decides [`Effects`].
+		origin: Origin,
 	},
 }
 
@@ -56,6 +97,14 @@ impl ProcessingContext {
 		match self {
 			Self::Outbound { temp_id } => temp_id.as_deref(),
 			Self::Inbound { .. } => None,
+		}
+	}
+
+	/// Outbound and live inbound: all effects. Backfill: state only.
+	pub fn effects(&self) -> Effects {
+		match self {
+			Self::Outbound { .. } => Effects::ALL,
+			Self::Inbound { origin, .. } => origin.effects(),
 		}
 	}
 
@@ -114,6 +163,7 @@ pub async fn process_after_store(
 ) -> ClResult<PostStoreResult> {
 	let mut result =
 		PostStoreResult { hook_result: None, status: None, ws_forward_deferred: false };
+	let effects = ctx.effects();
 
 	// 1. Execute hook (on_create for outbound, on_receive for inbound)
 	let hook_exec = execute_hook(app, tn_id, action, &ctx).await?;
@@ -155,7 +205,7 @@ pub async fn process_after_store(
 	// the hook's resting status — a rejected child (e.g. a stranger SUBS at 'D')
 	// must never be vouched.
 	let accepted = result.status.is_none_or(|s| s == crate::status::ACTIVE);
-	let vouched = accepted && maybe_relay_child_to_subscribers(app, tn_id, action).await?;
+	let vouched = accepted && maybe_relay_child_to_subscribers(app, tn_id, action, effects).await?;
 	let fanout_recipients = if vouched {
 		Vec::new()
 	} else {
@@ -166,6 +216,7 @@ pub async fn process_after_store(
 			action.parent_id.as_deref(),
 			action.subject.as_deref(),
 			&action.issuer_tag,
+			effects,
 		)
 		.await?
 	};
@@ -178,7 +229,7 @@ pub async fn process_after_store(
 		&& !is_sync
 	{
 		// Auto-approve approvable actions from trusted sources
-		try_auto_approve(app, tn_id, action).await;
+		try_auto_approve(app, tn_id, action, effects).await;
 	}
 
 	// 6. Sync involved profiles for inbound actions. ensure_profile early-returns
@@ -280,7 +331,8 @@ async fn execute_hook(
 		.expires_at(action.expires_at.map(|ts| format!("{}", ts.0)))
 		.tenant(tn_id, tenant.id_tag.to_string(), tenant.typ.as_str())
 		.client_address(ctx.client_address().map(String::from))
-		.pre_approved(matches!(ctx, ProcessingContext::Inbound { pre_approved: true, .. }));
+		.pre_approved(matches!(ctx, ProcessingContext::Inbound { pre_approved: true, .. }))
+		.effects(ctx.effects());
 
 	hook_context = if ctx.is_outbound() { hook_context.outbound() } else { hook_context.inbound() };
 
@@ -341,6 +393,13 @@ pub(crate) async fn forward_to_websocket(
 		is_outbound = %ctx.is_outbound(),
 		"WS forward preparing"
 	);
+
+	// Push and email below fire only as the offline fallback of the live send, so no live
+	// effect (Backfill) ends the whole forward. The notify helpers gate themselves too.
+	let effects = ctx.effects();
+	if !effects.live {
+		return;
+	}
 
 	if !ctx.is_outbound()
 		&& let Ok(us) = app.auth_adapter.read_id_tag(tn_id).await
@@ -435,6 +494,7 @@ pub(crate) async fn forward_to_websocket(
 				&action.issuer_tag,
 				action.parent_id.as_deref(),
 				content,
+				effects,
 			)
 			.await;
 		}
@@ -466,6 +526,7 @@ pub(crate) async fn forward_to_websocket(
 			&action.issuer_tag,
 			action.parent_id.as_deref(),
 			content,
+			effects,
 		)
 		.await;
 	}
@@ -804,8 +865,18 @@ async fn schedule_broadcast_delivery(
 }
 
 /// Try to auto-approve an approvable action from a trusted source
-async fn try_auto_approve(app: &App, tn_id: TnId, action: &meta_adapter::Action<Box<str>>) {
+async fn try_auto_approve(
+	app: &App,
+	tn_id: TnId,
+	action: &meta_adapter::Action<Box<str>>,
+	effects: Effects,
+) {
 	use crate::status;
+
+	// An approval is a new outbound action: a propagation.
+	if !effects.propagate {
+		return;
+	}
 
 	debug!(
 		action_id = %action.action_id,

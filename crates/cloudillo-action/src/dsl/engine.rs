@@ -31,6 +31,51 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 /// (largest is `APKG` at ~6 KB); `POST:LDOC` raises it explicitly.
 const DEFAULT_OBJECT_MAX_BYTES: usize = 16 * 1024;
 
+/// Most names a token's `crit` claim may carry; a longer list is refused outright.
+const MAX_CRIT_ENTRIES: usize = 16;
+
+/// Flag chars this node understands in a token's `f` claim — `$f:<char>` in `crit`.
+/// R/r reactions, C/c comments, O/o open/closed (`helpers::is_capability_enabled`, `is_open`);
+/// the REST form is `cloudillo_types::api_enums::ActionFlags`.
+pub const KNOWN_FLAG_CHARS: &[char] = &['R', 'r', 'C', 'c', 'O', 'o'];
+
+/// `ActionToken` serde wire names — `$<claim>` in `crit`. `_` is the PoW nonce.
+/// Keep in sync with `cloudillo_types::auth_adapter::ActionToken`.
+const ACTION_TOKEN_CLAIMS: &[&str] = &[
+	"iss", "k", "t", "c", "p", "a", "aud", "sub", "iat", "exp", "f", "v", "h", "ch", "_", "crit",
+];
+
+/// Every `"TYPE:SUB"` a native hook branches on, or registers a hook for. Checked at boot
+/// (`cloudillo::app`) against `DslEngine::is_known`: a hook-handled subtype missing from its
+/// base's `subtypes` map (and without its own definition) would be refused on arrival.
+/// Not derivable from hook code — add the entry when a hook learns a new subtype.
+pub const HOOK_HANDLED_TYPES: &[&str] = &[
+	"CONN:ACC",
+	"CONN:DEL",
+	"CONN:UPD",
+	"FLLW:DEL",
+	"CMNT:DEL",
+	"CMNT:UPD",
+	"MSG:DEL",
+	"MSG:UPD",
+	"PRES:TYPING",
+	"FSHR:ADMIN",
+	"FSHR:WRITE",
+	"FSHR:COMMENT",
+	"FSHR:DEL",
+	"SUBS:UPD",
+	"SUBS:DEL",
+	"SUBS:ROLE",
+	"INVT:DEL",
+	"REACT:DEL",
+	"PIN:DEL",
+	"PTNR:DEL",
+	"IDP:REG",
+	"CONV:UPD",
+	"BDG:STD",
+	"BDG:PAT",
+];
+
 /// DSL Engine - loads and executes action type definitions
 #[derive(Debug, Default)]
 pub struct DslEngine {
@@ -148,6 +193,57 @@ impl DslEngine {
 	/// Every loaded definition, for startup validation of fields `load_definition` skips.
 	pub fn definitions(&self) -> impl Iterator<Item = (&str, &ActionDefinition)> {
 		self.definitions.iter().map(|(k, v)| (k.as_str(), v))
+	}
+
+	/// Strict known-check on a token-form type (`ActionToken.t`: `"TYPE"` or `"TYPE:SUB"`).
+	/// Known iff the exact key has its own definition, or SUB is listed in BASE's `subtypes`
+	/// map. Unlike `definition_for`, an unlisted subtype never falls back to its base.
+	pub fn is_known(&self, t: &str) -> bool {
+		if self.definitions.contains_key(t) {
+			return true;
+		}
+		let Some((base, sub)) = t.split_once(':') else { return false };
+		self.definitions
+			.get(base)
+			.and_then(|d| d.subtypes.as_ref())
+			.is_some_and(|m| m.contains_key(sub))
+	}
+
+	/// Check a token's `crit` claim against `def`, the definition resolved for the token.
+	/// Name forms: a top-level content field (`def`'s schema properties), `$<claim>` (an
+	/// `ActionToken` wire name) and `$f:<char>` (`KNOWN_FLAG_CHARS`). Err carries the first
+	/// unknown name, or a too-many-entries message past `MAX_CRIT_ENTRIES`.
+	pub fn check_crit(
+		&self,
+		def: &ActionDefinition,
+		crit: Option<&[Box<str>]>,
+	) -> Result<(), String> {
+		let Some(crit) = crit else { return Ok(()) };
+		if crit.len() > MAX_CRIT_ENTRIES {
+			return Err(format!("crit has {} entries (max {MAX_CRIT_ENTRIES})", crit.len()));
+		}
+		let props = def
+			.schema
+			.as_ref()
+			.and_then(|s| s.content.as_ref())
+			.and_then(|c| c.properties.as_ref());
+		for name in crit {
+			let known = if let Some(flag) = name.strip_prefix("$f:") {
+				let mut chars = flag.chars();
+				matches!(
+					(chars.next(), chars.next()),
+					(Some(c), None) if KNOWN_FLAG_CHARS.contains(&c)
+				)
+			} else if let Some(claim) = name.strip_prefix('$') {
+				ACTION_TOKEN_CLAIMS.contains(&claim)
+			} else {
+				props.is_some_and(|p| p.contains_key(name.as_ref()))
+			};
+			if !known {
+				return Err(name.to_string());
+			}
+		}
+		Ok(())
 	}
 
 	/// Resolve action type for hook lookup.
@@ -997,6 +1093,53 @@ mod tests {
 	}
 
 	#[test]
+	fn is_known_is_strict_about_subtypes() {
+		let engine = builtin_engine();
+		for t in [
+			"POST",
+			"POST:TEXT",
+			"POST:VIDEO",
+			"POST:DOC",
+			"MSG:TEXT",
+			"MSG:IMG",
+			"MSG:FILE",
+			"CMNT:UPD",
+			"SUBS:ROLE",
+			"IDP:REG",
+			"BDG:STD",
+			"FSHR",
+		] {
+			assert!(engine.is_known(t), "{t} must be known");
+		}
+		for t in ["REACT:NEW", "CONN:XYZ", "FSHR:XYZ", "IDP:XYZ", "IDP", "XYZ", "POST:", ""] {
+			assert!(!engine.is_known(t), "{t} must be unknown");
+		}
+	}
+
+	#[test]
+	fn every_hook_handled_type_is_known() {
+		let engine = builtin_engine();
+		for t in HOOK_HANDLED_TYPES {
+			assert!(engine.is_known(t), "hook-handled {t} is not known");
+		}
+	}
+
+	#[test]
+	fn check_crit_refuses_unknown_names() {
+		let engine = builtin_engine();
+		let def = engine.definition_for("CONN", None).expect("CONN is built in");
+		let crit = |names: &[&str]| -> Vec<Box<str>> { names.iter().map(|&n| n.into()).collect() };
+
+		assert_eq!(engine.check_crit(def, None), Ok(()));
+		assert_eq!(engine.check_crit(def, Some(&*crit(&["msg", "$iat", "$_", "$f:O"]))), Ok(()));
+		assert_eq!(engine.check_crit(def, Some(&*crit(&["msg", "nope"]))), Err("nope".into()));
+		assert_eq!(engine.check_crit(def, Some(&*crit(&["$zz"]))), Err("$zz".into()));
+		assert_eq!(engine.check_crit(def, Some(&*crit(&["$f:Z"]))), Err("$f:Z".into()));
+		assert_eq!(engine.check_crit(def, Some(&*crit(&["$f:Oo"]))), Err("$f:Oo".into()));
+		assert!(engine.check_crit(def, Some(&*crit(&["$iat"; 17]))).is_err());
+	}
+
+	#[test]
 	fn conn_content_accepts_the_scalar_shorthand_and_the_object_form() {
 		let engine = builtin_engine();
 		let bare = serde_json::json!("hello");
@@ -1035,5 +1178,19 @@ mod tests {
 		let bare = serde_json::json!("contributor");
 		assert!(engine.validate_content("APRV", Some(&bare)).is_err());
 		assert_eq!(engine.normalize_content("APRV", Some(&bare)).map(Cow::into_owned), Some(bare));
+	}
+
+	/// The REST `flags` object (`api_enums::ActionFlags`) spells out every letter this node
+	/// understands, both cases, and nothing else.
+	#[test]
+	fn action_flags_cover_known_flag_chars() {
+		use cloudillo_types::api_enums::ActionFlags;
+		let on = ActionFlags { reactions: true, comments: true, open: true }.to_letters();
+		let off = ActionFlags { reactions: false, comments: false, open: false }.to_letters();
+		let mut letters: Vec<char> = on.chars().chain(off.chars()).collect();
+		let mut known = KNOWN_FLAG_CHARS.to_vec();
+		letters.sort_unstable();
+		known.sort_unstable();
+		assert_eq!(letters, known);
 	}
 }

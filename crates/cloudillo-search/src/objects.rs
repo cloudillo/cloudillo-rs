@@ -1194,10 +1194,10 @@ mod tests {
 	/// A `FileView` with only the fields the index rule reads.
 	fn file_view(parent_id: Option<&str>, status: &str) -> FileView {
 		serde_json::from_value(serde_json::json!({
-			"fileId": "f1~doc",
+			"contentId": "f1~doc",
 			"fileName": "Jegyzetek",
 			"parentId": parent_id,
-			"createdAt": 0,
+			"createdAt": "1970-01-01T00:00:00Z",
 			"status": status,
 		}))
 		.expect("file view")
@@ -1208,20 +1208,20 @@ mod tests {
 		// A hit on either would deep-link nowhere. The sweep pages with
 		// `sweep_all`, so it sees both and takes their rows back out even when the
 		// live hook was forgotten.
-		assert!(!is_indexable(&file_view(Some(TRASH_PARENT_ID), "A")));
-		assert!(!is_indexable(&file_view(None, "D")));
+		assert!(!is_indexable(&file_view(Some(TRASH_PARENT_ID), "active")));
+		assert!(!is_indexable(&file_view(None, "deleted")));
 		// A file in an ordinary folder is unaffected.
-		assert!(is_indexable(&file_view(Some("f1~folder"), "A")));
+		assert!(is_indexable(&file_view(Some("f1~folder"), "active")));
 	}
 
 	#[test]
 	fn the_representative_is_the_first_placed_live_entry() {
 		let entries = [
-			file_view(Some(MANAGED_PARENT_ID), "A"),
-			file_view(Some(TRASH_PARENT_ID), "A"),
-			file_view(None, "D"),
-			file_view(Some("f1~folder"), "A"),
-			file_view(None, "A"),
+			file_view(Some(MANAGED_PARENT_ID), "active"),
+			file_view(Some(TRASH_PARENT_ID), "active"),
+			file_view(None, "deleted"),
+			file_view(Some("f1~folder"), "active"),
+			file_view(None, "active"),
 		];
 		let rep = pick_representative(&entries).expect("live entry");
 		assert_eq!(rep.parent_id.as_deref(), Some("f1~folder"), "first placed live entry");
@@ -1230,9 +1230,9 @@ mod tests {
 			"managed / trashed / deleted never stand"
 		);
 		// A reference holds no bytes here: a local entry stands before it, whatever the order.
-		let mut pin = file_view(Some("f1~pins"), "A");
+		let mut pin = file_view(Some("f1~pins"), "active");
 		pin.upstream_tag = Some("bob.example".into());
-		let local = file_view(Some("f1~mine"), "A");
+		let local = file_view(Some("f1~mine"), "active");
 		let rep = pick_representative(std::slice::from_ref(&pin)).expect("reference alone");
 		assert_eq!(rep.parent_id.as_deref(), Some("f1~pins"));
 		let both = [pin, local];
@@ -1245,13 +1245,13 @@ mod tests {
 		// Cached peer avatars live in the managed folder with `visibility: 'P'`, so
 		// an indexed one leaks the tenant's contact graph to an unauthenticated
 		// search. `hidden` is the legacy spelling of the same thing.
-		let managed = file_view(Some(MANAGED_PARENT_ID), "A");
+		let managed = file_view(Some(MANAGED_PARENT_ID), "active");
 		assert!(!is_indexable(&managed));
-		let mut hidden = file_view(None, "A");
+		let mut hidden = file_view(None, "active");
 		hidden.hidden = true;
 		assert!(!is_indexable(&hidden));
 		// An ordinary file is unaffected by either exclusion.
-		assert!(is_indexable(&file_view(None, "A")));
+		assert!(is_indexable(&file_view(None, "active")));
 	}
 
 	#[test]
@@ -1259,7 +1259,7 @@ mod tests {
 		// Every site container is managed, so the disclosure rule above would keep
 		// every published site out of the index. A live container is served to
 		// anonymous crawlers, so there is nothing about it left to disclose.
-		let container = file_view(Some(MANAGED_PARENT_ID), "A");
+		let container = file_view(Some(MANAGED_PARENT_ID), "active");
 		assert!(is_live_site_indexable(&container));
 		assert!(!is_indexable(&container), "the managed rule itself must not have moved");
 	}
@@ -1268,8 +1268,8 @@ mod tests {
 	fn a_trashed_or_deleted_site_container_is_still_dropped() {
 		// The dead-link rule survives the exemption: a container that stopped
 		// serving takes its page rows with it, by set replacement.
-		assert!(!is_live_site_indexable(&file_view(Some(TRASH_PARENT_ID), "A")));
-		assert!(!is_live_site_indexable(&file_view(None, "D")));
+		assert!(!is_live_site_indexable(&file_view(Some(TRASH_PARENT_ID), "active")));
+		assert!(!is_live_site_indexable(&file_view(None, "deleted")));
 	}
 
 	#[test]

@@ -12,6 +12,7 @@ use crate::utils::Db;
 use cloudillo_types::{
 	meta_adapter::{DocFormat, UpsertDocFormat},
 	prelude::*,
+	types::ApiTime,
 	utils::normalize_id_tag,
 };
 use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
@@ -119,7 +120,7 @@ fn map_row(row: &SqliteRow) -> Result<DocFormat, sqlx::Error> {
 		nav_param: row.try_get::<Option<String>, _>("nav_param")?.map(Into::into),
 		search: parse_json(row.try_get::<Option<String>, _>("search")?.as_deref(), "search"),
 		x: parse_json(row.try_get::<Option<String>, _>("x")?.as_deref(), "x"),
-		updated_at: Timestamp(row.try_get::<Option<i64>, _>("updated_at")?.unwrap_or(0)),
+		updated_at: ApiTime(row.try_get::<Option<i64>, _>("updated_at")?.unwrap_or(0)),
 	})
 }
 

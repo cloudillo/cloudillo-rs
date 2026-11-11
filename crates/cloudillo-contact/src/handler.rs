@@ -14,11 +14,7 @@ use axum::{
 };
 use uuid::Uuid;
 
-use cloudillo_core::{
-	IdTag,
-	extract::{Auth, OptionalRequestId},
-	prelude::*,
-};
+use cloudillo_core::{IdTag, extract::Auth, prelude::*};
 use cloudillo_types::{
 	meta_adapter::{ListContactOptions, Profile, UpdateAddressBookData},
 	types::ApiResponse,
@@ -39,7 +35,7 @@ use crate::{
 
 fn ab_to_output(ab: &cloudillo_types::meta_adapter::AddressBook) -> AddressBookOutput {
 	AddressBookOutput {
-		ab_id: ab.ab_id,
+		ab_id: ab.ab_id.to_string(),
 		name: ab.name.to_string(),
 		description: ab.description.as_deref().map(str::to_string),
 		ctag: ab.ctag.to_string(),
@@ -107,8 +103,8 @@ fn contact_row_to_output(
 	}
 
 	ContactOutput {
-		c_id: row.c_id,
-		ab_id: row.ab_id,
+		c_id: row.c_id.to_string(),
+		ab_id: row.ab_id.to_string(),
 		uid: row.uid.to_string(),
 		etag: row.etag.to_string(),
 		formatted_name,
@@ -122,8 +118,8 @@ fn contact_row_to_output(
 		profile_id_tag,
 		profile,
 		parse_error,
-		created_at: row.created_at,
-		updated_at: row.updated_at,
+		created_at: row.created_at.into(),
+		updated_at: row.updated_at.into(),
 	}
 }
 
@@ -149,8 +145,8 @@ fn contact_view_to_list_item(
 	}
 
 	ContactListItem {
-		c_id: row.c_id,
-		ab_id: row.ab_id,
+		c_id: row.c_id.to_string(),
+		ab_id: row.ab_id.to_string(),
 		uid: row.uid.to_string(),
 		etag: row.etag.to_string(),
 		formatted_name,
@@ -160,7 +156,7 @@ fn contact_view_to_list_item(
 		photo,
 		profile_id_tag,
 		profile,
-		updated_at: row.updated_at,
+		updated_at: row.updated_at.into(),
 	}
 }
 
@@ -294,14 +290,10 @@ pub async fn list_address_books(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<AddressBookOutput>>>)> {
 	let books = app.meta_adapter.list_address_books(tn_id).await?;
 	let out: Vec<AddressBookOutput> = books.iter().map(ab_to_output).collect();
-	let mut resp = ApiResponse::new(out);
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(out);
 	Ok((StatusCode::OK, Json(resp)))
 }
 
@@ -325,7 +317,6 @@ pub async fn create_address_book(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(body): Json<AddressBookCreate>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<AddressBookOutput>>)> {
 	let name = body.name.trim();
@@ -334,10 +325,7 @@ pub async fn create_address_book(
 		.meta_adapter
 		.create_address_book(tn_id, name, body.description.as_deref())
 		.await?;
-	let mut resp = ApiResponse::new(ab_to_output(&ab));
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(ab_to_output(&ab));
 	Ok((StatusCode::CREATED, Json(resp)))
 }
 
@@ -346,7 +334,6 @@ pub async fn patch_address_book(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path(ab_id): Path<u64>,
 	Json(patch): Json<AddressBookPatch>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<AddressBookOutput>>)> {
@@ -361,10 +348,7 @@ pub async fn patch_address_book(
 	let update = UpdateAddressBookData { name, description: patch.description };
 	app.meta_adapter.update_address_book(tn_id, ab_id, &update).await?;
 	let ab = app.meta_adapter.get_address_book(tn_id, ab_id).await?.ok_or(Error::NotFound)?;
-	let mut resp = ApiResponse::new(ab_to_output(&ab));
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(ab_to_output(&ab));
 	Ok((StatusCode::OK, Json(resp)))
 }
 
@@ -374,11 +358,9 @@ pub async fn delete_address_book(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path(ab_id): Path<u64>,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	app.meta_adapter.delete_address_book(tn_id, ab_id).await?;
-	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
 // Contacts
@@ -389,7 +371,6 @@ async fn list_contacts_inner(
 	tn_id: TnId,
 	ab_id: Option<u64>,
 	query: ListContactsQuery,
-	req_id: Option<String>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ContactListItem>>>)> {
 	let opts = ListContactOptions { q: query.q, cursor: query.cursor, limit: query.limit };
 	let mut rows = app.meta_adapter.list_contacts(tn_id, ab_id, &opts).await?;
@@ -410,12 +391,9 @@ async fn list_contacts_inner(
 	let items: Vec<ContactListItem> =
 		rows.iter().map(|row| contact_view_to_list_item(row, &overlays)).collect();
 
-	let next_cursor = if has_more { items.last().map(|last| last.c_id.to_string()) } else { None };
+	let next_cursor = if has_more { items.last().map(|last| last.c_id.clone()) } else { None };
 
-	let mut resp = ApiResponse::with_cursor_pagination(items, next_cursor, has_more);
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::with_next(items, next_cursor);
 	Ok((StatusCode::OK, Json(resp)))
 }
 
@@ -424,11 +402,10 @@ pub async fn list_contacts(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path(ab_id): Path<u64>,
 	Query(query): Query<ListContactsQuery>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ContactListItem>>>)> {
-	list_contacts_inner(&app, tn_id, Some(ab_id), query, req_id).await
+	list_contacts_inner(&app, tn_id, Some(ab_id), query).await
 }
 
 pub async fn list_all_contacts(
@@ -436,10 +413,9 @@ pub async fn list_all_contacts(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Query(query): Query<ListContactsQuery>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ContactListItem>>>)> {
-	list_contacts_inner(&app, tn_id, None, query, req_id).await
+	list_contacts_inner(&app, tn_id, None, query).await
 }
 
 pub async fn get_contact(
@@ -447,7 +423,6 @@ pub async fn get_contact(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path((ab_id, uid)): Path<(u64, String)>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ContactOutput>>)> {
 	let stored = app.meta_adapter.get_contact(tn_id, ab_id, &uid).await?.ok_or(Error::NotFound)?;
@@ -456,10 +431,7 @@ pub async fn get_contact(
 		resolve_overlays(&app, tn_id, stored.extracted.profile_id_tag.as_deref()).await?;
 	let out = contact_row_to_output(&stored, &overlays);
 
-	let mut resp = ApiResponse::new(out);
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(out);
 	Ok((StatusCode::OK, Json(resp)))
 }
 
@@ -468,17 +440,13 @@ pub async fn create_contact(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path(ab_id): Path<u64>,
 	Json(body): Json<ContactInput>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ContactOutput>>)> {
 	// Address book must exist.
 	app.meta_adapter.get_address_book(tn_id, ab_id).await?.ok_or(Error::NotFound)?;
 	let out = write_contact(&app, tn_id, ab_id, body).await?;
-	let mut resp = ApiResponse::new(out);
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(out);
 	Ok((StatusCode::CREATED, Json(resp)))
 }
 
@@ -487,17 +455,13 @@ pub async fn put_contact(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path((ab_id, uid)): Path<(u64, String)>,
 	Json(mut body): Json<ContactInput>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ContactOutput>>)> {
 	app.meta_adapter.get_address_book(tn_id, ab_id).await?.ok_or(Error::NotFound)?;
 	body.uid = Some(uid);
 	let out = write_contact(&app, tn_id, ab_id, body).await?;
-	let mut resp = ApiResponse::new(out);
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(out);
 	Ok((StatusCode::OK, Json(resp)))
 }
 
@@ -506,7 +470,6 @@ pub async fn patch_contact(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path((ab_id, uid)): Path<(u64, String)>,
 	Json(patch): Json<ContactPatch>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ContactOutput>>)> {
@@ -517,10 +480,7 @@ pub async fn patch_contact(
 	merged.uid = Some(stored.uid.to_string());
 
 	let out = write_contact(&app, tn_id, ab_id, merged).await?;
-	let mut resp = ApiResponse::new(out);
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(out);
 	Ok((StatusCode::OK, Json(resp)))
 }
 
@@ -530,11 +490,9 @@ pub async fn delete_contact(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path((ab_id, uid)): Path<(u64, String)>,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	app.meta_adapter.delete_contact(tn_id, ab_id, &uid).await?;
-	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
 /// POST /api/address-books/{ab_id}/import?conflict=skip|replace|add
@@ -554,7 +512,6 @@ pub async fn import_contacts(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path(ab_id): Path<u64>,
 	Query(query): Query<ImportContactsQuery>,
 	body: String,
@@ -634,10 +591,7 @@ pub async fn import_contacts(
 		}
 	}
 
-	let mut resp = ApiResponse::new(result);
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(result);
 	Ok((StatusCode::OK, Json(resp)))
 }
 

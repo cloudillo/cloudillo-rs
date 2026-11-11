@@ -9,6 +9,7 @@ use std::sync::Arc;
 use cloudillo_types::{
 	auth_adapter::{ApiKeyInfo, ApiKeyValidation, CreateApiKeyOptions, CreatedApiKey},
 	prelude::*,
+	types::ApiTime,
 	worker::WorkerPool,
 };
 
@@ -206,9 +207,9 @@ pub async fn list_api_keys(db: &SqlitePool, tn_id: TnId) -> ClResult<Vec<ApiKeyI
 				key_prefix: key_prefix.into(),
 				name: name.map(Into::into),
 				scopes: scopes.map(Into::into),
-				expires_at: expires_at.map(Timestamp),
-				last_used_at: last_used_at.map(Timestamp),
-				created_at: Timestamp(created_at),
+				expires_at: expires_at.map(ApiTime),
+				last_used_at: last_used_at.map(ApiTime),
+				created_at: ApiTime(created_at),
 			}
 		})
 		.collect())
@@ -238,9 +239,9 @@ pub async fn read_api_key(db: &SqlitePool, tn_id: TnId, key_id: i64) -> ClResult
 		key_prefix: key_prefix.into(),
 		name: name.map(Into::into),
 		scopes: scopes.map(Into::into),
-		expires_at: expires_at.map(Timestamp),
-		last_used_at: last_used_at.map(Timestamp),
-		created_at: Timestamp(created_at),
+		expires_at: expires_at.map(ApiTime),
+		last_used_at: last_used_at.map(ApiTime),
+		created_at: ApiTime(created_at),
 	})
 }
 

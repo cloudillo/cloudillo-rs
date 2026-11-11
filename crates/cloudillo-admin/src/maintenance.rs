@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
 // SPDX-License-Identifier: MPL-2.0
 
-//! `POST /api/admin/db-maintenance` — running the nightly sweep by hand.
+//! `POST /api/admin/db/maintenance` — running the nightly sweep by hand.
 //!
 //! The work itself is [`DbMaintenanceTask`], which already runs on a cron; this
 //! only lets an admin trigger it without waiting for 04:20. Whole node, not per
@@ -33,7 +33,7 @@ pub struct DbMaintenanceResponse {
 	pub task_id: u64,
 }
 
-/// POST /api/admin/db-maintenance — compact the search index and reclaim space.
+/// POST /api/admin/db/maintenance — compact the search index and reclaim space.
 ///
 /// Scheduled rather than run inline: a VACUUM holds the single write connection
 /// and is proportional to the database, which would keep the request open for

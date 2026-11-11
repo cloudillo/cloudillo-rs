@@ -150,8 +150,8 @@ pub async fn handle_crdt_connection(
 ) {
 	let user_id = id_tag.as_deref().unwrap_or_default().to_owned();
 	// Generate unique connection ID
-	let conn_id =
-		cloudillo_types::utils::random_id().unwrap_or_else(|_| format!("conn-{}", now_timestamp()));
+	let conn_id = cloudillo_types::utils::random_id()
+		.unwrap_or_else(|_| format!("conn-{}", cloudillo_core::ws_broadcast::now_timestamp()));
 	info!("CRDT connection: {} / {} (tn_id={}, conn_id={})", user_id, doc_id, tn_id.0, conn_id);
 
 	// Get or create per-document state (broadcast channels + live Y.Doc).
@@ -1230,14 +1230,6 @@ async fn is_last_connection(doc_id: &str) -> bool {
 		info!("Doc {} not found in registry during cleanup check", doc_id);
 		false
 	}
-}
-
-/// Get current timestamp
-fn now_timestamp() -> u64 {
-	std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
-		.unwrap_or_default()
-		.as_secs()
 }
 
 /// Record file access with throttling (max once per TRACKING_THROTTLE_SECS)

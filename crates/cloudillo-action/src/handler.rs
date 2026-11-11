@@ -16,7 +16,7 @@ use cloudillo_types::utils::{decode_jwt_no_verify, normalize_id_tag};
 
 use cloudillo_core::{
 	IdTag,
-	extract::{Auth, OptionalAuth, OptionalRequestId},
+	extract::{Auth, OptionalAuth},
 	file_access,
 	rate_limit::RateLimitApi,
 	roles,
@@ -30,6 +30,7 @@ use crate::{
 	filter::filter_actions_by_visibility,
 	helpers,
 	prelude::*,
+	process::{check_supported, token_supported},
 	task::{self, ActionVerifierTask, CreateAction},
 };
 
@@ -38,9 +39,9 @@ pub async fn list_actions(
 	tn_id: TnId,
 	IdTag(tenant_id_tag): IdTag,
 	OptionalAuth(maybe_auth): OptionalAuth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Query(mut opts): Query<meta_adapter::ListActionOptions>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<meta_adapter::ActionView>>>)> {
+	opts.apply_include();
 	let is_tenant = maybe_auth
 		.as_ref()
 		.is_some_and(|a| cloudillo_core::abac::is_tenant_self(a, &tenant_id_tag));
@@ -87,11 +88,11 @@ pub async fn list_actions(
 		}
 		if status.is_empty() {
 			let response = if opts.count == Some(true) {
-				ApiResponse::with_count(0)
+				ApiResponse::count_only(0)
 			} else {
-				ApiResponse::with_cursor_pagination(Vec::new(), None, false)
+				ApiResponse::with_next(Vec::new(), None)
 			};
-			return Ok((StatusCode::OK, Json(response.with_req_id(req_id.unwrap_or_default()))));
+			return Ok((StatusCode::OK, Json(response)));
 		}
 		opts.status = Some(status);
 	}
@@ -185,35 +186,59 @@ pub async fn list_actions(
 		opts.rcpt_issuer = Some(tenant_id_tag.clone());
 	}
 
-	let limit = opts.limit.unwrap_or(20) as usize;
+	// Default 20, hard max 200; the adapter reads `opts.limit` and fetches one extra row.
+	let limit = opts.limit.unwrap_or(20).clamp(1, 200);
+	opts.limit = Some(limit);
+	let limit = limit as usize;
 	let sort_field = opts.sort.as_deref().unwrap_or("created");
 
-	// Aggregate-only path: return a COUNT(*) of matching rows. Runs the SQL
-	// visibility guard (`push_visibility_guard`, the query-level equivalent of
-	// `filter_actions_by_visibility` below) so it can't leak private aggregates on
-	// this guest route. Wire contract: a `count=true` response has an empty `data`
-	// array and surfaces the count only under `cursorPagination.count`.
+	// SQL visibility guard (`push_visibility_guard`, the query-level equivalent of
+	// `filter_actions_by_visibility` below) for both the count and the list, so neither a
+	// private aggregate nor a cursor anchored on a hidden row leaks on this guest route.
+	// Tenant/owner/leader sees everything; a viewer is guarded to what they may view;
+	// guest → Public only.
+	// Reused by the defense-in-depth filters below, which would otherwise look it up again.
+	let mut known_rel = None;
+	opts.visibility_guard = if is_tenant || is_leader {
+		types::Patch::Undefined
+	} else if is_authenticated {
+		opts.viewer_relation =
+			cloudillo_core::abac::subject_relation_to_tenant(&app, tn_id, subject_id_tag).await?;
+		known_rel = Some(opts.viewer_relation);
+		types::Patch::Value(subject_id_tag.to_string())
+	} else {
+		types::Patch::Null
+	};
+
+	// Aggregate-only path. Wire contract: a `count=true` response has an empty `data`
+	// array and surfaces the count only under the top-level `total`.
 	if opts.count == Some(true) {
-		// Tenant/owner sees everything (Owner level); everyone else is guarded to
-		// what they may view; guest → Public only.
-		opts.visibility_guard = if is_tenant || is_leader {
-			types::Patch::Undefined // tenant/owner/leader: sees everything
-		} else if is_authenticated {
-			opts.viewer_relation =
-				cloudillo_core::abac::subject_relation_to_tenant(&app, tn_id, subject_id_tag)
-					.await?;
-			types::Patch::Value(subject_id_tag.to_string())
-		} else {
-			types::Patch::Null // guest → only Public rows
-		};
 		let n = app.meta_adapter.count_actions(tn_id, &opts).await?;
-		return Ok((
-			StatusCode::OK,
-			Json(ApiResponse::with_count(n).with_req_id(req_id.unwrap_or_default())),
-		));
+		return Ok((StatusCode::OK, Json(ApiResponse::count_only(n))));
 	}
 
-	let actions = app.meta_adapter.list_actions(tn_id, &opts).await?;
+	let mut actions = app.meta_adapter.list_actions(tn_id, &opts).await?;
+
+	// More exists when the adapter returned its extra row. Decide it, and take the cursor
+	// anchor, on the raw rows: they are already SQL-guarded, and the defense-in-depth filter
+	// below may still drop rows, so judging by what survives it would end paging early.
+	let has_more = actions.len() > limit;
+	actions.truncate(limit);
+	// Build next cursor from the last raw row. The cursor's sort value must be the same
+	// column the keyset query orders by, so sort=received cursors carry received_at
+	// (falling back to created_at if a row has no received_at).
+	let next_cursor = match actions.last() {
+		Some(last) if has_more => {
+			let sort_ts = if sort_field == "received" {
+				last.received_at.map_or(last.created_at.0, |t| t.0)
+			} else {
+				last.created_at.0
+			};
+			let sort_value = serde_json::Value::Number(sort_ts.into());
+			Some(types::CursorData::new(sort_field, sort_value, &last.action_id).encode())
+		}
+		_ => None,
+	};
 
 	let mut filtered = if is_leader {
 		actions
@@ -224,18 +249,13 @@ pub async fn list_actions(
 			subject_id_tag,
 			is_authenticated,
 			&tenant_id_tag,
+			known_rel,
 			actions,
 		)
 		.await?
 	};
 
-	// Check if there are more results (we fetched limit+1)
-	let has_more = filtered.len() > limit;
-	if has_more {
-		filtered.truncate(limit);
-	}
-
-	// `includeSubject` embeds each subject as the adapter read it: hold it to a listed row's
+	// `include=subject` embeds each subject as the adapter read it: hold it to a listed row's
 	// read rules, or a public REPOST carries a post the caller cannot read.
 	if opts.include_subject == Some(true) {
 		let enterable = opts.enterable_channels.as_deref();
@@ -260,6 +280,7 @@ pub async fn list_actions(
 				subject_id_tag,
 				is_authenticated,
 				&tenant_id_tag,
+				known_rel,
 				subjects,
 			)
 			.await?
@@ -279,25 +300,7 @@ pub async fn list_actions(
 		filtered.iter_mut().for_each(strip_private);
 	}
 
-	// Build next cursor from last item. The cursor's sort value must be the same
-	// column the keyset query orders by, so sort=received cursors carry received_at
-	// (falling back to created_at if a row has no received_at).
-	let next_cursor = if has_more && !filtered.is_empty() {
-		let last = filtered.last().ok_or(Error::Internal("no last item".into()))?;
-		let sort_ts = if sort_field == "received" {
-			last.received_at.map_or(last.created_at.0, |t| t.0)
-		} else {
-			last.created_at.0
-		};
-		let sort_value = serde_json::Value::Number(sort_ts.into());
-		let cursor = types::CursorData::new(sort_field, sort_value, &last.action_id);
-		Some(cursor.encode())
-	} else {
-		None
-	};
-
-	let response = ApiResponse::with_cursor_pagination(filtered, next_cursor, has_more)
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::with_next(filtered, next_cursor);
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -329,30 +332,34 @@ fn decode_reader_cursor(cursor: &str) -> Option<(types::Timestamp, Box<str>, Box
 
 /// Query of `GET /api/reader-state`. `kind`: comma-separated kinds (`P:MSG,A:CONV`), absent =
 /// every kind; `sort`: only `lastAt` (the default); `limit`: 1..=200, default 50 (clamped);
-/// `cursor`: the previous page's `nextCursor`; `include`: `ref`, `last` (the `lastId` action).
+/// `cursor`: the previous page's `next`; `include`: `ref`, `last` (the `lastId` action).
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListReaderStateQuery {
-	kind: Option<String>,
+	#[serde(default, deserialize_with = "meta_adapter::deserialize_split")]
+	kind: Option<Vec<String>>,
 	sort: Option<String>,
 	limit: Option<u32>,
 	cursor: Option<String>,
-	include: Option<String>,
+	#[serde(default, deserialize_with = "meta_adapter::deserialize_split")]
+	include: Option<Vec<String>>,
 }
 
 /// One `GET /api/reader-state` row: the [`meta_adapter::ReaderState`] plus, for `P:*` rows
 /// with `include=ref`, the wire profile (the adapter embed itself is not serialized).
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReaderStateItem {
 	#[serde(flatten)]
 	state: meta_adapter::ReaderState,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	profile: Option<types::ProfileInfo>,
+	profile: Option<types::ProfileView>,
 }
 
 /// Wire form of a `P:*` row's `include=ref` profile. The owner's own view, so unfiltered;
 /// no `msgState`/`feedState` — the row itself is that state.
-fn reader_profile_info(p: meta_adapter::Profile<Box<str>>) -> types::ProfileInfo {
-	types::ProfileInfo {
+fn reader_profile_info(p: meta_adapter::Profile<Box<str>>) -> types::ProfileView {
+	types::ProfileView {
 		id_tag: p.id_tag.to_string(),
 		name: p.name.to_string(),
 		r#type: Some(p.typ.as_str().to_string()),
@@ -375,7 +382,6 @@ pub async fn list_reader_state(
 	tn_id: TnId,
 	Auth(auth): Auth,
 	IdTag(id_tag): IdTag,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Query(q): Query<ListReaderStateQuery>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ReaderStateItem>>>)> {
 	// Reader state is the tenant owner's alone, never federated.
@@ -385,21 +391,13 @@ pub async fn list_reader_state(
 	if q.sort.as_deref().is_some_and(|s| s != READER_CURSOR_SORT) {
 		return Err(Error::ValidationError("unknown sort".into()));
 	}
-	let list = |s: Option<&str>| -> Vec<String> {
-		s.unwrap_or_default()
-			.split(',')
-			.map(str::trim)
-			.filter(|t| !t.is_empty())
-			.map(Into::into)
-			.collect()
-	};
-	let kinds: Vec<Box<str>> = list(q.kind.as_deref()).into_iter().map(Into::into).collect();
+	let kinds: Vec<Box<str>> = q.kind.unwrap_or_default().into_iter().map(Into::into).collect();
 	if let Some(bad) = kinds.iter().find(|k| !valid_reader_kind(k)) {
 		return Err(Error::ValidationError(format!("invalid kind: {bad}")));
 	}
 	let mut include_ref = false;
 	let mut include_last = false;
-	for inc in list(q.include.as_deref()) {
+	for inc in q.include.unwrap_or_default() {
 		match inc.as_str() {
 			"ref" => include_ref = true,
 			"last" => include_last = true,
@@ -439,8 +437,7 @@ pub async fn list_reader_state(
 		})
 		.collect();
 
-	let response = ApiResponse::with_cursor_pagination(data, next_cursor, has_more)
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::with_next(data, next_cursor);
 	Ok((StatusCode::OK, Json(response)))
 }
 
@@ -448,7 +445,8 @@ pub async fn list_reader_state(
 /// thing; body [`meta_adapter::PatchReaderState`] (absent = unchanged, `null` = reset,
 /// `readAt` forward-only and not nullable). `kind` is `P:<TYPE>` (ref = a locally known
 /// profile idTag) or `A` / `A:<TYPE>` (ref = a local action id; the type always comes from
-/// the action row, a mismatching `A:<TYPE>` is a 400). 204; 400 bad kind / notify / body;
+/// the action row, a mismatching `A:<TYPE>` is a 400). 200 + the stored row as a
+/// [`ReaderStateItem`] (no `profile`); 400 bad kind / notify / body;
 /// 403 non-owner; 404 unknown ref. When `readAt` advances on `P:MSG` / `A:CONV` a read
 /// receipt goes out (the adapter already cleared `U` and recomputed `unread`).
 pub async fn patch_reader_state(
@@ -458,7 +456,7 @@ pub async fn patch_reader_state(
 	IdTag(id_tag): IdTag,
 	Path((kind, ref_)): Path<(String, String)>,
 	Json(body): Json<serde_json::Value>,
-) -> ClResult<StatusCode> {
+) -> ClResult<(StatusCode, Json<ApiResponse<ReaderStateItem>>)> {
 	if !cloudillo_core::abac::is_tenant_account(&auth, &id_tag) {
 		return Err(Error::PermissionDenied);
 	}
@@ -491,7 +489,12 @@ pub async fn patch_reader_state(
 			if kind == "A:CONV" { app.meta_adapter.get_action(tn_id, &ref_).await? } else { None };
 		send_read_receipt(&app, tn_id, &id_tag, &kind, &ref_, read_at, conv.as_ref()).await;
 	}
-	Ok(StatusCode::NO_CONTENT)
+	let state = app
+		.meta_adapter
+		.get_reader_state(tn_id, &kind, &ref_)
+		.await?
+		.ok_or(Error::NotFound)?;
+	Ok((StatusCode::OK, Json(ApiResponse::new(ReaderStateItem { state, profile: None }))))
 }
 
 /// After the owner's read watermark advanced, tell the other side — the DM
@@ -584,15 +587,30 @@ async fn check_attachments(
 	Ok(())
 }
 
+/// `POST /api/actions` body: [`CreateAction`] with `visibility` as a word (`direct` = none)
+/// and `flags` as an [`cloudillo_types::api_enums::ActionFlags`] object, converted to the
+/// stored chars before signing. `CreateAction`'s own serde stays char-based: scheduler
+/// payloads (`ActionCreatorTask`, `DraftPublishTask`) persist it.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateActionRequest {
+	#[serde(default, with = "cloudillo_types::api_enums::visibility::opt")]
+	pub visibility: Option<char>,
+	#[serde(default, with = "cloudillo_types::api_enums::flags::opt")]
+	pub flags: Option<Box<str>>,
+	#[serde(flatten)]
+	pub action: CreateAction,
+}
+
 #[axum::debug_handler]
 pub async fn post_action(
 	State(app): State<App>,
 	tn_id: TnId,
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
-	Json(mut action): Json<CreateAction>,
+	Json(req): Json<CreateActionRequest>,
 ) -> ClResult<axum::response::Response> {
+	let mut action = CreateAction { visibility: req.visibility, flags: req.flags, ..req.action };
 	// Defense-in-depth: apkg:publish scoped keys can only create APKG actions
 	if let Some(ref scope) = auth.scope
 		&& scope.as_ref() == "apkg:publish"
@@ -616,10 +634,19 @@ pub async fn post_action(
 		action.typ = "BDG".into();
 		action.sub_typ = sub_typ.clone().map(Into::into);
 	}
+	// Strict known-check: an unknown type or unlisted subtype is refused outright, never signed
+	// (a receiver would refuse it anyway, and `definition_for` would fall back to the base type).
+	let dsl = app.ext::<Arc<DslEngine>>()?;
+	let full = match &sub_typ {
+		Some(sub) => format!("{typ}:{sub}"),
+		None => typ.clone(),
+	};
+	if !dsl.is_known(&full) {
+		return Err(Error::Unsupported(format!("unknown action type: {}", full)));
+	}
 	// `server_emitted` types (PTNR, FSHR, STAT, IDP:REG, PRINVT, RCPT) come from hooks and dedicated
 	// endpoints, never a client's to sign as the tenant. An outbound hook cannot gate them: its
-	// `issuer` is the tenant. Unknown types fall through to validation.
-	let dsl = app.ext::<Arc<DslEngine>>()?;
+	// `issuer` is the tenant.
 	if dsl
 		.definition_for(&typ, sub_typ.as_deref())
 		.and_then(|d| d.behavior.server_emitted)
@@ -725,7 +752,7 @@ pub async fn post_action(
 	let action_id = task::create_action_as(&app, tn_id, &id_tag, &auth.id_tag, action).await?;
 	debug!("actionId {:?}", &action_id);
 	if ephemeral {
-		let response = ApiResponse::new(serde_json::json!({ "actionId": action_id }));
+		let response = ApiResponse::new(serde_json::json!({ "id": action_id }));
 		return Ok((StatusCode::ACCEPTED, Json(response)).into_response());
 	}
 
@@ -737,10 +764,7 @@ pub async fn post_action(
 		strip_private(&mut created);
 	}
 
-	let mut response = ApiResponse::new(created);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(created);
 
 	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
@@ -771,21 +795,23 @@ pub async fn post_inbox(
 	State(app): State<App>,
 	tn_id: TnId,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(inbox): Json<Inbox>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
-	// Pre-decode to check action type for PoW requirement
-	// This check happens here so the error is returned synchronously to the client
-	if let Ok(action_preview) = decode_jwt_no_verify::<ActionToken>(&inbox.token)
-		&& action_preview.t.starts_with("CONN")
-	{
+	let dsl = app.ext::<Arc<DslEngine>>()?;
+	// Pre-decode for the strict known-check and the PoW requirement, so both errors are returned
+	// synchronously to the client. Refusing unverified is safe: it only refuses, and nothing is
+	// stored or scheduled. An undecodable token falls through to the verifier's backstop.
+	if let Ok(action_preview) = decode_jwt_no_verify::<ActionToken>(&inbox.token) {
+		if let Err(e) = check_supported(dsl, &action_preview) {
+			debug!(issuer = %action_preview.iss, error = %e, "inbox: refusing unsupported action");
+			return Err(e);
+		}
 		// Check PoW requirement for CONN actions
-		if let Err(pow_err) = app.rate_limiter.verify_pow(&addr.ip(), &inbox.token) {
+		if action_preview.t.starts_with("CONN")
+			&& let Err(pow_err) = app.rate_limiter.verify_pow(&addr.ip(), &inbox.token)
+		{
 			debug!("CONN action from {} requires PoW: {:?}", action_preview.iss, pow_err);
-			return Err(Error::PreconditionRequired(format!(
-				"Proof of work required: {}",
-				pow_err
-			)));
+			return Err(pow_err.into());
 		}
 	}
 
@@ -810,6 +836,11 @@ pub async fn post_inbox(
 		}
 		for related_token in related_tokens {
 			let related_id = hash("a", related_token.as_bytes());
+			// An unknown or undecodable related token is dropped; the primary proceeds.
+			if !token_supported(dsl, &related_token) {
+				debug!(related_id = %related_id, "inbox: skipping unsupported related action");
+				continue;
+			}
 			debug!(
 				"Storing related action {} (waiting for {} verification)",
 				related_id, action_id
@@ -836,7 +867,7 @@ pub async fn post_inbox(
 	let task = ActionVerifierTask::new(tn_id, inbox.token.into(), client_address.clone());
 	let _task_id = app.scheduler.task(task).with_automatic_retry().await?;
 
-	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(());
 
 	Ok((StatusCode::CREATED, Json(response)))
 }
@@ -852,20 +883,24 @@ pub async fn post_inbox_sync(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	ConnectInfo(socket_addr): ConnectInfo<std::net::SocketAddr>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(inbox): Json<Inbox>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	use crate::process::process_inbound_action_token;
 
 	debug!("POST /api/inbox/sync - Processing synchronous action");
 
-	// Pre-decode to check action type for PoW requirement (same as post_inbox)
-	if let Ok(action_preview) = decode_jwt_no_verify::<ActionToken>(&inbox.token)
-		&& action_preview.t.starts_with("CONN")
-		&& let Err(pow_err) = app.rate_limiter.verify_pow(&socket_addr.ip(), &inbox.token)
-	{
-		debug!("CONN action from {} requires PoW: {:?}", action_preview.iss, pow_err);
-		return Err(Error::PreconditionRequired(format!("Proof of work required: {}", pow_err)));
+	// Pre-decode for the strict known-check and the PoW requirement (same as post_inbox)
+	if let Ok(action_preview) = decode_jwt_no_verify::<ActionToken>(&inbox.token) {
+		if let Err(e) = check_supported(app.ext::<Arc<DslEngine>>()?, &action_preview) {
+			debug!(issuer = %action_preview.iss, error = %e, "inbox/sync: refusing unsupported");
+			return Err(e);
+		}
+		if action_preview.t.starts_with("CONN")
+			&& let Err(pow_err) = app.rate_limiter.verify_pow(&socket_addr.ip(), &inbox.token)
+		{
+			debug!("CONN action from {} requires PoW: {:?}", action_preview.iss, pow_err);
+			return Err(pow_err.into());
+		}
 	}
 
 	// Create action ID from token hash
@@ -876,32 +911,38 @@ pub async fn post_inbox_sync(
 	let client_address = Some(socket_addr.ip().to_string());
 
 	// Process the action synchronously and get the hook result
-	let hook_result =
-		process_inbound_action_token(&app, tn_id, &action_id, &inbox.token, true, client_address)
-			.await
-			.map_err(|e| {
-				warn!(error = %e, "Failed to process synchronous action");
-				e
-			})?;
+	let hook_result = process_inbound_action_token(
+		&app,
+		tn_id,
+		&action_id,
+		&inbox.token,
+		true,
+		client_address,
+		crate::post_store::Origin::Live,
+	)
+	.await
+	.map_err(|e| {
+		warn!(error = %e, "Failed to process synchronous action");
+		e
+	})?;
 
 	// Extract the return value from the hook result (or empty object if no return value)
 	let response_data = hook_result.unwrap_or(serde_json::json!({}));
 
 	debug!("POST /api/inbox/sync - Synchronous action {} processed successfully", action_id);
 
-	let response = ApiResponse::new(response_data).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(response_data);
 
 	Ok((StatusCode::CREATED, Json(response)))
 }
 
-/// GET /api/actions/:action_id - Get a single action
+/// GET /api/actions/{id} - Get a single action
 pub async fn get_action_by_id(
 	State(app): State<App>,
 	tn_id: TnId,
 	IdTag(tenant_id_tag): IdTag,
 	OptionalAuth(maybe_auth): OptionalAuth,
 	Path(action_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
 	let action = app.meta_adapter.get_action(tn_id, &action_id).await?;
 	let is_account = maybe_auth
@@ -925,40 +966,36 @@ pub async fn get_action_by_id(
 			if !is_account {
 				strip_private(&mut a);
 			}
-			let response = ApiResponse::new(a).with_req_id(req_id.unwrap_or_default());
+			let response = ApiResponse::new(a);
 			Ok((StatusCode::OK, Json(response)))
 		}
 		None => Err(Error::NotFound),
 	}
 }
 
-/// DELETE /api/actions/:action_id - Delete action
+/// DELETE /api/actions/{id} - Delete action
 pub async fn delete_action(
 	State(app): State<App>,
 	tn_id: TnId,
 	Path(action_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	app.meta_adapter.delete_action(tn_id, &action_id).await?;
 	// Cheap; a deleted BDG must drop out of the cached /me.
 	app.profile_me.invalidate(tn_id);
 	cloudillo_core::search_index_action(&app, tn_id, &action_id);
 	info!("Deleted action {}", action_id);
 
-	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
-
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /api/actions/:action_id/accept - Accept an action
+/// POST /api/actions/{id}/accept - Accept an action
 pub async fn post_action_accept(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
 	IdTag(id_tag): IdTag,
 	Path(action_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	info!("User {} accepting action {}", auth.id_tag, action_id);
 
 	// Fetch the action from database
@@ -1076,9 +1113,7 @@ pub async fn post_action_accept(
 		"Action accepted"
 	);
 
-	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
-
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
 /// The groups whose knocks `id_tag` may see and resolve without being a tenant moderator: the
@@ -1106,15 +1141,14 @@ async fn moderated_groups(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<Vec<
 		.collect())
 }
 
-/// POST /api/actions/:action_id/reject - Reject an action
+/// POST /api/actions/{id}/reject - Reject an action
 pub async fn post_action_reject(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
 	IdTag(id_tag): IdTag,
 	Path(action_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	info!("User {} rejecting action {}", auth.id_tag, action_id);
 
 	// Fetch the action from database
@@ -1199,19 +1233,16 @@ pub async fn post_action_reject(
 		"Action rejected"
 	);
 
-	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
-
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /api/actions/:action_id/dismiss - Dismiss a notification
+/// POST /api/actions/{id}/dismiss - Dismiss a notification
 pub async fn post_action_dismiss(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
 	Path(action_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	let action = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
 	match action.status.as_deref().unwrap_or("") {
@@ -1237,10 +1268,10 @@ pub async fn post_action_dismiss(
 		"Action dismissed"
 	);
 
-	Ok((StatusCode::OK, Json(ApiResponse::new(()).with_req_id(req_id.unwrap_or_default()))))
+	Ok(StatusCode::NO_CONTENT)
 }
 
-/// Request body for PATCH /api/actions/:action_id.
+/// Request body for PATCH /api/actions/{id}.
 ///
 /// Allowed only for drafts (status `R`) and scheduled actions (status `S`).
 /// `publishAt` updates the scheduled publish time; the convention here is that
@@ -1249,29 +1280,43 @@ pub async fn post_action_dismiss(
 /// `publishAt` → `UpdateActionDataOptions::created_at`. State transitions
 /// (draft → scheduled/published) still go through POST /actions/:id/publish.
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PatchActionRequest {
-	#[serde(rename = "subType")]
-	pub sub_typ: Option<Box<str>>,
+	/// Must equal the stored subtype (`null` = none); it cannot change on a draft.
+	#[serde(default, rename = "subType")]
+	pub sub_typ: cloudillo_types::types::Patch<Box<str>>,
+	/// Not clearable through PATCH (`null` = no change).
 	pub content: Option<serde_json::Value>,
-	pub attachments: Option<Vec<Box<str>>>,
-	pub visibility: Option<char>,
-	pub flags: Option<Box<str>>,
-	pub x: Option<serde_json::Value>,
-	#[serde(rename = "publishAt")]
-	pub publish_at: Option<cloudillo_types::types::Timestamp>,
+	/// `null` clears the attachment list.
+	#[serde(default)]
+	pub attachments: cloudillo_types::types::Patch<Vec<Box<str>>>,
+	/// Visibility word; `null` / `"direct"` clears it to NULL (direct).
+	#[serde(
+		default,
+		deserialize_with = "cloudillo_types::api_enums::visibility::patch::deserialize"
+	)]
+	pub visibility: cloudillo_types::types::Patch<char>,
+	/// [`cloudillo_types::api_enums::ActionFlags`] object; `null` clears to the defaults.
+	#[serde(default, deserialize_with = "cloudillo_types::api_enums::flags::patch::deserialize")]
+	pub flags: cloudillo_types::types::Patch<String>,
+	/// Extensible metadata; `null` clears it.
+	#[serde(rename = "extra", default)]
+	pub x: cloudillo_types::types::Patch<serde_json::Value>,
+	/// Scheduled publish time; `null` is refused (the readers need a time).
+	#[serde(default)]
+	pub publish_at: cloudillo_types::types::Patch<cloudillo_types::types::ApiTime>,
 	/// Room of a root draft; `null` moves it back to the open floor.
 	#[serde(default)]
 	pub channel: cloudillo_types::types::Patch<String>,
 }
 
-/// PATCH /api/actions/:action_id - Update a draft action
+/// PATCH /api/actions/{id} - Update a draft action
 pub async fn patch_action(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
 	IdTag(id_tag): IdTag,
 	Path(action_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(mut req): Json<PatchActionRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
 	// Only drafts can be updated
@@ -1293,7 +1338,7 @@ pub async fn patch_action(
 		.sub_typ
 		.clone()
 		.or(helpers::extract_type_and_subtype(&action.typ).1.map(Into::into));
-	if req.sub_typ.is_some() && req.sub_typ != stored_sub {
+	if !req.sub_typ.is_undefined() && req.sub_typ.value() != stored_sub.as_ref() {
 		return Err(Error::ValidationError("subType cannot change on a draft".into()));
 	}
 	// Same rule as create: only a root takes an explicit room, and it must be enterable.
@@ -1315,15 +1360,17 @@ pub async fn patch_action(
 		.await?;
 	}
 
-	if let Some(file_ids) = req.attachments.as_mut() {
+	// `created_at` is read back as a plain timestamp; NULL would 500 every read of the draft.
+	if matches!(req.publish_at, cloudillo_types::types::Patch::Null) {
+		return Err(Error::ValidationError("publishAt cannot be cleared".into()));
+	}
+	if let cloudillo_types::types::Patch::Value(file_ids) = &mut req.attachments {
 		check_attachments(&app, tn_id, &auth, &id_tag, file_ids).await?;
 	}
 
 	// Build update options
 	let content_str = req.content.as_ref().and_then(|v| serde_json::to_string(v).ok());
-	let attachments_str = req
-		.attachments
-		.as_ref()
+	let attachments = std::mem::take(&mut req.attachments)
 		.map(|a| a.iter().map(AsRef::as_ref).collect::<Vec<&str>>().join(","));
 
 	let opts = meta_adapter::UpdateActionDataOptions {
@@ -1331,30 +1378,15 @@ pub async fn patch_action(
 			Some(s) => cloudillo_types::types::Patch::Value(s),
 			None => cloudillo_types::types::Patch::Undefined,
 		},
-		attachments: match attachments_str {
-			Some(s) => cloudillo_types::types::Patch::Value(s),
-			None => cloudillo_types::types::Patch::Undefined,
-		},
-		visibility: match req.visibility {
-			Some(v) => cloudillo_types::types::Patch::Value(v),
-			None => cloudillo_types::types::Patch::Undefined,
-		},
-		flags: match req.flags {
-			Some(ref f) => cloudillo_types::types::Patch::Value(f.to_string()),
-			None => cloudillo_types::types::Patch::Undefined,
-		},
-		x: match req.x {
-			Some(ref v) => cloudillo_types::types::Patch::Value(v.clone()),
-			None => cloudillo_types::types::Patch::Undefined,
-		},
+		attachments,
+		visibility: req.visibility,
+		flags: req.flags.clone(),
+		x: std::mem::take(&mut req.x),
 		// Scheduled-publish time is stored as `created_at` for actions in
 		// state R/S; this lets ComposePanel auto-save persist schedule edits
 		// without going through the publish endpoint.
 		// see actions.created_at: dual-purpose for status R/S — holds publish_at
-		created_at: match req.publish_at {
-			Some(ts) => cloudillo_types::types::Patch::Value(ts),
-			None => cloudillo_types::types::Patch::Undefined,
-		},
+		created_at: req.publish_at.map(Into::into),
 		channel: req.channel,
 		..Default::default()
 	};
@@ -1367,26 +1399,25 @@ pub async fn patch_action(
 	// Re-fetch the updated action
 	let updated = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
-	let response = ApiResponse::new(updated).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(updated);
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// Request body for POST /api/actions/:action_id/publish
+/// Request body for POST /api/actions/{id}/publish
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PublishDraftRequest {
 	/// Optional scheduled publish time. If set, the draft will be published at this time.
-	#[serde(rename = "publishAt")]
-	pub publish_at: Option<cloudillo_types::types::Timestamp>,
+	pub publish_at: Option<cloudillo_types::types::ApiTime>,
 }
 
-/// POST /api/actions/:action_id/publish - Publish a draft action
+/// POST /api/actions/{id}/publish - Publish a draft action
 pub async fn publish_draft(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
 	IdTag(id_tag): IdTag,
 	Path(action_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<PublishDraftRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
 	// Only drafts can be published
@@ -1427,7 +1458,7 @@ pub async fn publish_draft(
 		content: action.content.clone(),
 		attachments,
 		subject: action.subject.clone(),
-		expires_at: action.expires_at,
+		expires_at: action.expires_at.map(Into::into),
 		visibility: action.visibility,
 		flags: action.flags.clone(),
 		x: action.x.clone(),
@@ -1437,7 +1468,7 @@ pub async fn publish_draft(
 		channel: action.channel.clone(),
 	};
 
-	if let Some(publish_at) = req.publish_at {
+	if let Some(publish_at) = req.publish_at.map(cloudillo_types::types::Timestamp::from) {
 		// Scheduled publish: set status to 'S', update created_at, schedule DraftPublishTask
 		// Different scheduled_at ensures scheduler replaces the old task on reschedule
 		let opts = meta_adapter::UpdateActionDataOptions {
@@ -1495,18 +1526,17 @@ pub async fn publish_draft(
 	// Re-fetch the action (`get_action`: the list's draft guard would hide a scheduled 'S' row)
 	let result = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
-	let response = ApiResponse::new(result).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(result);
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// POST /api/actions/:action_id/cancel - Cancel a scheduled draft (back to draft status)
+/// POST /api/actions/{id}/cancel - Cancel a scheduled draft (back to draft status)
 pub async fn cancel_scheduled(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
 	IdTag(_id_tag): IdTag,
 	Path(action_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
 	// Only drafts can be cancelled
 	if !action_id.starts_with('@') {
@@ -1536,7 +1566,7 @@ pub async fn cancel_scheduled(
 	// Re-fetch the updated action
 	let updated = app.meta_adapter.get_action(tn_id, &action_id).await?.ok_or(Error::NotFound)?;
 
-	let response = ApiResponse::new(updated).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(updated);
 	Ok((StatusCode::OK, Json(response)))
 }
 
@@ -1553,10 +1583,11 @@ const HISTORY_SYNC_HARD_LIMIT: i64 = 100;
 
 /// Query parameters for GET /api/outbox
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OutboxQuery {
-	/// Earliest action timestamp (unix seconds). Caller-supplied lower bound;
+	/// Earliest action time (RFC 3339). Caller-supplied lower bound;
 	/// clamped at most to `now`. Workload control comes from the count cap.
-	pub since: Option<i64>,
+	pub created_after: Option<types::ApiTime>,
 	/// Maximum number of primary actions to return. Clamped to server's limit setting.
 	pub limit: Option<u32>,
 }
@@ -1737,6 +1768,7 @@ async fn find_tenant_aprv_token(
 		requester_id_tag,
 		true,
 		tenant_id_tag,
+		None,
 		aprvs,
 	)
 	.await
@@ -1883,7 +1915,6 @@ pub async fn get_outbox(
 	tn_id: TnId,
 	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Query(query): Query<OutboxQuery>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<OutboxResponse>>)> {
 	let requester = auth.id_tag.clone();
@@ -1894,9 +1925,9 @@ pub async fn get_outbox(
 
 	let now = Timestamp::now().0;
 	// The caller picks the age window; we only reject future timestamps. The
-	// count cap below bounds workload regardless of how far back `since`
+	// count cap below bounds workload regardless of how far back `createdAfter`
 	// reaches, so there's no need for a server-side floor.
-	let since_ts = query.since.map_or(0, |s| s.min(now));
+	let since_ts = query.created_after.map_or(0, |t| t.0.min(now));
 	// Caller-supplied `limit` is also clamped to the hard cap; missing or
 	// over-large values default to the (already-clamped) per-tenant cap.
 	let requested_limit = query.limit.map_or(limit_cap, i64::from);
@@ -1905,8 +1936,7 @@ pub async fn get_outbox(
 	// always succeeds; `unwrap_or(0)` is a clippy-clean unreachable fallback.
 	let effective_limit_u32: u32 = effective_limit.try_into().unwrap_or(0);
 	if effective_limit_u32 == 0 {
-		let response = ApiResponse::new(OutboxResponse { items: Vec::new() })
-			.with_req_id(req_id.unwrap_or_default());
+		let response = ApiResponse::new(OutboxResponse { items: Vec::new() });
 		return Ok((StatusCode::OK, Json(response)));
 	}
 
@@ -1940,8 +1970,7 @@ pub async fn get_outbox(
 	let dsl = app.ext::<Arc<DslEngine>>()?;
 	let primary_types = derive_primary_types(dsl.as_ref());
 	if primary_types.is_empty() {
-		let response = ApiResponse::new(OutboxResponse { items: Vec::new() })
-			.with_req_id(req_id.unwrap_or_default());
+		let response = ApiResponse::new(OutboxResponse { items: Vec::new() });
 		return Ok((StatusCode::OK, Json(response)));
 	}
 
@@ -1957,7 +1986,7 @@ pub async fn get_outbox(
 		typ: Some(primary_types),
 		status: Some(vec!["A".into()]),
 		audience: Some(tenant_id_tag.to_string()),
-		created_after: Some(Timestamp(since_ts)),
+		created_after: Some(types::ApiTime(since_ts)),
 		limit: Some(effective_limit_u32),
 		sort: Some("created".into()),
 		sort_dir: Some("desc".into()),
@@ -1969,9 +1998,16 @@ pub async fn get_outbox(
 	// rather than concluding "the tenant has no recent posts".
 	let primaries = app.meta_adapter.list_actions(tn_id, &opts).await?;
 
-	let mut primaries =
-		filter_actions_by_visibility(&app, tn_id, &requester, true, &tenant_id_tag, primaries)
-			.await?;
+	let mut primaries = filter_actions_by_visibility(
+		&app,
+		tn_id,
+		&requester,
+		true,
+		&tenant_id_tag,
+		None,
+		primaries,
+	)
+	.await?;
 	// Newest-first → chronological for the downstream loop. Reversing here
 	// (after visibility filtering) keeps the per-item APRV/STAT pairing tight.
 	primaries.reverse();
@@ -1987,12 +2023,11 @@ pub async fn get_outbox(
 		}
 	}
 
-	let response =
-		ApiResponse::new(OutboxResponse { items }).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(OutboxResponse { items });
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// Body for `POST /api/actions/verify`.
+/// Body for `POST /api/action-verifications`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VerifyTokensBody {
@@ -2043,7 +2078,7 @@ fn verify_status<T>(res: &ClResult<T>) -> &'static str {
 	}
 }
 
-/// `POST /api/actions/verify` — verify action tokens with this node's cached issuer keys.
+/// `POST /api/action-verifications` — verify action tokens with this node's cached issuer keys.
 ///
 /// Owner only: a key fetch spends this tenant's outbound budget. Without `sync`, only
 /// tokens from issuers already in the profile table are verified; the rest come back
@@ -2111,6 +2146,21 @@ mod verify_tests {
 		assert_eq!(verify_status::<()>(&Err(Error::PermissionDenied)), "invalid");
 		assert_eq!(verify_status::<()>(&Err(Error::ServiceUnavailable("x".into()))), "error");
 		assert_eq!(verify_status::<()>(&Err(Error::NotFound)), "error");
+	}
+
+	#[test]
+	fn publish_at_patch_shapes() -> Result<(), serde_json::Error> {
+		let p: PatchActionRequest = serde_json::from_str(r#"{"publishAt":null}"#)?;
+		assert!(matches!(p.publish_at, Patch::Null));
+		let p: PatchActionRequest = serde_json::from_str("{}")?;
+		assert!(matches!(p.publish_at, Patch::Undefined));
+		let p: PatchActionRequest =
+			serde_json::from_str(r#"{"publishAt":"2026-11-09T12:00:00Z"}"#)?;
+		assert!(
+			matches!(p.publish_at, Patch::Value(t) if t.to_iso_string() == "2026-11-09T12:00:00Z")
+		);
+		assert!(serde_json::from_str::<PatchActionRequest>(r#"{"publishAt":1700000000}"#).is_err());
+		Ok(())
 	}
 
 	#[test]

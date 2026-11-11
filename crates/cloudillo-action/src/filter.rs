@@ -20,12 +20,15 @@ use crate::prelude::*;
 /// - The subject's relationship **to this tenant** (`follower` = "they follow us", `connected`)
 /// - Whether the subject is in the audience (for Direct visibility)
 /// - Whether the subject subscribes to the action's container (visibility `S` or none)
+///
+/// `known_rel`: the subject's relation to this tenant, if the caller already loaded it.
 pub async fn filter_actions_by_visibility(
 	app: &App,
 	tn_id: TnId,
 	subject_id_tag: &str,
 	is_authenticated: bool,
 	tenant_id_tag: &str,
+	known_rel: Option<cloudillo_types::meta_adapter::ProfileRelation>,
 	actions: Vec<ActionView>,
 ) -> ClResult<Vec<ActionView>> {
 	// If no actions, return early
@@ -47,7 +50,9 @@ pub async fn filter_actions_by_visibility(
 	let needs_relation = actions
 		.iter()
 		.any(|a| visibility_needs_relation(VisibilityLevel::from_char(a.visibility)));
-	let rel = if needs_relation {
+	let rel = if let Some(rel) = known_rel {
+		rel
+	} else if needs_relation {
 		cloudillo_core::abac::subject_relation_to_tenant(app, tn_id, subject_id_tag).await?
 	} else {
 		cloudillo_types::meta_adapter::ProfileRelation::default()
@@ -206,7 +211,7 @@ pub(crate) async fn subject_has_peer_relation_to_tenant(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use cloudillo_types::meta_adapter::{ProfileInfo, ProfileRelation, ProfileType};
+	use cloudillo_types::meta_adapter::{ProfileRef, ProfileRelation, ProfileType};
 
 	fn action_view(
 		action_id: &str,
@@ -220,7 +225,7 @@ mod tests {
 			sub_typ: None,
 			parent_id: None,
 			root_id: root_id.map(Into::into),
-			issuer: ProfileInfo {
+			issuer: ProfileRef {
 				id_tag: "alice.example.com".into(),
 				name: "Alice".into(),
 				typ: ProfileType::Person,
@@ -232,7 +237,7 @@ mod tests {
 			subject: subject.map(Into::into),
 			subject_profile: None,
 			subject_action: None,
-			created_at: Timestamp(0),
+			created_at: Timestamp(0).into(),
 			received_at: None,
 			expires_at: None,
 			status: Some("A".into()),
@@ -244,6 +249,7 @@ mod tests {
 			hat: None,
 			channel: None,
 			token: None,
+			delivery_error: None,
 		}
 	}
 

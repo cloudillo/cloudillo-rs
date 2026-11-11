@@ -9,6 +9,7 @@
 use cloudillo_types::{
 	meta_adapter::{Channel, UpdateChannelData},
 	prelude::*,
+	types::ApiTime,
 };
 use sqlx::{Row, SqlitePool};
 
@@ -25,8 +26,8 @@ fn row_to_channel(row: &sqlx::sqlite::SqliteRow) -> Channel {
 		visibility: row.get::<Option<String>, _>("visibility").and_then(|s| s.chars().next()),
 		min_role: row.get::<Option<String>, _>("min_role").map(Into::into),
 		closed: row.get::<i64, _>("closed") != 0,
-		created_at: Timestamp(row.get::<i64, _>("created_at")),
-		updated_at: Timestamp(row.get::<i64, _>("updated_at")),
+		created_at: ApiTime(row.get::<i64, _>("created_at")),
+		updated_at: ApiTime(row.get::<i64, _>("updated_at")),
 	}
 }
 

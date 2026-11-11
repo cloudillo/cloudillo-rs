@@ -15,6 +15,7 @@ use crate::{
 	delivery::ActionDeliveryTask,
 	dsl::DslEngine,
 	native_hooks::ownership::owns_subject,
+	post_store::Effects,
 	prelude::*,
 	subject_ref::{SubjectRef, parse_subject_ref},
 };
@@ -44,7 +45,11 @@ pub async fn schedule_subscriber_fanout(
 	parent_id: Option<&str>,
 	subject: Option<&str>,
 	issuer: &str,
+	effects: Effects,
 ) -> ClResult<Vec<Box<str>>> {
+	if !effects.propagate {
+		return Ok(vec![]);
+	}
 	// No parent: only an action-typed subject can lead to a subscribable root.
 	let subject_action =
 		subject.filter(|s| matches!(parse_subject_ref(s), Some(SubjectRef::Action(_))));
@@ -267,7 +272,11 @@ pub async fn maybe_relay_child_to_subscribers(
 	app: &App,
 	tn_id: TnId,
 	action: &meta_adapter::Action<Box<str>>,
+	effects: Effects,
 ) -> ClResult<bool> {
+	if !effects.propagate {
+		return Ok(false);
+	}
 	// No parent and no action-typed subject → no subscribable container; skip the
 	// id-tag read and parent walk (the common POST/REACT/FLLW/... case).
 	if action.parent_id.is_none()

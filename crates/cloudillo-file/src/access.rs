@@ -32,12 +32,12 @@ use crate::prelude::*;
 use cloudillo_core::abac::VisibilityLevel;
 use cloudillo_core::channels::reader_enterable_channels;
 use cloudillo_core::dir_cache::DirCache;
-use cloudillo_core::extract::{IdTag, OptionalAuth, OptionalRequestId};
+use cloudillo_core::extract::{IdTag, OptionalAuth};
 use cloudillo_core::share_access::{ShareStanding, share_standing};
 use cloudillo_types::auth_adapter::AuthCtx;
 use cloudillo_types::hasher;
 use cloudillo_types::meta_adapter::{self, ListRefsOptions, SHARE_FILE_REF_TYPE, ShareEntry};
-use cloudillo_types::types::{AccessLevel, ApiResponse, TokenScope, serialize_timestamp_iso_opt};
+use cloudillo_types::types::{AccessLevel, ApiResponse, ApiTime, TokenScope};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -62,7 +62,7 @@ struct AccessOwner {
 #[serde(rename_all = "camelCase")]
 struct AccessAudience {
 	/// `owner` | `members` | `room` | `shared` | `public` | `verified` | `secondDegree` |
-	/// `followers` | `connections` | `subscribers`
+	/// `followers` | `connected` | `subscribed`
 	kind: &'static str,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	channel: Option<AccessChannel>,
@@ -95,13 +95,11 @@ struct AccessSource {
 #[serde(rename_all = "camelCase")]
 struct AccessPerson {
 	id_tag: Box<str>,
-	/// Share permission char `R|C|W|A`.
+	/// Share permission; stored char `R|C|W|A`, wire word via `api_enums::share_permission`.
+	#[serde(with = "cloudillo_types::api_enums::share_permission")]
 	permission: char,
-	#[serde(
-		skip_serializing_if = "Option::is_none",
-		serialize_with = "serialize_timestamp_iso_opt"
-	)]
-	expires_at: Option<Timestamp>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	expires_at: Option<ApiTime>,
 	inherited: bool,
 	/// Absent = direct.
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -124,11 +122,8 @@ struct AccessLink {
 	redacted: bool,
 	/// `read` | `comment` | `write` (a link never carries admin).
 	access_level: &'static str,
-	#[serde(
-		skip_serializing_if = "Option::is_none",
-		serialize_with = "serialize_timestamp_iso_opt"
-	)]
-	expires_at: Option<Timestamp>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	expires_at: Option<ApiTime>,
 	/// Absent = direct.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	inherited_from: Option<AccessSource>,
@@ -191,7 +186,6 @@ pub async fn get_file_access(
 	OptionalAuth(maybe_auth): OptionalAuth,
 	Extension(ResolvedEntry(file)): Extension<ResolvedEntry>,
 	Extension(ResolvedLevel(level)): Extension<ResolvedLevel>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<impl IntoResponse> {
 	let owner_tag: Box<str> = file
 		.owner
@@ -213,8 +207,7 @@ pub async fn get_file_access(
 		access_for_caller(&app, tn_id, &tenant_id_tag, maybe_auth.as_ref(), &file, owner, level)
 			.await?
 	};
-	let response = ApiResponse::new(access).with_req_id(req_id.unwrap_or_default());
-	Ok((StatusCode::OK, Json(response)))
+	Ok((StatusCode::OK, Json(ApiResponse::new(access))))
 }
 
 /// The access of `file` for any caller but a link guest.
@@ -254,15 +247,8 @@ async fn access_for_caller(
 	} else {
 		// Mirrored by `push_access_filter` (meta-adapter-sqlite); the access matrix
 		// `access_filter_agrees_with_access_endpoint` scenario checks the two agree.
-		let kind = match VisibilityLevel::from_char(file.visibility) {
-			VisibilityLevel::Public => "public",
-			VisibilityLevel::Verified => "verified",
-			VisibilityLevel::SecondDegree => "secondDegree",
-			VisibilityLevel::Follower => "followers",
-			VisibilityLevel::Connected => "connections",
-			VisibilityLevel::Subscribed => "subscribers",
-			// NULL / 'D': owner plus members (role holders), see `push_entry_gate`.
-			VisibilityLevel::Direct => {
+		let kind = match (VisibilityLevel::from_char(file.visibility), file.visibility) {
+			(VisibilityLevel::Direct, _) | (_, None) => {
 				let tenant = app.meta_adapter.read_tenant(tn_id).await?;
 				if matches!(tenant.typ, meta_adapter::ProfileType::Community) {
 					"members"
@@ -270,6 +256,7 @@ async fn access_for_caller(
 					"owner"
 				}
 			}
+			(_, Some(c)) => cloudillo_types::api_enums::visibility::to_word(c),
 		};
 		AccessAudience { kind, channel: None }
 	};
@@ -307,7 +294,7 @@ async fn access_for_caller(
 			}
 		}
 		// two queries per ancestor level; one recursive CTE if deep trees get slow.
-		let shares = app.meta_adapter.list_share_entries(tn_id, 'F', &entry_id).await?;
+		let shares = app.meta_adapter.list_share_entries(tn_id, 'F', &entry_id, None, None).await?;
 		let refs = app
 			.meta_adapter
 			.list_refs(
@@ -316,6 +303,7 @@ async fn access_for_caller(
 					typ: Some(SHARE_FILE_REF_TYPE.into()),
 					filter: Some("active".into()),
 					resource_id: Some(entry_id.to_string()),
+					..Default::default() // unbounded: the access check needs every link
 				},
 			)
 			.await?;

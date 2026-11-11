@@ -284,11 +284,11 @@ pub async fn action_levels(fx: &Fixture) -> Report {
 
 /// `/api/actions` parameters; `status=` names every status, hidden ones included.
 const ACTION_NARROWS: [&str; 6] = [
-	"status=A,C,D,N,V,F",
-	"includeTokens=true",
-	"includeSubject=true",
+	"status=active,confirmation,deleted,notification,verifying,failed",
+	"include=tokens",
+	"include=subject",
 	"visibility=P",
-	"visibility=D",
+	"visibility=followers",
 	"subscribed=true",
 ];
 /// `/api/files` parameters; `{host}` is the subject's host.
@@ -306,9 +306,9 @@ async fn check_narrows(
 ) {
 	let Ok(plain) = plain else { return };
 	let (base, id_key) = if op == Op::File(FileOp::List) {
-		("/api/files", "fileId")
+		("/api/files", "contentId")
 	} else {
-		("/api/actions", "actionId")
+		("/api/actions", "id")
 	};
 	for q in queries {
 		let q = q.replace("{host}", &s.host);

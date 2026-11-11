@@ -9,18 +9,18 @@ use axum::{
 	http::StatusCode,
 };
 use dashmap::{DashMap, mapref::entry::Entry};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use cloudillo_core::{
 	Auth, audit,
-	extract::{IdTag, OptionalRequestId},
+	extract::IdTag,
 	rate_limit::{PenaltyReason, RateLimitApi},
 };
 use cloudillo_types::{
-	auth_adapter::{AuditCategory, AuditEventRow, AuditQuery, AuthCtx},
-	types::{ApiResponse, SHARED_TN},
+	auth_adapter::{AuditCategory, AuditEventRow, AuthCtx},
+	types::{ApiResponse, CursorData, SHARED_TN},
 };
 
 use crate::prelude::*;
@@ -150,23 +150,10 @@ pub(crate) fn penalize(app: &App, addr: &SocketAddr) {
 	}
 }
 
-/// Query of `GET /api/auth/audit`. `from`/`to` are unix seconds (inclusive); `event` is a prefix.
-#[derive(Debug, Default, Deserialize)]
-pub struct AuditListQuery {
-	pub from: Option<i64>,
-	pub to: Option<i64>,
-	pub category: Option<String>,
-	pub event: Option<String>,
-	pub outcome: Option<String>,
-	pub limit: Option<u32>,
-	pub cursor: Option<i64>,
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditListRes {
 	pub events: Vec<AuditEventRow>,
-	pub next_cursor: Option<i64>,
 	pub global_categories: serde_json::Value,
 	pub tenant_categories: serde_json::Value,
 }
@@ -176,23 +163,12 @@ pub async fn get_audit(
 	State(app): State<App>,
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
-	Query(q): Query<AuditListQuery>,
-	OptionalRequestId(req_id): OptionalRequestId,
+	Query(q): Query<audit::AuditFilter>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<AuditListRes>>)> {
 	if !cloudillo_core::abac::is_tenant_account(&auth, &id_tag) {
 		return Err(Error::PermissionDenied);
 	}
-	let query = AuditQuery {
-		tn_id: Some(auth.tn_id),
-		from: q.from.map(Timestamp),
-		to: q.to.map(Timestamp),
-		category: audit::parse_category(q.category.as_deref())?,
-		event_prefix: q.event.map(Into::into),
-		actor: None,
-		outcome: q.outcome.map(Into::into),
-		limit: Some(audit::page_limit(q.limit)),
-		cursor: q.cursor,
-	};
+	let query = q.into_query(Some(auth.tn_id), None)?;
 	let (mut events, next_cursor) = audit::list_page(&app, query).await?;
 	// Admin rows tell the tenant who acted, not where the admin connects from.
 	for r in &mut events {
@@ -213,8 +189,9 @@ pub async fn get_audit(
 		.await
 		.unwrap_or_else(|_| empty());
 
-	let res = AuditListRes { events, next_cursor, global_categories, tenant_categories };
-	Ok((StatusCode::OK, Json(ApiResponse::new(res).with_req_id(req_id.unwrap_or_default()))))
+	let res = AuditListRes { events, global_categories, tenant_categories };
+	let next = next_cursor.map(|c| CursorData::int("audit", c));
+	Ok((StatusCode::OK, Json(ApiResponse::with_next(res, next))))
 }
 
 #[cfg(test)]

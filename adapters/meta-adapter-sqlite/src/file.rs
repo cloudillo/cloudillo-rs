@@ -11,16 +11,16 @@ use crate::utils::{Db, collect_res, map_res, parse_str_list, push_patch};
 use cloudillo_types::meta_adapter::{
 	BrokenReason, ContentInfo, CreateFile, CreatedFile, DeleteFileResult, FileId, FileResolution,
 	FileStatus, FileUserData, FileVariant, FileView, ListFileOptions, MANAGED_PARENT_ID,
-	MAX_PARENT_DEPTH, ProfileInfo, ProfileType, ROOT_PARENT_ID, SHARE_FILE_REF_TYPE,
+	MAX_PARENT_DEPTH, ProfileRef, ProfileType, ROOT_PARENT_ID, SHARE_FILE_REF_TYPE,
 	TRASH_PARENT_ID, UpdateFileOptions,
 };
-use cloudillo_types::prelude::*;
 use cloudillo_types::types::AccessLevel;
 use cloudillo_types::utils::normalize_id_tag;
+use cloudillo_types::{prelude::*, types::ApiTime};
 
-/// Build a ProfileInfo from raw SQL columns with the given prefix.
+/// Build a ProfileRef from raw SQL columns with the given prefix.
 /// Returns None if the id_tag column is NULL or empty (i.e. the LEFT JOIN didn't match).
-fn profile_from_row(row: &SqliteRow, prefix: &str) -> Option<ProfileInfo> {
+fn profile_from_row(row: &SqliteRow, prefix: &str) -> Option<ProfileRef> {
 	let id_tag: Box<str> = row
 		.try_get::<Box<str>, _>(&*format!("{prefix}id_tag"))
 		.ok()
@@ -32,7 +32,7 @@ fn profile_from_row(row: &SqliteRow, prefix: &str) -> Option<ProfileInfo> {
 		_ => ProfileType::Person,
 	};
 	let profile_pic: Option<Box<str>> = row.try_get(&*format!("{prefix}profile_pic")).ok();
-	Some(ProfileInfo { id_tag, name, typ, profile_pic })
+	Some(ProfileRef { id_tag, name, typ, profile_pic })
 }
 
 /// Map the on-disk `broken_reason` text to the typed enum. Unknown / NULL
@@ -49,22 +49,22 @@ fn parse_broken_reason(s: Option<&str>) -> Option<BrokenReason> {
 	}
 }
 
-/// Build a tag-only ProfileInfo for when the tag is set but no local profile exists.
-fn tag_only_profile(tag: &str) -> ProfileInfo {
-	ProfileInfo { id_tag: tag.into(), name: "".into(), typ: ProfileType::Person, profile_pic: None }
+/// Build a tag-only ProfileRef for when the tag is set but no local profile exists.
+fn tag_only_profile(tag: &str) -> ProfileRef {
+	ProfileRef { id_tag: tag.into(), name: "".into(), typ: ProfileType::Person, profile_pic: None }
 }
 
-/// Build the upstream ProfileInfo: upstream profile → upstream tag-only → None.
+/// Build the upstream ProfileRef: upstream profile → upstream tag-only → None.
 /// No tenant fallback — a NULL `upstream_tag` means the entry originates here.
-fn build_upstream_profile(row: &SqliteRow) -> Option<ProfileInfo> {
+fn build_upstream_profile(row: &SqliteRow) -> Option<ProfileRef> {
 	let upstream_tag: Option<Box<str>> = row.try_get("upstream_tag").ok().flatten();
 	profile_from_row(row, "upstream_").or_else(|| upstream_tag.as_deref().map(tag_only_profile))
 }
 
-/// Build the owner ProfileInfo with fallback chain:
+/// Build the owner ProfileRef with fallback chain:
 /// owner profile → tenant profile (when the owner IS the tenant, which has no `profiles` row
 /// of its own) → owner tag-only → tenant. A NULL `owner_tag` means the tenant owns the row.
-fn build_owner_profile(row: &SqliteRow) -> Option<ProfileInfo> {
+fn build_owner_profile(row: &SqliteRow) -> Option<ProfileRef> {
 	let owner_tag: Option<Box<str>> = row.try_get("owner_tag").ok().flatten();
 	let tn_id_tag: Option<Box<str>> = row.try_get("tn_id_tag").ok();
 	if let Some(p) = profile_from_row(row, "owner_") {
@@ -425,7 +425,7 @@ pub(crate) async fn list(
 				|| opts.starred == Some(true)
 				|| opts.opened_since.is_some())
 		{
-			// INNER JOIN when filtering by pinned/starred/openedSince (must have the data)
+			// INNER JOIN when filtering by pinned/starred/openedAfter (must have the data)
 			query.push(
 				" INNER JOIN file_user_data fud ON fud.tn_id=e.tn_id AND fud.e_id=e.e_id AND fud.id_tag=",
 			);
@@ -582,13 +582,6 @@ pub(crate) async fn list(
 		query.push(" AND f.root_id IS NULL");
 	}
 
-	if let Some(tag) = &opts.tag {
-		query
-			.push(" AND e.tags LIKE ")
-			.push_bind(format!("%{}%", crate::utils::escape_like(tag)))
-			.push(" ESCAPE '\\'");
-	}
-
 	if let Some(preset) = &opts.preset {
 		query.push(" AND COALESCE(f.preset, e.ref_preset)=").push_bind(preset.as_str());
 	}
@@ -597,7 +590,7 @@ pub(crate) async fn list(
 		&& !file_types.is_empty()
 	{
 		// Same `file_tp` as `FILE_VIEW_COLS` reports: a local folder has no `files` row, so a
-		// plain COALESCE is NULL for it and `fileTp=FLDR` would never match one.
+		// plain COALESCE is NULL for it and `type=FLDR` would never match one.
 		const FILE_TP: &str = "CASE WHEN e.ref_file_id IS NOT NULL THEN e.ref_file_tp \
 			WHEN e.f_id IS NULL THEN 'FLDR' ELSE f.file_tp END";
 		query.push(" AND (");
@@ -701,16 +694,10 @@ pub(crate) async fn list(
 		}
 	}
 
-	// Filter by hidden flag. `sweep_all` with no explicit `hidden` pushes nothing:
-	// a hidden file is a normal, indexable file a browse listing just does not show.
-	match opts.hidden {
-		Some(true) => {
-			query.push(" AND e.hidden = 1");
-		}
-		None if opts.sweep_all => {}
-		_ => {
-			query.push(" AND (e.hidden IS NULL OR e.hidden = 0)");
-		}
+	// Legacy hidden rows drop out of every listing but `sweep_all`: a hidden file is a normal,
+	// indexable file a browse listing just does not show.
+	if !opts.sweep_all {
+		query.push(" AND (e.hidden IS NULL OR e.hidden = 0)");
 	}
 
 	// Filter by pinned/starred (user-specific) — only valid when the
@@ -1965,8 +1952,8 @@ fn user_data_from_row(row: &SqliteRow) -> Option<FileUserData> {
 		return None;
 	}
 	Some(FileUserData {
-		accessed_at: accessed_at.map(Timestamp),
-		modified_at: modified_at.map(Timestamp),
+		accessed_at: accessed_at.map(ApiTime),
+		modified_at: modified_at.map(ApiTime),
 		pinned: pinned.unwrap_or(0) != 0,
 		starred: starred.unwrap_or(0) != 0,
 		access_level,
@@ -2014,9 +2001,9 @@ fn row_to_file_view(row: &SqliteRow, user_data: Option<FileUserData>) -> ClResul
 		content_type: row.try_get("content_type").ok().flatten(),
 		file_name: row.try_get("file_name").db()?,
 		file_tp: row.try_get("file_tp").ok().flatten(),
-		created_at: row.try_get::<i64, _>("created_at").map(Timestamp).db()?,
-		accessed_at: accessed_at.map(Timestamp),
-		modified_at: modified_at.map(Timestamp),
+		created_at: row.try_get::<i64, _>("created_at").map(ApiTime).db()?,
+		accessed_at: accessed_at.map(ApiTime),
+		modified_at: modified_at.map(ApiTime),
 		status,
 		tags,
 		visibility,
@@ -2027,7 +2014,7 @@ fn row_to_file_view(row: &SqliteRow, user_data: Option<FileUserData>) -> ClResul
 		x,
 		parent_name: None, // Filled in by handler when with_parent=true
 		path: None,        // Filled in by handler when with_path=true
-		broken_at: broken_at.map(Timestamp),
+		broken_at: broken_at.map(ApiTime),
 		broken_reason,
 	})
 }
@@ -2639,7 +2626,7 @@ mod tests {
 		ShareSetReader, TRASH_PARENT_ID,
 	};
 	use cloudillo_types::prelude::TnId;
-	use cloudillo_types::types::Timestamp;
+	use cloudillo_types::types::ApiTime;
 	use sqlx::Row;
 	use sqlx::sqlite::{self, SqlitePool};
 
@@ -2928,7 +2915,7 @@ mod tests {
 	async fn list_access() {
 		let s = seed().await;
 		// Exposure, each value and an OR of two.
-		// Subscribed counts as network, like `/access`'s `subscribers`.
+		// Subscribed counts as network, like `/access`'s `subscribed`.
 		make_entry(&s.db, "fs", false, None, &[], Some('S')).await;
 		// Direct is stored NULL (A) or 'D' (fb); B and fa are exposed by a live link / share.
 		assert_eq!(names(&s.db, &access(&["private"])).await, ["A", "fb"]);
@@ -2971,7 +2958,7 @@ mod tests {
 	#[tokio::test]
 	async fn list_opened_since() {
 		let s = seed().await;
-		// openedSince: the calling user's own `accessed_at`; no caller matches nothing.
+		// openedAfter: the calling user's own `accessed_at`; no caller matches nothing.
 		for (entry, at) in [(&s.fa, 1000_i64), (&s.fb, 3000)] {
 			sqlx::query(
 				"INSERT INTO file_user_data (tn_id, id_tag, e_id, accessed_at) \
@@ -2984,7 +2971,7 @@ mod tests {
 			.expect("file user data");
 		}
 		let mut opts = ListFileOptions {
-			opened_since: Some(Timestamp(2000)),
+			opened_since: Some(ApiTime(2000)),
 			user_id_tag: Some("owner.test".into()),
 			..Default::default()
 		};
@@ -3018,12 +3005,12 @@ mod tests {
 			.expect("modified_at");
 		}
 		let opts = ListFileOptions {
-			modified_after: Some(Timestamp(200)),
-			modified_before: Some(Timestamp(600)),
+			modified_after: Some(ApiTime(200)),
+			modified_before: Some(ApiTime(600)),
 			..Default::default()
 		};
 		assert_eq!(names(&s.db, &opts).await, ["fa", "fb"]);
-		let opts = ListFileOptions { modified_after: Some(Timestamp(1000)), ..Default::default() };
+		let opts = ListFileOptions { modified_after: Some(ApiTime(1000)), ..Default::default() };
 		assert_eq!(names(&s.db, &opts).await, ["A", "B"]);
 	}
 

@@ -15,7 +15,7 @@ use crate::audit::{penalize, record_auth, verify_own_password};
 use crate::totp;
 use cloudillo_core::{
 	ActionVerifyFn, Auth,
-	extract::{IdTag, OptionalAuth, OptionalRequestId},
+	extract::{IdTag, OptionalAuth},
 	profile_status::reactivate_suspended,
 	roles::{active_member_role, expand_roles, expand_roles_preserving_extras},
 	settings::SettingValue,
@@ -41,7 +41,7 @@ use crate::prelude::*;
 ///
 /// `cloudillo_core::request::create_proxy_token` mints them with 60s; the slack covers
 /// clock skew between federated servers. See the `t == "PROXY"` gate in
-/// [`get_access_token`].
+/// [`post_access_token`].
 const PROXY_TOKEN_MAX_LIFETIME: i64 = 300;
 
 /// # Login
@@ -73,7 +73,6 @@ pub struct IdTagRes {
 
 pub async fn get_id_tag(
 	State(app): State<App>,
-	OptionalRequestId(_req_id): OptionalRequestId,
 	req: axum::http::Request<axum::body::Body>,
 ) -> ClResult<(StatusCode, Json<IdTagRes>)> {
 	let host = req
@@ -87,6 +86,7 @@ pub async fn get_id_tag(
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TenantDomainQuery {
 	domain: String,
 }
@@ -159,7 +159,6 @@ pub enum LoginRes {
 pub async fn post_login(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(login): Json<LoginReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<LoginRes>>)> {
 	let auth = app.auth_adapter.check_tenant_password(&login.id_tag, &login.password).await;
@@ -169,8 +168,7 @@ pub async fn post_login(
 		// Password is right but MFA applies: drop the token just minted; the session is
 		// minted in `post_login_mfa` once the code checks out.
 		if let Some(challenge) = totp::login_challenge(&app, tn_id, &actor).await? {
-			let response =
-				ApiResponse::new(LoginRes::Mfa(challenge)).with_req_id(req_id.unwrap_or_default());
+			let response = ApiResponse::new(LoginRes::Mfa(challenge));
 			return Ok((StatusCode::OK, Json(response)));
 		}
 		let (_status, Json(mut login_data)) = return_login(&app, auth).await?;
@@ -189,8 +187,7 @@ pub async fn post_login(
 			login_data.api_key =
 				crate::api_key::mint_remember_key(&app, &addr, tn_id, &actor, name).await;
 		}
-		let response =
-			ApiResponse::new(LoginRes::Login(login_data)).with_req_id(req_id.unwrap_or_default());
+		let response = ApiResponse::new(LoginRes::Login(login_data));
 		Ok((StatusCode::OK, Json(response)))
 	} else {
 		// Penalize rate limit for failed login attempt
@@ -200,7 +197,7 @@ pub async fn post_login(
 		crate::audit::record_auth_fail(&app, "auth.login", tn_id, &login.id_tag, &addr, details)
 			.await;
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-		Err(Error::PermissionDenied)
+		Err(Error::BadPassword)
 	}
 }
 
@@ -223,7 +220,6 @@ pub struct LoginMfaReq {
 pub async fn post_login_mfa(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<LoginMfaReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Login>>)> {
 	let store = app.ext::<totp::MfaStore>()?;
@@ -282,14 +278,14 @@ pub async fn post_login_mfa(
 		login_data.api_key =
 			crate::api_key::mint_remember_key(&app, &addr, tn_id, &id_tag, name).await;
 	}
-	let response = ApiResponse::new(login_data).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(login_data);
 	Ok((StatusCode::OK, Json(response)))
 }
 
 /// Absolute session lifetime: refuse to extend a session that began more than the tenant's
 /// `auth.session_timeout` seconds ago. Every path that mints a fresh session from a presented
-/// one (`get_login_token`, `post_login_init`, the session, `via` and hatted branches of
-/// `get_access_token`, `get_proxy_token`, QR approval) calls this
+/// one (`post_session_renew`, the session, `via` and hatted branches of
+/// `post_access_token`, `post_proxy_token`, QR approval) calls this
 /// with `AuthCtx::auth_time` and copies it forward.
 pub(crate) async fn check_session_age(
 	app: &App,
@@ -307,48 +303,40 @@ pub(crate) async fn check_session_age(
 	Ok(())
 }
 
-/// # GET /api/auth/login-token
-pub async fn get_login_token(
+/// # POST /api/auth/session/renew
+/// Trades the presented session for a fresh owner login. No body; no session → 401.
+pub async fn post_session_renew(
 	State(app): State<App>,
 	IdTag(id_tag): IdTag,
 	OptionalAuth(auth): OptionalAuth,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<Option<Login>>>)> {
-	if let Some(auth) = auth {
-		// Only the account itself (or SADM) trades a session for an owner login. A share-link
-		// token's `id_tag` *is* the tenant (it is minted `sub: None`), so it would satisfy the
-		// host binding in `create_tenant_login` and trade a read-only file scope for an owner
-		// session; a role-less credential naming the tenant must not either. Denied at once.
-		if !cloudillo_core::abac::is_tenant_self(&auth, &id_tag) {
-			warn!(subject = %auth.id_tag, "login-token denied - not the account");
-			return Err(Error::PermissionDenied);
+) -> ClResult<(StatusCode, Json<ApiResponse<Login>>)> {
+	let auth = auth.ok_or(Error::Unauthorized)?;
+	// Only the account itself (or SADM) trades a session for an owner login. A share-link
+	// token's `id_tag` *is* the tenant (it is minted `sub: None`), so it would satisfy the
+	// host binding in `create_tenant_login` and trade a read-only file scope for an owner
+	// session; a role-less credential naming the tenant must not either. Denied at once.
+	if !cloudillo_core::abac::is_tenant_self(&auth, &id_tag) {
+		warn!(subject = %auth.id_tag, "session renew denied - not the account");
+		return Err(Error::PermissionDenied);
+	}
+	info!("session renew for {}", &auth.id_tag);
+	let auth_time = auth.auth_time.unwrap_or(Timestamp(0));
+	check_session_age(&app, auth.tn_id, auth_time).await?;
+	// A session whose `id_tag` is not this host's tenant fails the adapter's host binding.
+	// Tokens here are bearer-only and stored per origin, so an ordinary same-origin session
+	// cannot produce that mismatch — it means a credential minted elsewhere is being
+	// presented. Denied outright, with the delay kept as an anti-enumeration measure for
+	// the adapter's other failure modes (absent or disabled tenant).
+	match app.auth_adapter.create_tenant_login(&auth.id_tag, &id_tag, auth_time).await {
+		Ok(auth_login) => {
+			let (_status, Json(login_data)) = return_login(&app, auth_login).await?;
+			Ok((StatusCode::OK, Json(ApiResponse::new(login_data))))
 		}
-		info!("login-token for {}", &auth.id_tag);
-		let auth_time = auth.auth_time.unwrap_or(Timestamp(0));
-		check_session_age(&app, auth.tn_id, auth_time).await?;
-		// A session whose `id_tag` is not this host's tenant fails the adapter's host binding.
-		// Tokens here are bearer-only and stored per origin, so an ordinary same-origin session
-		// cannot produce that mismatch — it means a credential minted elsewhere is being
-		// presented. Denied outright, with the delay kept as an anti-enumeration measure for
-		// the adapter's other failure modes (absent or disabled tenant).
-		match app.auth_adapter.create_tenant_login(&auth.id_tag, &id_tag, auth_time).await {
-			Ok(auth_login) => {
-				let (_status, Json(login_data)) = return_login(&app, auth_login).await?;
-				let response =
-					ApiResponse::new(Some(login_data)).with_req_id(req_id.unwrap_or_default());
-				Ok((StatusCode::OK, Json(response)))
-			}
-			Err(e) => {
-				warn!(subject = %auth.id_tag, host = %id_tag, error = %e, "login-token denied");
-				tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-				Err(Error::PermissionDenied)
-			}
+		Err(e) => {
+			warn!(subject = %auth.id_tag, host = %id_tag, error = %e, "session renew denied");
+			tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+			Err(Error::PermissionDenied)
 		}
-	} else {
-		// No authentication - return empty result
-		info!("login-token called without authentication");
-		let response = ApiResponse::new(None).with_req_id(req_id.unwrap_or_default());
-		Ok((StatusCode::OK, Json(response)))
 	}
 }
 
@@ -365,9 +353,8 @@ pub async fn post_logout(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<LogoutReq>,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	// Note: Token invalidation could be implemented with a token blacklist table
 	// For now, tokens remain valid until expiration (short-lived access tokens)
 
@@ -398,9 +385,7 @@ pub async fn post_logout(
 	info!("User {} logged out", auth.id_tag);
 	record_auth(&app, "auth.logout", "success", Some(auth.tn_id), &auth.id_tag, &addr, None).await;
 
-	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
-
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
 /// # POST /api/auth/password
@@ -416,9 +401,8 @@ pub async fn post_password(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<PasswordReq>,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	// Validate new password strength
 	if req.new_password.trim().is_empty() {
 		return Err(Error::ValidationError("Password cannot be empty or only whitespace".into()));
@@ -452,22 +436,19 @@ pub async fn post_password(
 
 	info!("User {} successfully changed their password", auth.id_tag);
 
-	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
-
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
-/// # GET /api/auth/access-token
-/// Gets an access token for a subject.
-/// Can be called with either:
-/// 1. A token query parameter (action token to exchange)
-/// 2. A refId query parameter (share link to exchange for scoped token)
-/// 3. An apiKey query parameter (API key to exchange for access token)
-/// 4. A via parameter (cross-document link: get token for target file via source file)
-/// 5. Just subject parameter (uses authenticated session)
-#[derive(Deserialize)]
-pub struct GetAccessTokenQuery {
-	#[serde(default)]
+/// # POST /api/auth/access-token
+/// Gets an access token. Every credential rides in the JSON body; the body may be omitted
+/// (no `Content-Type`) for the bare session mode. Modes:
+/// 1. `token` (action token to exchange)
+/// 2. `refId` (share link to exchange for a scoped token; consumes a use unless `refresh`)
+/// 3. `apiKey` (API key to exchange for an access token)
+/// 4. `via` (cross-document link: get token for target file via source file; bearer session)
+/// 5. none of the above (re-mint from the `Authorization` bearer session, optional `scope`)
+#[derive(Deserialize, Default)]
+pub struct AccessTokenReq {
 	token: Option<String>,
 	scope: Option<String>,
 	/// Share link ref_id to exchange for a scoped access token
@@ -477,18 +458,17 @@ pub struct GetAccessTokenQuery {
 	#[serde(rename = "apiKey")]
 	api_key: Option<String>,
 	/// If true with refId, use validate_ref instead of use_ref (for token refresh)
-	#[serde(default)]
 	refresh: Option<bool>,
 	/// Source file_id for cross-document link access (requires scope param with target file)
 	via: Option<String>,
-	/// Hat endorsement (an `APRV` from the hat community, see [`get_hat_endorse`]). Only
+	/// Hat endorsement (an `APRV` from the hat community, see [`post_hat_endorse`]). Only
 	/// with `token`; the session then carries the mapped role and `h`.
 	hat: Option<String>,
 }
 
 /// `hat=` rides only on a bare PROXY exchange: combined with any other mode it would mean a
 /// hatted session that is also scoped, share-linked or API-keyed, which nothing defines.
-fn hat_params_valid(query: &GetAccessTokenQuery) -> bool {
+fn hat_params_valid(query: &AccessTokenReq) -> bool {
 	query.hat.is_none()
 		|| (query.token.is_some()
 			&& query.scope.is_none()
@@ -540,7 +520,7 @@ fn check_session_hat(
 	}
 }
 
-/// The `sub` a *derived* token (`?via=` cross-document link) should carry.
+/// The `sub` a *derived* token (`via` cross-document link) should carry.
 ///
 /// A derived token inherits the caller's identity, because the caller is the person who
 /// will be editing the embedded document. It carries none only when the caller has none
@@ -548,7 +528,7 @@ fn check_session_hat(
 /// owner by `iss` fallback and must never be asserted as a person.
 ///
 /// Keyed on [`auth_adapter::AuthCtx::anonymous`], NOT on `scope`: a `file:`-scoped token
-/// minted for a signed-in user names a real person, and chaining a second `?via=` hop
+/// minted for a signed-in user names a real person, and chaining a second `via` hop
 /// must not silently demote them to a guest. The token's *authority* is unaffected
 /// either way — it comes from the freshly computed `file:` scope, and `r` is `None`.
 fn derived_sub(auth: &auth_adapter::AuthCtx) -> Option<&str> {
@@ -559,7 +539,7 @@ fn derived_sub(auth: &auth_adapter::AuthCtx) -> Option<&str> {
 ///
 /// **PROXY only.** PROXY is minted for exactly this exchange
 /// (`cloudillo_core::request::create_proxy_token`, 60s `exp`); every *other* action type is
-/// handed to third parties by design — `/api/actions?includeTokens=true` is unauthenticated,
+/// handed to third parties by design — `/api/actions?include=tokens` is unauthenticated,
 /// `/api/outbox` reaches any follower, CONV fan-out and roster backfill reach every member —
 /// so without this any signed action token naming this tenant in `aud` is a bearer credential
 /// minting a full-role session as its issuer.
@@ -671,7 +651,7 @@ fn normalized_dav_scope(requested: &str) -> Option<String> {
 ///
 /// Without this, `?scope=file:{id}:W` was a self-service capability mint: `file_access`'s scope
 /// short-circuit treats a matching file scope as *the* grant, on the assumption that only a server
-/// that checked the access ever minted one. Same `min()` cap as the `?via=` branch.
+/// that checked the access ever minted one. Same `min()` cap as the `via` branch.
 ///
 /// Every call site rejects a *scoped* caller before reaching here (the `auth.scope.is_some()` guard
 /// in the session branch, hatted or not; the federated branch authenticates with an action token,
@@ -801,16 +781,17 @@ fn verify_failure_is_401(e: Error) -> Error {
 	}
 }
 
-pub async fn get_access_token(
+pub async fn post_access_token(
 	State(app): State<App>,
 	tn_id: TnId,
 	id_tag: IdTag,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	OptionalAuth(maybe_auth): OptionalAuth,
-	Query(query): Query<GetAccessTokenQuery>,
-	OptionalRequestId(req_id): OptionalRequestId,
+	body: Option<Json<AccessTokenReq>>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	use tracing::warn;
+
+	let query = body.map(|Json(b)| b).unwrap_or_default();
 
 	debug!("Got access token request for id_tag={} with scope={:?}", id_tag.0, query.scope);
 
@@ -985,8 +966,7 @@ pub async fn get_access_token(
 			// Derived from the minted char, not recomputed: `scope_char_within` is the one
 			// place the cap lives, and `to_scope_char` already caps Admin at 'W'.
 			"accessLevel": AccessLevel::from_perm_char(scope_char).as_str(),
-		}))
-		.with_req_id(req_id.unwrap_or_default());
+		}));
 		return Ok((StatusCode::OK, Json(response)));
 	}
 
@@ -1157,7 +1137,7 @@ pub async fn get_access_token(
 			body["hat"] = json!(hat_tag);
 			body["role"] = json!(role);
 		}
-		let response = ApiResponse::new(body).with_req_id(req_id.unwrap_or_default());
+		let response = ApiResponse::new(body);
 		Ok((StatusCode::OK, Json(response)))
 	} else if let Some(ref_id) = query.ref_id {
 		// Exchange share link ref for scoped access token (no auth required)
@@ -1168,7 +1148,7 @@ pub async fn get_access_token(
 			warn!("Failed to resolve share-link ref: {}", e);
 			match e {
 				Error::NotFound => Error::ValidationError("Invalid or expired share link".into()),
-				Error::ValidationError(_) => e,
+				Error::ValidationError(_) | Error::RefExpired | Error::RefUsed => e,
 				_ => Error::ValidationError("Invalid share link".into()),
 			}
 		};
@@ -1239,7 +1219,7 @@ pub async fn get_access_token(
 		if let Some(ref params) = ref_data.params {
 			result["params"] = json!(params);
 		}
-		let response = ApiResponse::new(result).with_req_id(req_id.unwrap_or_default());
+		let response = ApiResponse::new(result);
 		Ok((StatusCode::OK, Json(response)))
 	} else if let Some(api_key) = query.api_key {
 		// Exchange API key for access token (no auth required)
@@ -1300,16 +1280,15 @@ pub async fn get_access_token(
 			id_tag.0, validation.id_tag, validation.scopes
 		);
 
-		let response = ApiResponse::new(json!({ "token": token_result }))
-			.with_req_id(req_id.unwrap_or_default());
+		let response = ApiResponse::new(json!({ "token": token_result }));
 		Ok((StatusCode::OK, Json(response)))
 	} else {
 		// Use authenticated session token - requires auth
 		let auth = maybe_auth.ok_or(Error::Unauthorized)?;
 
 		// A scoped token (e.g. a share link) must never mint a broader session token.
-		// Only this bare, param-less branch is closed: `?via=` (cross-document
-		// re-scoping) accepts a scoped bearer and `?refId=` needs no auth at all —
+		// Only this bare, param-less branch is closed: `via` (cross-document
+		// re-scoping) accepts a scoped bearer and `refId` needs no auth at all —
 		// which is why `cloudillo_core::scope` still allowlists this path for `file:*`.
 		if auth.scope.is_some() {
 			warn!("Scoped token attempted to mint an unscoped session token");
@@ -1352,8 +1331,7 @@ pub async fn get_access_token(
 				"Issued access token: id_tag={} sub={} scope={:?} hat={} via=hatted_session",
 				id_tag.0, auth.id_tag, scope, hat
 			);
-			let response = ApiResponse::new(json!({ "token": token_result }))
-				.with_req_id(req_id.unwrap_or_default());
+			let response = ApiResponse::new(json!({ "token": token_result }));
 			return Ok((StatusCode::OK, Json(response)));
 		}
 
@@ -1407,29 +1385,28 @@ pub async fn get_access_token(
 			"Issued access token: id_tag={} sub={} scope={:?} via=session",
 			id_tag.0, auth.id_tag, scope
 		);
-		let response = ApiResponse::new(json!({ "token": token_result }))
-			.with_req_id(req_id.unwrap_or_default());
+		let response = ApiResponse::new(json!({ "token": token_result }));
 		Ok((StatusCode::OK, Json(response)))
 	}
 }
 
-/// # GET /api/auth/hat-endorse
+/// # POST /api/auth/hat-endorse
+/// Body `{peer, token}`.
 /// Runs at the hat community: vouches, to `peer`, for the PROXY issuer's role here. The
 /// endorsement is a plain 60s `APRV` minted straight through the auth adapter and never
-/// stored — a credential for one `access-token?hat=` exchange, not an action.
+/// stored — a credential for one `access-token` `hat` exchange, not an action.
 #[derive(Deserialize)]
-pub struct HatEndorseQuery {
+pub struct HatEndorseReq {
 	peer: String,
 	token: String,
 }
 
-pub async fn get_hat_endorse(
+pub async fn post_hat_endorse(
 	State(app): State<App>,
 	tn_id: TnId,
 	id_tag: IdTag,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
-	Query(query): Query<HatEndorseQuery>,
-	OptionalRequestId(req_id): OptionalRequestId,
+	Json(query): Json<HatEndorseReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	let verify_fn = app.ext::<ActionVerifyFn>()?;
 	let proxy = verify_fn(&app, tn_id, &query.token, Some(&addr.ip()))
@@ -1486,8 +1463,7 @@ pub async fn get_hat_endorse(
 		"Issued hat endorsement: hat={} member={} peer={} role={}",
 		id_tag.0, proxy.iss, query.peer, role
 	);
-	let response =
-		ApiResponse::new(json!({ "token": token })).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(json!({ "token": token }));
 	Ok((StatusCode::OK, Json(response)))
 }
 
@@ -1507,9 +1483,9 @@ fn check_endorse_peer(peer: Option<(ProfileType, bool, Option<&str>)>, role: &st
 	Ok(())
 }
 
-/// # GET /api/auth/proxy-token
+/// # POST /api/auth/proxy-token
 /// Generate a proxy token for federation (allows this user to authenticate on behalf of the server)
-/// If `idTag` query parameter is provided and different from the current server, this will
+/// Body `{idTag?, hat?}`, may be omitted. If `idTag` is provided and different from the current server, this will
 /// perform a federated token exchange with the target server.
 #[skip_serializing_none]
 #[derive(Serialize)]
@@ -1517,14 +1493,14 @@ pub struct ProxyTokenRes {
 	token: String,
 	/// User's roles in this context (extracted from JWT for federated tokens)
 	roles: Option<Vec<String>>,
-	/// Hat community the session was entered with (`?hat=` only)
+	/// Hat community the session was entered with (`hat` only)
 	hat: Option<String>,
-	/// Local role the target mapped the hat to (`?hat=` only)
+	/// Local role the target mapped the hat to (`hat` only)
 	role: Option<String>,
 }
 
-#[derive(Deserialize)]
-pub struct ProxyTokenQuery {
+#[derive(Deserialize, Default)]
+pub struct ProxyTokenReq {
 	#[serde(rename = "idTag")]
 	id_tag: Option<String>,
 	/// Enter `idTag` wearing this community's hat (requires a federated `idTag`)
@@ -1547,9 +1523,10 @@ struct TokenData {
 /// short-lived endorsement, which a second PROXY presents at the target. Returns the target's
 /// access token and the local role it mapped the hat to.
 ///
-/// Errors keep the remote's status class (`request::get_bin`): 404 → `NotFound` (no
-/// role at the hat, or the hat's published map for the target skips it), 401/403 →
-/// `PermissionDenied`, anything else → `NetworkError`.
+/// Errors keep the remote's status class (`Request::post`, i.e. `error_for_status`): 404 →
+/// `NotFound` (no role at the hat, or the hat's published map for the target skips it),
+/// 401/403 → `PermissionDenied`, 429/503 → `ServiceUnavailable`, 400/413/422 →
+/// `ValidationError`, anything else → `NetworkError`.
 async fn hat_session(
 	app: &App,
 	tn_id: TnId,
@@ -1570,32 +1547,24 @@ async fn hat_session(
 	let proxy = mint_proxy(hat).await?;
 	let endorsement: TokenEnvelope = app
 		.request
-		.get_noauth(tn_id, hat, &format!("/auth/hat-endorse?peer={target}&token={proxy}"))
+		.post(tn_id, hat, "/auth/hat-endorse", &json!({ "peer": target, "token": proxy }))
 		.await?;
 	let hat_token = endorsement.data.token;
-	// Goes into the target's query string verbatim: only a JWT's base64url segments pass.
-	if !hat_token
-		.bytes()
-		.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-	{
-		warn!(hat = %hat, "Hat endorsement is not a JWT");
-		return Err(Error::PermissionDenied);
-	}
 	let proxy = mint_proxy(target).await?;
 	let session: TokenEnvelope = app
 		.request
-		.get_noauth(tn_id, target, &format!("/auth/access-token?token={proxy}&hat={hat_token}"))
+		.post(tn_id, target, "/auth/access-token", &json!({ "token": proxy, "hat": hat_token }))
 		.await?;
 	Ok((session.data.token, session.data.role))
 }
 
-pub async fn get_proxy_token(
+pub async fn post_proxy_token(
 	State(app): State<App>,
 	IdTag(own_id_tag): IdTag,
 	Auth(auth): Auth,
-	Query(query): Query<ProxyTokenQuery>,
-	OptionalRequestId(req_id): OptionalRequestId,
+	body: Option<Json<ProxyTokenReq>>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ProxyTokenRes>>)> {
+	let query = body.map(|Json(b)| b).unwrap_or_default();
 	// `scope::scope_permits` already keeps every delegated token off this route. Fail closed
 	// here as well, for both branches: a share-link token must never be able to renew itself
 	// past its link's revocation, and re-deriving roles below would hand it the tenant's own
@@ -1613,7 +1582,7 @@ pub async fn get_proxy_token(
 	let auth_time = auth.auth_time.unwrap_or(Timestamp(0));
 	check_session_age(&app, auth.tn_id, auth_time).await?;
 	if let Some(hat) = query.hat.as_deref() {
-		// Both go into a remote's query string, so they must be canonical id_tags.
+		// Both name remote hosts, so they must be canonical id_tags.
 		let bad_target = |t: &str| !validate_id_tag(t) || t == hat || t == own_id_tag.as_ref();
 		if !validate_id_tag(hat)
 			|| hat == own_id_tag.as_ref()
@@ -1655,10 +1624,7 @@ pub async fn get_proxy_token(
 		// Mint fresh on each call: clients want full TTL, cache is for server-to-server only.
 		let (token, role) = match query.hat.as_deref() {
 			Some(hat) => hat_session(&app, auth.tn_id, target_id_tag, hat).await?,
-			None => (
-				app.request.create_proxy_token(auth.tn_id, target_id_tag, None).await?.into(),
-				None,
-			),
+			None => (app.request.create_proxy_token(auth.tn_id, target_id_tag).await?.into(), None),
 		};
 
 		let roles: Option<Vec<String>> = match decode_jwt_no_verify::<AccessTokenClaims>(&token) {
@@ -1677,8 +1643,7 @@ pub async fn get_proxy_token(
 			own_id_tag, auth.id_tag, target_id_tag, query.hat
 		);
 		let response =
-			ApiResponse::new(ProxyTokenRes { token, roles, hat: query.hat.clone(), role })
-				.with_req_id(req_id.unwrap_or_default());
+			ApiResponse::new(ProxyTokenRes { token, roles, hat: query.hat.clone(), role });
 		return Ok((StatusCode::OK, Json(response)));
 	}
 
@@ -1714,13 +1679,12 @@ pub async fn get_proxy_token(
 		roles: Some(roles),
 		hat: None,
 		role: None,
-	})
-	.with_req_id(req_id.unwrap_or_default());
+	});
 
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// # POST /auth/set-password
+/// # POST /api/auth/password/set
 /// Set password using a reference (welcome or password reset)
 /// This endpoint is used during registration (welcome ref) and password reset flows.
 /// An account with TOTP set up must also send `code`: missing → 400 `mfa code required`,
@@ -1740,7 +1704,6 @@ pub async fn post_set_password(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	IdTag(host_id_tag): IdTag,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<SetPasswordReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<LoginRes>>)> {
 	// Validate new password strength
@@ -1763,7 +1726,7 @@ pub async fn post_set_password(
 			warn!("Failed to validate ref {}: {}", req.ref_id, e);
 			match e {
 				Error::NotFound => Error::ValidationError("Invalid or expired reference".into()),
-				Error::ValidationError(_) => e,
+				Error::ValidationError(_) | Error::RefExpired | Error::RefUsed => e,
 				_ => Error::ValidationError("Invalid reference".into()),
 			}
 		})?;
@@ -1772,7 +1735,7 @@ pub async fn post_set_password(
 	// tenant-agnostic, so without this a ref belonging to tenant A could be
 	// posted to tenant B's host and A's password would be changed (a
 	// cross-tenant write) before `create_tenant_login` below refused the
-	// session. Same check as the `?refId=` branch in `get_access_token`.
+	// session. Same check as the `refId` branch in `post_access_token`.
 	if id_tag.as_ref() != host_id_tag.as_ref() {
 		warn!(
 			ref_owner = %id_tag,
@@ -1849,7 +1812,7 @@ pub async fn post_set_password(
 			warn!("Failed to use ref {}: {}", req.ref_id, e);
 			match e {
 				Error::NotFound => Error::ValidationError("Invalid or expired reference".into()),
-				Error::ValidationError(_) => e,
+				Error::ValidationError(_) | Error::RefExpired | Error::RefUsed => e,
 				_ => Error::ValidationError("Invalid reference".into()),
 			}
 		})?;
@@ -1870,8 +1833,7 @@ pub async fn post_set_password(
 	if enrolled.is_none()
 		&& let Some(challenge) = totp::login_challenge(&app, tn_id, &id_tag).await?
 	{
-		let response =
-			ApiResponse::new(LoginRes::Mfa(challenge)).with_req_id(req_id.unwrap_or_default());
+		let response = ApiResponse::new(LoginRes::Mfa(challenge));
 		return Ok((StatusCode::OK, Json(response)));
 	}
 
@@ -1884,8 +1846,7 @@ pub async fn post_set_password(
 
 	// Return login info using the existing return_login helper
 	let (_status, Json(login_data)) = return_login(&app, auth).await?;
-	let response =
-		ApiResponse::new(LoginRes::Login(login_data)).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(LoginRes::Login(login_data));
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -1913,9 +1874,8 @@ pub async fn post_complete_onboarding(
 	State(app): State<App>,
 	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<CompleteOnboardingReq>,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	// The account itself, SADM excluded: no other session may retire its welcome link.
 	if !cloudillo_core::abac::is_tenant_account(&auth, &tenant_id_tag) {
 		warn!(caller = %auth.id_tag, "complete-onboarding: not the account itself");
@@ -1940,7 +1900,7 @@ pub async fn post_complete_onboarding(
 				info!(id_tag = %auth.id_tag, "Onboarding completed");
 			}
 		}
-		Err(Error::NotFound | Error::ValidationError(_)) => {
+		Err(Error::NotFound | Error::ValidationError(_) | Error::RefExpired | Error::RefUsed) => {
 			// Ref already consumed/expired — onboarding is effectively complete.
 			info!(
 				id_tag = %auth.id_tag,
@@ -1950,11 +1910,10 @@ pub async fn post_complete_onboarding(
 		Err(e) => return Err(e),
 	}
 
-	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
-/// # POST /api/auth/forgot-password
+/// # POST /api/auth/password/reset
 /// Request a password reset email (user-initiated)
 /// Always returns success to prevent email enumeration
 #[derive(Deserialize)]
@@ -1970,7 +1929,6 @@ pub struct ForgotPasswordRes {
 pub async fn post_forgot_password(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	id_tag_ext: Option<IdTag>,
 	Json(req): Json<ForgotPasswordReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ForgotPasswordRes>>)> {
@@ -1984,7 +1942,6 @@ pub async fn post_forgot_password(
 			message: "If an account with this email exists, a password reset link has been sent."
 				.to_string(),
 		})
-		.with_req_id(req_id.clone().unwrap_or_default())
 	};
 
 	// Basic email validation
@@ -2028,6 +1985,7 @@ pub async fn post_forgot_password(
 		typ: Some(PASSWORD_REF_TYPE.to_string()),
 		filter: Some("all".to_string()),
 		resource_id: None,
+		..Default::default() // unbounded: the rate limit counts every recent ref
 	};
 	let recent_refs = app.meta_adapter.list_refs(tn_id, &opts).await.unwrap_or_default();
 
@@ -2119,81 +2077,43 @@ pub async fn post_forgot_password(
 }
 
 // ============================================================================
-// POST /api/auth/login-init — Combined login initialization endpoint
+// POST /api/auth/login/init — unauthenticated login-page bootstrap
 // ============================================================================
 
+/// QR session, a "passkeys exist" flag (the challenge itself is minted at prompt time) and
+/// the masked email for forgot-password.
+#[skip_serializing_none]
 #[derive(Serialize)]
-#[serde(tag = "status")]
-pub enum LoginInitResponse {
-	#[serde(rename = "authenticated")]
-	Authenticated { login: Login },
-	#[serde(rename = "unauthenticated")]
-	Unauthenticated {
-		#[serde(rename = "qrLogin")]
-		qr_login: crate::qr_login::InitResponse,
-		#[serde(rename = "webAuthn")]
-		web_authn: bool,
-		#[serde(rename = "maskedEmail", skip_serializing_if = "Option::is_none")]
-		masked_email: Option<String>,
-	},
+#[serde(rename_all = "camelCase")]
+pub struct LoginInitResponse {
+	qr: crate::qr_login::InitResponse,
+	passkeys: bool,
+	masked_email: Option<String>,
 }
 
+/// An authenticated caller is refused with 400: renewing a session is
+/// `POST /api/auth/session/renew`, which is ban-enforced; this route is not.
 pub async fn post_login_init(
 	State(app): State<App>,
 	OptionalAuth(auth): OptionalAuth,
 	tn_id: TnId,
 	id_tag: IdTag,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	headers: HeaderMap,
 ) -> ClResult<(StatusCode, Json<ApiResponse<LoginInitResponse>>)> {
-	if let Some(auth) = auth {
-		// Same up-front account check as `get_login_token`.
-		if !cloudillo_core::abac::is_tenant_self(&auth, &id_tag.0) {
-			warn!(subject = %auth.id_tag, "login-init denied - not the account");
-			return Err(Error::PermissionDenied);
-		}
-		// Authenticated path: create fresh login token (replaces login-token)
-		info!("login-init for authenticated user {}", &auth.id_tag);
-		let auth_time = auth.auth_time.unwrap_or(Timestamp(0));
-		check_session_age(&app, tn_id, auth_time).await?;
-		// A host-binding miss is not a routine "no account here" — see `get_login_token`.
-		// This route sits in `recovery()`, where the IP ban is deliberately skipped, so it
-		// must not be the softer sibling: deny, and pay the same delay.
-		match app.auth_adapter.create_tenant_login(&auth.id_tag, &id_tag.0, auth_time).await {
-			Ok(auth_login) => {
-				let (_status, Json(login_data)) = return_login(&app, auth_login).await?;
-				let response =
-					ApiResponse::new(LoginInitResponse::Authenticated { login: login_data })
-						.with_req_id(req_id.unwrap_or_default());
-				Ok((StatusCode::OK, Json(response)))
-			}
-			Err(e) => {
-				warn!(subject = %auth.id_tag, host = %id_tag.0, error = %e, "login-init denied");
-				tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-				Err(Error::PermissionDenied)
-			}
-		}
-	} else {
-		// Unauthenticated path: QR init data + a "passkeys exist" flag (the challenge
-		// itself is minted at prompt time) + masked email for forgot-password
-		debug!("login-init for unauthenticated user");
-		let qr_result = crate::qr_login::create_session(&app, tn_id, &addr, &headers)?;
-		let wa_result = crate::webauthn::has_passkeys(&app, tn_id).await;
-
-		let masked_email = match app.auth_adapter.read_tenant(&id_tag.0).await {
-			Ok(profile) => profile.email.as_deref().and_then(cloudillo_types::utils::mask_email),
-			Err(_) => None,
-		};
-
-		let response = ApiResponse::new(LoginInitResponse::Unauthenticated {
-			qr_login: qr_result,
-			web_authn: wa_result,
-			masked_email,
-		})
-		.with_req_id(req_id.unwrap_or_default());
-		Ok((StatusCode::OK, Json(response)))
+	if auth.is_some() {
+		return Err(Error::ValidationError(
+			"already authenticated - use POST /api/auth/session/renew".into(),
+		));
 	}
+	let qr = crate::qr_login::create_session(&app, tn_id, &addr, &headers)?;
+	let passkeys = crate::webauthn::has_passkeys(&app, tn_id).await;
+	let masked_email = match app.auth_adapter.read_tenant(&id_tag.0).await {
+		Ok(profile) => profile.email.as_deref().and_then(cloudillo_types::utils::mask_email),
+		Err(_) => None,
+	};
+	let response = ApiResponse::new(LoginInitResponse { qr, passkeys, masked_email });
+	Ok((StatusCode::OK, Json(response)))
 }
 
 #[cfg(test)]
@@ -2246,7 +2166,7 @@ mod tests {
 	#[test]
 	fn derived_sub_keeps_a_scoped_signed_in_callers_identity() {
 		// Keying on `scope` instead would demote a signed-in user following a second
-		// `?via=` hop to a nameless guest — no awareness idTag, an `anon:` RTDB lock
+		// `via` hop to a nameless guest — no awareness idTag, an `anon:` RTDB lock
 		// owner, no `file_user_data` row.
 		assert_eq!(derived_sub(&auth_ctx(false, Some("file:f1~abc:W"))), Some("alice.example.com"));
 	}
@@ -2391,7 +2311,7 @@ mod tests {
 
 	#[test]
 	fn hat_rides_only_on_a_bare_proxy_exchange() {
-		let q = |token: bool, scope: bool| GetAccessTokenQuery {
+		let q = |token: bool, scope: bool| AccessTokenReq {
 			token: token.then(|| "t".into()),
 			scope: scope.then(|| "file:f1~x:R".into()),
 			ref_id: None,

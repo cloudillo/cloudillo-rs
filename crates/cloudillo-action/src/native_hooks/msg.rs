@@ -356,7 +356,7 @@ async fn update_conv_counters(
 		return Ok(HookResult::default());
 	}
 
-	emit_stat_for_subject(app, tn_id, &context.tenant_tag, parent_id).await;
+	emit_stat_for_subject(app, tn_id, &context.tenant_tag, parent_id, context.effects).await;
 
 	Ok(HookResult::default())
 }

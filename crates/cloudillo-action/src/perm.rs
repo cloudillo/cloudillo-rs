@@ -27,10 +27,11 @@ use crate::prelude::*;
 /// way a single-field `Path<String>` (a *sequence*) does.
 #[derive(Deserialize)]
 pub struct ActionIdParam {
+	#[serde(rename = "id")]
 	action_id: String,
 }
 
-/// The guard's path extraction, kept fallible: a route with no `{action_id}`
+/// The guard's path extraction, kept fallible: a route with no `{id}`
 /// capture gets a logged `PermissionDenied` rather than axum's bare 400 with the
 /// serde message in it.
 type ActionIdPath = Result<Path<ActionIdParam>, PathRejection>;
@@ -45,7 +46,7 @@ type ActionIdPath = Result<Path<ActionIdParam>, PathRejection>;
 /// # Returns
 /// A cloneable middleware function with return type `PermissionCheckOutput`
 ///
-/// The route must capture the action id as `{action_id}` — the guard reads it by
+/// The route must capture the action id as `{id}` — the guard reads it by
 /// name, not by position. Other captures are ignored.
 pub fn check_perm_action(
 	action: &'static str,
@@ -70,7 +71,7 @@ async fn check_action_permission(
 	use tracing::warn;
 
 	let Ok(Path(ActionIdParam { action_id })) = params else {
-		warn!("Action permission guard on a route with no {{action_id}} capture");
+		warn!("Action permission guard on a route with no {{id}} capture");
 		return Err(Error::PermissionDenied);
 	};
 

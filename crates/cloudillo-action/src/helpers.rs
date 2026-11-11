@@ -685,8 +685,8 @@ mod tests {
 			visibility: Some('F'),
 			min_role: min_role.map(Into::into),
 			closed,
-			created_at: Timestamp::now(),
-			updated_at: Timestamp::now(),
+			created_at: Timestamp::now().into(),
+			updated_at: Timestamp::now().into(),
 		}
 	}
 

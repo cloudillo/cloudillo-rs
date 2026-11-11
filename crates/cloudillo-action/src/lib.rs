@@ -26,6 +26,7 @@ mod prelude;
 
 pub use cloudillo_types::action_types::status;
 pub use key_cache::KeyFetchCache;
+pub use post_store::{Effects, Origin};
 
 pub use process::{process_inbound_action_token, verify_action_token};
 

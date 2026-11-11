@@ -220,13 +220,7 @@ impl Request {
 	// short-lived bearer for the access-token endpoint only). Most callers
 	// should go through `get_or_mint_proxy_token` to benefit from caching
 	// and the 401-retry path.
-	pub async fn create_proxy_token(
-		&self,
-		tn_id: TnId,
-		id_tag: &str,
-		subject: Option<&str>,
-	) -> ClResult<Box<str>> {
-		let host = self.peer_host(id_tag).await?;
+	pub async fn create_proxy_token(&self, tn_id: TnId, id_tag: &str) -> ClResult<Box<str>> {
 		let auth_token = self
 			.auth_adapter
 			.create_action_token(
@@ -239,25 +233,9 @@ impl Request {
 				},
 			)
 			.await?;
-		let req = hyper::Request::builder()
-			.method(Method::GET)
-			.uri(format!(
-				"https://cl-o.{}/api/auth/access-token?token={}{}",
-				host,
-				auth_token,
-				if let Some(subject) = subject {
-					format!("&subject={}", subject)
-				} else {
-					String::new()
-				}
-			))
-			.body(to_boxed(Empty::new()))?;
-		let res = self.timed_request(req).await?;
-		if !res.status().is_success() {
-			return Err(Error::PermissionDenied);
-		}
-		let parsed: TokenRes = serde_json::from_slice(&Self::collect_body(res.into_body()).await?)?;
-
+		// `post` keeps the status contract: only 401/403 is a denial, 429/5xx stay retryable.
+		let body = serde_json::json!({ "token": auth_token });
+		let parsed: TokenRes = self.post(tn_id, id_tag, "/auth/access-token", &body).await?;
 		Ok(parsed.data.token)
 	}
 
@@ -268,7 +246,7 @@ impl Request {
 		if let Some(token) = self.proxy_tokens.get(tn_id, id_tag) {
 			return Ok(token);
 		}
-		let token = self.create_proxy_token(tn_id, id_tag, None).await?;
+		let token = self.create_proxy_token(tn_id, id_tag).await?;
 		self.proxy_tokens.insert(tn_id, id_tag, token.clone());
 		Ok(token)
 	}
@@ -403,7 +381,8 @@ impl Request {
 				Ok(parsed)
 			}
 			StatusCode::NOT_FOUND => Err(Error::NotFound),
-			StatusCode::FORBIDDEN => Err(Error::PermissionDenied),
+			StatusCode::GONE => Err(Error::Gone),
+			StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::PermissionDenied),
 			code => Err(Error::NetworkError(format!("unexpected HTTP status: {}", code))),
 		}
 	}
@@ -520,7 +499,44 @@ impl Request {
 			.header("Content-Type", "application/json")
 			.body(to_boxed(Full::from(data)))?;
 		let res = self.timed_request(req).await?;
-		Self::collect_body(res.into_body()).await
+		debug!(status = %res.status(), "federated POST response");
+		if res.status().is_success() {
+			return Self::collect_body(res.into_body()).await;
+		}
+		Err(Self::error_for_status(res).await)
+	}
+
+	/// The federation status contract for a non-2xx response. 4xx is terminal (400/413/422 →
+	/// `ValidationError`, 422 `E-FED-UNSUPPORTED` → `Unsupported`, 401/403 → `PermissionDenied`,
+	/// 410 → `Gone`, incl. `E-REF-EXPIRED`/`E-REF-USED`); 429/503 → `ServiceUnavailable` and every other status → `NetworkError`,
+	/// both retryable. 404 stays `NotFound` (retryable, see `Error::is_retryable`).
+	// `Retry-After` is ignored, the scheduler has no hook for it; add one if peers
+	// start throttling hard.
+	async fn error_for_status(res: hyper::Response<hyper::body::Incoming>) -> Error {
+		let status = res.status();
+		match status {
+			StatusCode::NOT_FOUND => Error::NotFound,
+			StatusCode::GONE => Error::Gone,
+			StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Error::PermissionDenied,
+			StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
+				Error::ServiceUnavailable(format!("peer returned HTTP {}", status))
+			}
+			StatusCode::UNPROCESSABLE_ENTITY => {
+				let body = Self::collect_body(res.into_body()).await.unwrap_or_default();
+				let code = serde_json::from_slice::<serde_json::Value>(&body).ok().and_then(|v| {
+					v.pointer("/error/code").and_then(serde_json::Value::as_str).map(str::to_owned)
+				});
+				if code.as_deref() == Some(cloudillo_types::error::codes::FED_UNSUPPORTED) {
+					Error::Unsupported("peer does not support this action".into())
+				} else {
+					Error::ValidationError(format!("peer returned HTTP {}", status))
+				}
+			}
+			StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE => {
+				Error::ValidationError(format!("peer returned HTTP {}", status))
+			}
+			code => Error::NetworkError(format!("unexpected HTTP status: {}", code)),
+		}
 	}
 
 	pub async fn post<Res>(
@@ -566,15 +582,12 @@ impl Request {
 			})
 			.await?;
 		debug!(status = %res.status(), "federated POST response");
-		match res.status() {
-			StatusCode::NOT_FOUND => Err(Error::NotFound),
-			StatusCode::GONE => Err(Error::Gone),
-			StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::PermissionDenied),
-			// Any 2xx: the wire shape is the caller's. A `204` yields empty bytes, which
-			// `post_authed` surfaces as a JSON parse error.
-			code if code.is_success() => Self::collect_body(res.into_body()).await,
-			code => Err(Error::NetworkError(format!("unexpected HTTP status: {}", code))),
+		// Any 2xx: the wire shape is the caller's. A `204` yields empty bytes, which
+		// `post_authed` surfaces as a JSON parse error.
+		if res.status().is_success() {
+			return Self::collect_body(res.into_body()).await;
 		}
+		Err(Self::error_for_status(res).await)
 	}
 
 	/// Typed JSON wrapper around [`Self::post_json_authed`].

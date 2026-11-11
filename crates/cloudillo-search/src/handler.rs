@@ -56,18 +56,19 @@
 //!
 //! # Pagination
 //!
-//! Results are relevance-ordered, so this endpoint uses `limit`/`offset` rather
-//! than the keyset cursor the rest of the API uses — a cursor over a `bm25()`
-//! ordering has nothing stable to anchor on. `offset` is capped.
+//! Results are relevance-ordered, so the opaque `cursor` encodes an offset
+//! ([`CursorData::offset`]) rather than a keyset like the rest of the API — a
+//! keyset over a `bm25()` ordering has nothing stable to anchor on. The offset is
+//! capped. `limit` defaults to 20, max `SEARCH_MAX_LIMIT`.
 //!
-//! `pagination.total` is the only has-more signal the response carries: derived
-//! from the page alone it would equal `offset + len` and every page would look
-//! like the last one. It normally comes from a second adapter call,
+//! The match count decides whether `next` is sent: derived from the page alone
+//! it would equal `offset + len` and every page would look like the last one.
+//! Only the first page reports it, as `total`. It normally comes from a second adapter call,
 //! [`cloudillo_types::meta_adapter::MetaAdapter::count_search`], over the same SQL
 //! filters as the page itself.
 //!
 //! That second call is **skipped when the page answers the question by itself**:
-//! a first page (`offset == 0`) shorter than `limit` is the whole match set, so
+//! a first page (no cursor) shorter than `limit` is the whole match set, so
 //! its length *is* the total. This is the common case on a route reachable with
 //! no token at all, where `?q=a` — a `"a"*` prefix matching most of the corpus —
 //! would otherwise cost two full ranked FTS scans, each re-running the per-row
@@ -76,9 +77,9 @@
 //! matched. Not `tokio::join!`ed with the page: that would undo the skip.
 //!
 //! When it does run, the count **saturates** at
-//! `SEARCH_MAX_OFFSET + SEARCH_MAX_LIMIT`. `offset` is clamped to
-//! `SEARCH_MAX_OFFSET`, so no page a caller can reach lies past it and the
-//! has-more signal stays exact where a caller can act on it. Uncapped, such a
+//! `SEARCH_MAX_OFFSET + SEARCH_MAX_LIMIT`. The offset is clamped to
+//! `SEARCH_MAX_OFFSET` and no `next` points past it, so no page a caller can
+//! reach lies past it and the has-more signal stays exact where a caller can act on it. Uncapped, such a
 //! request would walk the tenant's whole match set.
 
 use std::collections::HashMap;
@@ -90,7 +91,7 @@ use axum::{
 };
 use cloudillo_core::{
 	abac::{self, SubjectAccessLevel, relationship_level},
-	extract::{IdTag, OptionalAuth, OptionalRequestId},
+	extract::{IdTag, OptionalAuth},
 	file_access,
 };
 use cloudillo_types::{
@@ -100,7 +101,7 @@ use cloudillo_types::{
 		SEARCH_MAX_LIMIT, SEARCH_MAX_OFFSET, SEARCH_MAX_TAGS, SearchMatch, SearchOptions,
 		SearchRow,
 	},
-	types::{AccessLevel, ApiResponse, TokenScope, serialize_timestamp_iso},
+	types::{AccessLevel, ApiResponse, ApiTime, CursorData, TokenScope},
 };
 use serde::{Deserialize, Serialize};
 
@@ -114,7 +115,7 @@ const DEFAULT_LIMIT: u32 = 20;
 
 /// Longest accepted `q`. Every token becomes a quoted term plus an ` AND ` in
 /// the FTS5 MATCH expression, so an unbounded query is an unbounded expression;
-/// `limit` and `offset` are capped and this is the third knob.
+/// `limit` and the cursor's offset are capped and this is the third knob.
 const MAX_QUERY_CHARS: usize = 256;
 
 /// Longest accepted single `tags` / `contentType` entry. A tag is a word and a
@@ -126,27 +127,31 @@ const MAX_FILTER_ENTRY_CHARS: usize = 128;
 /// Deliberately **not** `deny_unknown_fields`, matching every other query struct in
 /// the API. This route is reachable with no token at all, and a parameter this build
 /// has never heard of must degrade to "ignored" rather than to a 400 on the whole
-/// request — the same stance [`parse_types`] takes for an unknown `?type=` name.
+/// request — the same stance [`parse_types`] takes for an unknown `?kind=` name.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchQuery {
 	pub q: String,
-	/// Comma-separated subset of `file,doc,action,profile`.
-	pub r#type: Option<String>,
+	/// Comma-separated subset of `file,doc,action,profile` (the resource kind).
+	#[serde(default, deserialize_with = "cloudillo_types::meta_adapter::deserialize_split")]
+	pub kind: Option<Vec<String>>,
 	/// Restrict to one container document and its parts.
-	pub file_id: Option<String>,
+	pub content_id: Option<String>,
 	/// Comma-separated content types.
-	pub content_type: Option<String>,
+	#[serde(default, deserialize_with = "cloudillo_types::meta_adapter::deserialize_split")]
+	pub content_type: Option<Vec<String>>,
 	/// Comma-separated tags, AND-combined. Applied inside the FTS match, so a
 	/// text+tag query cannot lose a hit to the relevance cut.
 	///
 	/// With `tags` present, `q` may be empty — that is a tag-only browse.
-	pub tags: Option<String>,
+	#[serde(default, deserialize_with = "cloudillo_types::meta_adapter::deserialize_split")]
+	pub tags: Option<Vec<String>>,
 	/// Conversation scope: a CONV id (its messages) or a peer idTag (DMs with that peer).
-	/// Implies `type=action`.
+	/// Implies `kind=action`.
 	pub conv: Option<String>,
 	pub limit: Option<u32>,
-	pub offset: Option<u32>,
+	/// Opaque cursor: the previous page's `next`.
+	pub cursor: Option<String>,
 }
 
 /// One result row on the wire.
@@ -158,7 +163,9 @@ pub struct SearchQuery {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchHit {
-	/// `'F'` file, `'D'` deep document part, `'A'` action, `'P'` profile.
+	/// Wire `kind`: `file`, `doc` (deep document part), `action`, `profile`
+	/// (`api_enums::search_kind`, stored `obj_tp` F/D/A/P).
+	#[serde(rename = "kind", with = "cloudillo_types::api_enums::search_kind")]
 	pub obj_tp: char,
 	pub obj_id: Box<str>,
 	/// Deep-link key — for notillo, the page id.
@@ -208,8 +215,7 @@ pub struct SearchHit {
 	/// `profiles` row alongside the picture, so it costs no extra query.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub profile_type: Option<ProfileType>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub updated_at: Timestamp,
+	pub updated_at: ApiTime,
 	/// Sign-flipped `bm25()`: higher is more relevant.
 	pub score: f64,
 }
@@ -219,11 +225,10 @@ pub async fn get_search(
 	tn_id: TnId,
 	IdTag(tenant_id_tag): IdTag,
 	OptionalAuth(maybe_auth): OptionalAuth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Query(q): Query<SearchQuery>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<SearchHit>>>)> {
 	let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, SEARCH_MAX_LIMIT);
-	let offset = q.offset.unwrap_or(0).min(SEARCH_MAX_OFFSET);
+	let offset = CursorData::parse_offset(q.cursor.as_deref())?.min(SEARCH_MAX_OFFSET);
 	let authenticated = maybe_auth.is_some();
 	// The same synthesis `check_file_permission` uses for unauthenticated file
 	// reads, so the `"guest"` subject the visibility derivation below tests for is
@@ -244,14 +249,13 @@ pub async fn get_search(
 	if q.q.chars().count() > MAX_QUERY_CHARS {
 		return Err(Error::ValidationError("Search query too long".into()));
 	}
-	let content_type =
-		csv_filter(q.content_type.as_deref(), SEARCH_MAX_CONTENT_TYPES, "contentType")?;
-	let tags = csv_filter(q.tags.as_deref(), SEARCH_MAX_TAGS, "tags")?;
+	let content_type = csv_filter(q.content_type, SEARCH_MAX_CONTENT_TYPES, "contentType")?;
+	let tags = csv_filter(q.tags, SEARCH_MAX_TAGS, "tags")?;
 
 	let mut opts = SearchOptions {
 		q: q.q,
-		obj_tp: if q.conv.is_some() { Some(vec!['A']) } else { obj_tp_filter(q.r#type.as_deref()) },
-		file_id: q.file_id,
+		obj_tp: if q.conv.is_some() { Some(vec!['A']) } else { obj_tp_filter(q.kind.as_deref()) },
+		file_id: q.content_id,
 		// A peer idTag keys like every other idTag; an action id (`a1~…`) is taken as is.
 		conv: q.conv.map(|c| {
 			if c.contains('~') {
@@ -392,13 +396,17 @@ pub async fn get_search(
 	let hits: Vec<SearchHit> =
 		rows.into_iter().map(|row| to_hit(row, &nav_params, &profile_meta)).collect();
 
-	let total = usize::try_from(total).unwrap_or(0);
-	let response = ApiResponse::with_pagination(hits, offset as usize, limit as usize, total)
-		.with_req_id(req_id.unwrap_or_default());
+	// More exists past this page, and the next page is still reachable under the offset cap.
+	let next_offset = offset + limit;
+	let has_more = i64::from(offset) + i64::try_from(fetched_len).unwrap_or(i64::MAX) < total
+		&& next_offset <= SEARCH_MAX_OFFSET;
+	let next = has_more.then(|| CursorData::offset(next_offset));
+	let response = ApiResponse::with_next(hits, next);
+	let response = if offset == 0 { response.with_total(total) } else { response };
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// `pagination.total` when the page alone settles it, `None` when the second FTS
+/// The match count when the page alone settles it, `None` when the second FTS
 /// scan has to run.
 ///
 /// A *first* page shorter than `limit` is the whole match set, so its length is
@@ -581,7 +589,7 @@ fn to_hit(
 		upstream_tag: row.upstream_tag,
 		profile_pic,
 		profile_type,
-		updated_at: row.updated_at,
+		updated_at: row.updated_at.into(),
 		// `bm25()` is negative and ascending-relevant; flip it so the client's
 		// "higher is better" intuition holds.
 		score: -row.score,
@@ -601,35 +609,28 @@ pub(crate) fn strip_kind<'a>(part: &'a str, kind: Option<&str>) -> &'a str {
 	kind.and_then(|k| part.strip_prefix(k)?.strip_prefix('/')).unwrap_or(part)
 }
 
-/// Map the API's `type` names onto `search_docs.obj_tp` codes. Unknown names
+/// Map the API's `kind` names onto `search_docs.obj_tp` codes. Unknown names
 /// are dropped rather than erroring, so a newer client asking for a type this
 /// build has never heard of degrades to "no such results" instead of a 400.
 ///
 /// An all-unknown list therefore returns an *empty* vec, which the caller keeps
 /// as `Some(vec![])` — the adapter reads that as "match nothing". Collapsing it
-/// to `None` would turn `?type=quantum` into an unfiltered search, which is the
+/// to `None` would turn `?kind=quantum` into an unfiltered search, which is the
 /// opposite of what a filter the caller wrote should do.
-fn parse_types(raw: &str) -> Vec<char> {
-	raw.split(',')
-		.map(str::trim)
-		.filter_map(|t| match t {
-			"file" => Some('F'),
-			"doc" => Some('D'),
-			"action" => Some('A'),
-			"profile" => Some('P'),
-			_ => None,
-		})
+fn parse_types(raw: &[String]) -> Vec<char> {
+	raw.iter()
+		.filter_map(|w| cloudillo_types::api_enums::search_kind::from_word(w))
 		.collect()
 }
 
-/// The mapping `get_search` applies to `?type=`: a blank or absent parameter is
+/// The mapping `get_search` applies to `?kind=`: a blank or absent parameter is
 /// "no filter at all" (`None`), while a non-blank one naming nothing this build
 /// knows keeps its empty vec — which the adapter reads as "match nothing".
 ///
 /// A free function rather than an inline expression so the test that guards the
 /// `Some(vec![])` / `None` distinction exercises the production path.
-fn obj_tp_filter(raw: Option<&str>) -> Option<Vec<char>> {
-	raw.map(str::trim).filter(|t| !t.is_empty()).map(parse_types)
+fn obj_tp_filter(raw: Option<&[String]>) -> Option<Vec<char>> {
+	raw.filter(|t| !t.is_empty()).map(parse_types)
 }
 
 /// Narrow an unauthenticated caller's `obj_tp` filter to the types a guest may
@@ -638,7 +639,7 @@ fn obj_tp_filter(raw: Option<&str>) -> Option<Vec<char>> {
 /// The SQL prefilter exempts profiles from the visibility predicate on the
 /// grounds that any *authenticated* caller may already list them via
 /// `GET /api/profiles`; that does not hold for an anonymous one. A guest asking
-/// for `?type=profile` therefore ends with an empty vec, which the adapter reads
+/// for `?kind=profile` therefore ends with an empty vec, which the adapter reads
 /// as "match nothing" — an empty page, not an unfiltered one — and both
 /// `count_search` and `search` see the same `opts`, so the count agrees with it.
 fn guest_obj_tp(requested: Option<Vec<char>>) -> Vec<char> {
@@ -651,7 +652,7 @@ fn guest_obj_tp(requested: Option<Vec<char>>) -> Vec<char> {
 /// Narrow a file-scoped caller's `obj_tp` filter to what a file scope can hold.
 ///
 /// Intersect, don't replace: a scope narrows what the caller asked for, it does
-/// not answer a different question. A share-link holder asking `?type=action`
+/// not answer a different question. A share-link holder asking `?kind=action`
 /// gets an empty page, not a page of files. `Some(empty)` is "match nothing",
 /// which the adapter emits as `AND 1=0` — the same contract [`guest_obj_tp`]
 /// relies on, and both `count_search` and `search` see the same `opts`.
@@ -662,15 +663,15 @@ fn scope_obj_tp(requested: Option<Vec<char>>) -> Vec<char> {
 	}
 }
 
-/// Split one comma-separated filter list and bound it.
+/// Bound one comma-separated filter list (already split by `deserialize_split`).
 ///
 /// Rejected rather than truncated: a caller that asked for forty tags and was
 /// quietly served sixteen would get an answer to a question it did not ask. The
 /// cap matters because neither list is otherwise bounded — ~33k `contentType`
 /// values overrun SQLite's 32766 bound-variable limit into a 500, and a long
 /// `tags` list builds an arbitrarily deep FTS5 `MATCH` expression.
-fn csv_filter(raw: Option<&str>, max: usize, what: &str) -> ClResult<Option<Vec<String>>> {
-	let Some(values) = raw.map(split_csv) else { return Ok(None) };
+fn csv_filter(raw: Option<Vec<String>>, max: usize, what: &str) -> ClResult<Option<Vec<String>>> {
+	let Some(values) = raw else { return Ok(None) };
 	if values.len() > max {
 		return Err(Error::ValidationError(format!("Too many {what} values (max {max})")));
 	}
@@ -678,14 +679,6 @@ fn csv_filter(raw: Option<&str>, max: usize, what: &str) -> ClResult<Option<Vec<
 		return Err(Error::ValidationError(format!("A {what} value is too long")));
 	}
 	Ok((!values.is_empty()).then_some(values))
-}
-
-fn split_csv(raw: &str) -> Vec<String> {
-	raw.split(',')
-		.map(str::trim)
-		.filter(|s| !s.is_empty())
-		.map(ToOwned::to_owned)
-		.collect()
 }
 
 fn split_tags(raw: &str) -> Box<[Box<str>]> {
@@ -696,30 +689,34 @@ fn split_tags(raw: &str) -> Box<[Box<str>]> {
 mod tests {
 	use super::*;
 
+	/// What `deserialize_split` hands the handler for a raw `a,b` value.
+	fn split(raw: &str) -> Vec<String> {
+		raw.split(',').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect()
+	}
+
 	#[test]
 	fn type_names_map_to_obj_tp_codes() {
-		assert_eq!(parse_types("file,doc"), vec!['F', 'D']);
-		assert_eq!(parse_types(" action , profile "), vec!['A', 'P']);
+		assert_eq!(parse_types(&split("file,doc")), vec!['F', 'D']);
+		assert_eq!(parse_types(&split(" action , profile ")), vec!['A', 'P']);
 	}
 
 	#[test]
 	fn unknown_type_names_are_dropped_not_rejected() {
-		assert_eq!(parse_types("doc,quantum"), vec!['D']);
-		assert!(parse_types("quantum").is_empty());
+		assert_eq!(parse_types(&split("doc,quantum")), vec!['D']);
+		assert!(parse_types(&split("quantum")).is_empty());
 	}
 
 	/// An all-unknown list must stay `Some(vec![])` — "match nothing"; only a
 	/// blank one may become `None`, which is "no filter at all".
 	#[test]
 	fn an_all_unknown_type_filter_matches_nothing_rather_than_everything() {
-		assert_eq!(obj_tp_filter(Some("quantum")), Some(vec![]));
-		assert_eq!(obj_tp_filter(Some("quantum,warp")), Some(vec![]));
+		assert_eq!(obj_tp_filter(Some(&split("quantum"))), Some(vec![]));
+		assert_eq!(obj_tp_filter(Some(&split("quantum,warp"))), Some(vec![]));
 		// A blank or absent parameter is the only "no filter" case.
-		assert_eq!(obj_tp_filter(Some("")), None);
-		assert_eq!(obj_tp_filter(Some("  ")), None);
+		assert_eq!(obj_tp_filter(Some(&[])), None);
 		assert_eq!(obj_tp_filter(None), None);
 		// A partially-recognised list keeps what it understood.
-		assert_eq!(obj_tp_filter(Some("doc,quantum")), Some(vec!['D']));
+		assert_eq!(obj_tp_filter(Some(&split("doc,quantum"))), Some(vec!['D']));
 	}
 
 	/// A page that filled up may or may not be the last one, and no page past the
@@ -740,7 +737,7 @@ mod tests {
 		assert_eq!(total_from_page(1, 0, 20), None);
 	}
 
-	/// An explicit `?type=profile` becomes "match nothing" rather than falling
+	/// An explicit `?kind=profile` becomes "match nothing" rather than falling
 	/// back to "no filter".
 	#[test]
 	fn a_guest_never_sees_profiles() {
@@ -811,13 +808,15 @@ mod tests {
 	fn an_over_long_filter_list_is_rejected() {
 		let tags = (0..=SEARCH_MAX_TAGS).map(|i| format!("t{i}")).collect::<Vec<_>>().join(",");
 		assert!(matches!(
-			csv_filter(Some(&tags), SEARCH_MAX_TAGS, "tags"),
+			csv_filter(Some(split(&tags)), SEARCH_MAX_TAGS, "tags"),
 			Err(Error::ValidationError(_))
 		));
 		// Exactly at the cap is fine.
 		let tags = (0..SEARCH_MAX_TAGS).map(|i| format!("t{i}")).collect::<Vec<_>>().join(",");
 		assert_eq!(
-			csv_filter(Some(&tags), SEARCH_MAX_TAGS, "tags").expect("ok").map(|v| v.len()),
+			csv_filter(Some(split(&tags)), SEARCH_MAX_TAGS, "tags")
+				.expect("ok")
+				.map(|v| v.len()),
 			Some(SEARCH_MAX_TAGS)
 		);
 	}
@@ -826,7 +825,7 @@ mod tests {
 	fn an_over_long_filter_entry_is_rejected() {
 		let long = "x".repeat(MAX_FILTER_ENTRY_CHARS + 1);
 		assert!(matches!(
-			csv_filter(Some(&long), SEARCH_MAX_TAGS, "tags"),
+			csv_filter(Some(vec![long]), SEARCH_MAX_TAGS, "tags"),
 			Err(Error::ValidationError(_))
 		));
 	}
@@ -834,7 +833,7 @@ mod tests {
 	#[test]
 	fn an_empty_filter_list_is_no_filter() {
 		assert_eq!(csv_filter(None, SEARCH_MAX_TAGS, "tags").expect("ok"), None);
-		assert_eq!(csv_filter(Some(" , "), SEARCH_MAX_TAGS, "tags").expect("ok"), None);
+		assert_eq!(csv_filter(Some(vec![]), SEARCH_MAX_TAGS, "tags").expect("ok"), None);
 	}
 
 	#[test]

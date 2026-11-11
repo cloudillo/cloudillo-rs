@@ -8,13 +8,16 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use cloudillo_core::scheduler::{Task, TaskId};
-use cloudillo_types::auth_adapter::ActionToken;
+use cloudillo_types::auth_adapter::{ActionToken, AuditCategory, AuditEvent};
 use cloudillo_types::utils::decode_jwt_no_verify;
 
 use crate::dsl::DslEngine;
 use crate::subject_ref::{SubjectRef, parse_subject_ref};
 
 use crate::prelude::*;
+
+/// `actions.delivery_error` value for a directed delivery refused with 422 `E-FED-UNSUPPORTED`.
+pub const DELIVERY_ERROR_UNSUPPORTED: &str = "unsupported";
 
 /// Task for delivering federated actions
 /// Retry logic is handled by the scheduler with RetryPolicy
@@ -145,6 +148,72 @@ impl Task<App> for ActionDeliveryTask {
 				Err(e)
 			}
 		}
+	}
+
+	async fn on_failed(&self, app: &App, attempts: u16, last_error: &str) {
+		// The scheduler hands over `e.to_string()`, and `Error`'s `Display` is `{:?}`, so an
+		// `Error::Unsupported` arrives as `Unsupported("…")`. The `E-FED-UNSUPPORTED` code
+		// string never appears in it: match the variant-name prefix instead.
+		if !last_error.starts_with("Unsupported(") {
+			return;
+		}
+		let action = match app.meta_adapter.get_action(self.tn_id, &self.action_id).await {
+			Ok(action) => action,
+			Err(e) => {
+				warn!(action_id = %self.action_id, error = %e, "delivery: action lookup failed");
+				None
+			}
+		};
+		// Directed = the refusing target is the action's audience; a broadcast copy refused by
+		// one follower or subscriber does not mark the action.
+		let directed = action
+			.as_ref()
+			.and_then(|a| a.audience.as_ref())
+			.is_some_and(|aud| aud.id_tag == self.target_id_tag);
+		warn!(
+			action_id = %self.action_id,
+			target = %self.target_id_tag,
+			directed,
+			attempts,
+			"delivery refused as unsupported"
+		);
+
+		if directed {
+			match app
+				.meta_adapter
+				.set_action_delivery_error(self.tn_id, &self.action_id, DELIVERY_ERROR_UNSUPPORTED)
+				.await
+			{
+				// Push the marked action to the sender's own sessions.
+				Ok(()) => match app.meta_adapter.get_action(self.tn_id, &self.action_id).await {
+					Ok(Some(view)) => {
+						crate::forward::forward_inbound_action_view(
+							app, self.tn_id, &view, None, None,
+						)
+						.await;
+					}
+					Ok(None) => {}
+					Err(e) => {
+						warn!(action_id = %self.action_id, error = %e, "delivery: re-fetch failed");
+					}
+				},
+				Err(e) => {
+					warn!(action_id = %self.action_id, error = %e, "delivery: marker not stored");
+				}
+			}
+		}
+
+		let ev = AuditEvent {
+			tn_id: Some(self.tn_id),
+			details: Some(serde_json::json!({
+				"actionId": self.action_id,
+				"target": self.target_id_tag,
+				"directed": directed,
+				"error": last_error,
+			})),
+			..AuditEvent::new(AuditCategory::Admin, "federation.delivery.unsupported", "fail")
+		};
+		cloudillo_core::audit::record(app, ev).await;
 	}
 }
 

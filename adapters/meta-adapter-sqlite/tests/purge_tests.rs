@@ -219,17 +219,17 @@ async fn purging_a_tree_cascades_its_links_and_grants_and_nothing_else() {
 
 	// Resource side cleared...
 	for gone in [&doomed_eid, &child_b_eid] {
-		let entries = adapter.list_share_entries(tn_id, 'F', gone).await.unwrap();
+		let entries = adapter.list_share_entries(tn_id, 'F', gone, None, None).await.unwrap();
 		assert!(entries.is_empty(), "{gone} still has share entries: {entries:?}");
 	}
 	// ...and the subject side too, so the surviving container no longer lists the dead embed.
 	let by_subject = adapter
-		.list_share_entries_by_subject(tn_id, Some('F'), &child_a_eid)
+		.list_share_entries_by_subject(tn_id, Some('F'), &child_a_eid, None, None)
 		.await
 		.unwrap();
 	assert!(by_subject.is_empty(), "embed row survived: {by_subject:?}");
 	let keep_entries = adapter
-		.list_share_entries(tn_id, 'F', &eid(&adapter, tn_id, "f1~keep").await)
+		.list_share_entries(tn_id, 'F', &eid(&adapter, tn_id, "f1~keep").await, None, None)
 		.await
 		.unwrap();
 	assert_eq!(keep_entries.len(), 1, "only the embed should have been swept from f1~keep");
@@ -238,7 +238,13 @@ async fn purging_a_tree_cascades_its_links_and_grants_and_nothing_else() {
 	// Another tenant's grant on the same resource id is untouched.
 	assert_eq!(
 		adapter
-			.list_share_entries(other_tn_id, 'F', &eid(&adapter, other_tn_id, "f1~doomed").await)
+			.list_share_entries(
+				other_tn_id,
+				'F',
+				&eid(&adapter, other_tn_id, "f1~doomed").await,
+				None,
+				None
+			)
 			.await
 			.unwrap()
 			.len(),
@@ -304,7 +310,13 @@ async fn deleting_by_f_id_resolves_the_content_id() {
 	assert_eq!(purged.share_entries_removed, 1);
 	assert!(is_deleted(&adapter, tn_id, "f1~by-int").await);
 	assert!(adapter.get_ref(tn_id, "link-int").await.unwrap().is_none());
-	assert!(adapter.list_share_entries(tn_id, 'F', &by_int_eid).await.unwrap().is_empty());
+	assert!(
+		adapter
+			.list_share_entries(tn_id, 'F', &by_int_eid, None, None)
+			.await
+			.unwrap()
+			.is_empty()
+	);
 }
 
 #[tokio::test]
@@ -336,7 +348,13 @@ async fn an_already_tombstoned_child_still_has_its_links_swept() {
 	assert_eq!(purged.refs_removed, 1);
 	assert_eq!(purged.share_entries_removed, 1);
 	assert!(adapter.get_ref(tn_id, "link-dead-child").await.unwrap().is_none());
-	assert!(adapter.list_share_entries(tn_id, 'F', &dead_eid).await.unwrap().is_empty());
+	assert!(
+		adapter
+			.list_share_entries(tn_id, 'F', &dead_eid, None, None)
+			.await
+			.unwrap()
+			.is_empty()
+	);
 }
 
 #[tokio::test]
@@ -410,14 +428,22 @@ async fn hard_deleting_a_file_sweeps_its_links_and_grants_too() {
 
 	assert!(adapter.read_file(tn_id, "f1~gc-me").await.unwrap().is_none(), "row should be gone");
 	assert!(adapter.get_ref(tn_id, "link-gc").await.unwrap().is_none());
-	assert!(adapter.list_share_entries(tn_id, 'F', &gc_eid).await.unwrap().is_empty());
-	let by_subject =
-		adapter.list_share_entries_by_subject(tn_id, Some('F'), &gc_eid).await.unwrap();
+	assert!(
+		adapter
+			.list_share_entries(tn_id, 'F', &gc_eid, None, None)
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	let by_subject = adapter
+		.list_share_entries_by_subject(tn_id, Some('F'), &gc_eid, None, None)
+		.await
+		.unwrap();
 	assert!(by_subject.is_empty(), "embed row survived: {by_subject:?}");
 
 	// Everything naming another file is untouched.
 	assert!(adapter.get_ref(tn_id, "link-keep").await.unwrap().is_some());
-	let keep_entries = adapter.list_share_entries(tn_id, 'F', &keep_eid).await.unwrap();
+	let keep_entries = adapter.list_share_entries(tn_id, 'F', &keep_eid, None, None).await.unwrap();
 	assert_eq!(keep_entries.len(), 1, "only the embed should have been swept from f1~keep");
 	assert_eq!(keep_entries[0].subject_id.as_ref(), "dave.example.com");
 }

@@ -63,7 +63,7 @@ async fn admin_permission_survives_the_full_round_trip() {
 
 	// ...and through the listing path the share dialog uses.
 	let listed = adapter
-		.list_share_entries(tn_id, 'F', "f1~doc")
+		.list_share_entries(tn_id, 'F', "f1~doc", None, None)
 		.await
 		.expect("list share entries");
 	assert_eq!(listed.len(), 1);

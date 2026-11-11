@@ -11,6 +11,7 @@ use crate::utils::{Db, async_map_res, inspect, map_res, parse_str_list_optional}
 use cloudillo_types::{
 	auth_adapter::{AuthProfile, CreateTenantData, ListTenantsOptions, TenantListItem},
 	prelude::*,
+	types::ApiTime,
 	utils::{normalize_id_tag, random_id},
 	worker::WorkerPool,
 };
@@ -318,9 +319,9 @@ pub(crate) async fn list_tenants(
 				email: row.try_get("email").db()?,
 				roles: parse_str_list_optional(roles_str.as_deref()),
 				status: row.try_get("status").db()?,
-				suspended_at: row.try_get::<Option<i64>, _>("suspended_at").db()?.map(Timestamp),
-				expires_at: row.try_get::<Option<i64>, _>("expires_at").db()?.map(Timestamp),
-				created_at: Timestamp(row.try_get("created_at").db()?),
+				suspended_at: row.try_get::<Option<i64>, _>("suspended_at").db()?.map(ApiTime),
+				expires_at: row.try_get::<Option<i64>, _>("expires_at").db()?.map(ApiTime),
+				created_at: ApiTime(row.try_get("created_at").db()?),
 			})
 		})
 		.collect::<ClResult<Vec<_>>>()?;

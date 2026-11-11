@@ -36,8 +36,8 @@
 //!   for the two trailing `SetResponseHeaderLayer` calls: they set two different
 //!   headers (`Cache-Control`, `Expires`) with `if_not_present`.
 //! - `check_perm_file` / `check_perm_action` read their subject from a **named**
-//!   capture, so the route must capture the file id as `{file_id}` (or
-//!   `{variant_id}`) / the action id as `{action_id}`. Other captures are
+//!   capture, so the route must capture the file id as `{id}` (or
+//!   `{variantId}`) / the action id as `{action_id}`. Other captures are
 //!   ignored.
 
 use axum::{Router, http::header, middleware};

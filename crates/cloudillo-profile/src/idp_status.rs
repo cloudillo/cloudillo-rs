@@ -14,9 +14,9 @@
 //! fire; once an IDP identity is `Active` it stays that way, so trusting the
 //! cleared setting is sufficient.
 //!
-//! In addition to the auth-based `/api/profiles/me/...` handlers, this module
+//! In addition to the auth-based `/api/me/idp-status` / `/api/me/idp/resend` handlers, this module
 //! exposes ref-scoped variants (`/api/refs/{refId}/idp-status`,
-//! `/api/refs/{refId}/resend-activation`) used by the unauthenticated
+//! `/api/refs/{refId}/idp/resend`) used by the unauthenticated
 //! welcome page to gate the password-setup form on IDP activation. The refId
 //! is the credential — the meta adapter's non-destructive `validate_ref`
 //! resolves it to the owning tenant so we can run the same federation lookup.
@@ -31,9 +31,9 @@ use serde_with::skip_serializing_none;
 
 use crate::prelude::*;
 use cloudillo_core::abac;
-use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
+use cloudillo_core::extract::{Auth, IdTag};
 use cloudillo_core::settings::SettingValue;
-use cloudillo_types::types::{ApiResponse, serialize_timestamp_iso};
+use cloudillo_types::types::{ApiResponse, ApiTime};
 
 /// IDP-side wire shape — must match `IdentityStatusResponse` in
 /// `crates/cloudillo-idp/src/handler.rs`. The body is wrapped in the standard
@@ -42,16 +42,16 @@ use cloudillo_types::types::{ApiResponse, serialize_timestamp_iso};
 #[serde(rename_all = "camelCase")]
 struct IdpStatusBody {
 	status: String,
-	expires_at: Timestamp,
+	expires_at: ApiTime,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct IdpResendBody {
-	expires_at: Timestamp,
+	expires_at: ApiTime,
 }
 
-/// Frontend-facing response for `GET /api/profiles/me/idp-status`.
+/// Frontend-facing response for `GET /api/me/idp-status`.
 ///
 /// Carries the live IDP status plus the metadata the verify-idp UI needs
 /// (provider name, recovery email, deletion deadline) and — critically — the
@@ -63,8 +63,7 @@ struct IdpResendBody {
 #[serde(rename_all = "camelCase")]
 pub struct MeIdpStatusResponse {
 	pub status: String,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub expires_at: Timestamp,
+	pub expires_at: ApiTime,
 	pub provider_name: Option<String>,
 	pub email: Option<String>,
 	/// New `ui.onboarding` value if this call advanced it; absent otherwise.
@@ -76,8 +75,7 @@ pub struct MeIdpStatusResponse {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeResendActivationResponse {
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub expires_at: Timestamp,
+	pub expires_at: ApiTime,
 }
 
 /// Splits `alice.cloudillo.net` into `("alice", "cloudillo.net")`. Returns a
@@ -105,20 +103,15 @@ async fn is_verify_idp(app: &App, tn_id: TnId) -> bool {
 /// (domain-typed tenants, already-active identities, communities never
 /// registered with an IDP). `expires_at` is the Unix epoch — the frontend
 /// ignores it when `status == "active"`.
-fn synthetic_active_idp_response(
-	req_id: Option<String>,
-) -> (StatusCode, Json<ApiResponse<MeIdpStatusResponse>>) {
+fn synthetic_active_idp_response() -> (StatusCode, Json<ApiResponse<MeIdpStatusResponse>>) {
 	let response_data = MeIdpStatusResponse {
 		status: "active".to_string(),
-		expires_at: Timestamp(0),
+		expires_at: ApiTime(0),
 		provider_name: None,
 		email: None,
 		onboarding: None,
 	};
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(response_data);
 	(StatusCode::OK, Json(response))
 }
 
@@ -211,7 +204,7 @@ async fn forward_resend_to_idp(
 	Ok(MeResendActivationResponse { expires_at: resp.data.expires_at })
 }
 
-/// `GET /api/profiles/me/idp-status`
+/// `GET /api/me/idp-status`
 ///
 /// Pulls live IDP status for the active tenant via DNS-discovered federation,
 /// caches briefly (the IDP rate-limits anyway), and — when status flips to
@@ -221,7 +214,6 @@ pub async fn get_me_idp_status(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	IdTag(host_id_tag): IdTag,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<MeIdpStatusResponse>>)> {
 	// Allow either:
 	//   (a) the active tenant authenticating as itself (the personal verify-idp
@@ -245,7 +237,7 @@ pub async fn get_me_idp_status(
 	// split_idp_domain("cloudillo.net") => "net" makes the outbound call hit a
 	// bogus host (cl-o.net), failing with hyper "client error (Connect)" -> 500.
 	if !is_verify_idp(&app, auth.tn_id).await {
-		return Ok(synthetic_active_idp_response(req_id));
+		return Ok(synthetic_active_idp_response());
 	}
 
 	// Always query the IDP for the *active tenant's* identity (`host_id_tag`),
@@ -255,14 +247,11 @@ pub async fn get_me_idp_status(
 	let mut response_data = fetch_idp_status(&app, auth.tn_id, host_id_tag.as_ref()).await?;
 	response_data.onboarding =
 		apply_onboarding_clear(&app, auth.tn_id, &response_data.status).await;
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(response_data);
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// `POST /api/profiles/me/resend-activation`
+/// `POST /api/me/idp/resend`
 ///
 /// Allowed only while `ui.onboarding === 'verify-idp'`. Forwards the resend
 /// to the IDP, returns the **unchanged** `Identity.expires_at`. The IDP
@@ -273,7 +262,6 @@ pub async fn post_me_resend_activation(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	IdTag(host_id_tag): IdTag,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<MeResendActivationResponse>>)> {
 	// Same guard as get_me_idp_status (rationale there).
 	if !abac::is_tenant_self(&auth, &host_id_tag) && !abac::is_unscoped_leader(&auth) {
@@ -289,10 +277,7 @@ pub async fn post_me_resend_activation(
 	// Resend for the active tenant's identity (`host_id_tag`), not the
 	// bearer's `auth.id_tag` — see get_me_idp_status for the rationale.
 	let response_data = forward_resend_to_idp(&app, auth.tn_id, host_id_tag.as_ref()).await?;
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(response_data);
 	Ok((StatusCode::OK, Json(response)))
 }
 
@@ -324,13 +309,12 @@ pub async fn get_ref_idp_status(
 	State(app): State<App>,
 	IdTag(host_id_tag): IdTag,
 	Path(ref_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<MeIdpStatusResponse>>)> {
 	let (tn_id, id_tag, _ref_data) =
 		app.meta_adapter.validate_ref(&ref_id, &["welcome", "password"]).await.map_err(
 			|e| match e {
 				Error::NotFound => Error::ValidationError("Invalid or expired reference".into()),
-				Error::ValidationError(_) => e,
+				Error::ValidationError(_) | Error::RefExpired | Error::RefUsed => e,
 				_ => Error::ValidationError("Invalid reference".into()),
 			},
 		)?;
@@ -342,19 +326,16 @@ pub async fn get_ref_idp_status(
 	// IDP-vs-domain. The synthetic `expires_at` is the Unix epoch — the
 	// frontend ignores it on `status === "active"`.
 	if !is_verify_idp(&app, tn_id).await {
-		return Ok(synthetic_active_idp_response(req_id));
+		return Ok(synthetic_active_idp_response());
 	}
 
 	let mut response_data = fetch_idp_status(&app, tn_id, id_tag.as_ref()).await?;
 	response_data.onboarding = apply_onboarding_clear(&app, tn_id, &response_data.status).await;
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(response_data);
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// `POST /api/refs/{refId}/resend-activation` — unauthenticated.
+/// `POST /api/refs/{refId}/idp/resend` — unauthenticated.
 ///
 /// Resend variant of the ref-scoped IDP status endpoint. Same trust model
 /// (refId is the scope), same federation path. Rejected when the tenant is
@@ -364,7 +345,6 @@ pub async fn post_ref_resend_activation(
 	State(app): State<App>,
 	IdTag(host_id_tag): IdTag,
 	Path(ref_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<MeResendActivationResponse>>)> {
 	// Allow both "welcome" and "password" ref types here for symmetry with
 	// `get_ref_idp_status`: a `password` ref already grants enough trust to
@@ -376,7 +356,7 @@ pub async fn post_ref_resend_activation(
 		app.meta_adapter.validate_ref(&ref_id, &["welcome", "password"]).await.map_err(
 			|e| match e {
 				Error::NotFound => Error::ValidationError("Invalid or expired reference".into()),
-				Error::ValidationError(_) => e,
+				Error::ValidationError(_) | Error::RefExpired | Error::RefUsed => e,
 				_ => Error::ValidationError("Invalid reference".into()),
 			},
 		)?;
@@ -389,10 +369,7 @@ pub async fn post_ref_resend_activation(
 	}
 
 	let response_data = forward_resend_to_idp(&app, tn_id, id_tag.as_ref()).await?;
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(response_data);
 	Ok((StatusCode::OK, Json(response)))
 }
 

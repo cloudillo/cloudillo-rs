@@ -135,10 +135,10 @@ pub(crate) fn outranks(caller: SubscriptionRole, target: SubscriptionRole) -> bo
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use cloudillo_types::meta_adapter::{ProfileInfo, ProfileType};
+	use cloudillo_types::meta_adapter::{ProfileRef, ProfileType};
 
-	fn profile(id_tag: &str) -> ProfileInfo {
-		ProfileInfo {
+	fn profile(id_tag: &str) -> ProfileRef {
+		ProfileRef {
 			id_tag: id_tag.into(),
 			name: "test".into(),
 			typ: ProfileType::Person,
@@ -160,7 +160,7 @@ mod tests {
 			subject: None,
 			subject_profile: None,
 			subject_action: None,
-			created_at: Timestamp(0),
+			created_at: Timestamp(0).into(),
 			received_at: None,
 			expires_at: None,
 			status: None,
@@ -172,6 +172,7 @@ mod tests {
 			hat: None,
 			channel: None,
 			token: None,
+			delivery_error: None,
 		}
 	}
 

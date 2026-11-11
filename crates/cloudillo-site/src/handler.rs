@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
 // SPDX-License-Identifier: MPL-2.0
 
-//! `/api/sites` — a tenant's site configuration.
+//! `/api/site` — a tenant's site configuration.
 //!
 //! # Authorization
 //!
@@ -20,20 +20,24 @@
 //! # Shape
 //!
 //! One row per tenant, so the resource has no id and no listing: `GET` and `PATCH`
-//! both address `/api/sites` and answer with the same [`SiteConfig`]. `publish` and
+//! both address `/api/site` and answer with the same [`SiteConfig`]. `publish` and
 //! `rollback` each answer with the one `site_docs` row they wrote.
-//! `GET /api/sites/pages` is the odd one out — it opens every mount's container, for
+//! `GET /api/site/pages` is the odd one out — it opens every mount's container, for
 //! the navigation editor's target picker alone.
 //!
 //! Downloading a generation is not here: a container is an ordinary managed file, so
-//! `GET /api/files/{file_id}` already serves it under its own ABAC.
+//! `GET /api/files/{id}` already serves it under its own ABAC.
 
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{
+	Json,
+	extract::{Path, State},
+	http::StatusCode,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::cache;
 use crate::prelude::*;
-use cloudillo_core::extract::{Auth, OptionalRequestId};
+use cloudillo_core::extract::Auth;
 use cloudillo_types::meta_adapter::{
 	PublishSiteDoc, Site, SiteDoc, SiteNavItem, UpsertSite, UpsertSiteMount,
 };
@@ -57,7 +61,7 @@ pub struct SiteConfig {
 	pub derived_nav: Vec<SiteNavItem>,
 }
 
-/// Body of `PATCH /api/sites`.
+/// Body of `PATCH /api/site`.
 ///
 /// [`Patch`] gives each field the three PATCH states; the adapter's `UpsertSite` is
 /// a full assignment, so this handler reads the record first and fills in the rest.
@@ -80,17 +84,16 @@ pub struct PatchSite {
 const MAX_NAV_LABEL_LEN: usize = 128;
 const MAX_NAV_TARGET_LEN: usize = 512;
 
-/// `GET /api/sites` — the tenant's site record and its mounted documents.
+/// `GET /api/site` — the tenant's site record and its mounted documents.
 pub async fn get_site(
 	State(app): State<App>,
 	tn_id: TnId,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SiteConfig>>)> {
 	let config = read_config(&app, tn_id).await?;
-	Ok((StatusCode::OK, Json(ApiResponse::new(config).with_req_id(req_id.unwrap_or_default()))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(config))))
 }
 
-/// `PATCH /api/sites` — set or clear the site's explicit main navigation.
+/// `PATCH /api/site` — set or clear the site's explicit main navigation.
 ///
 /// Creates the record if the tenant has none, so the settings page needs no
 /// separate "enable site" call.
@@ -98,7 +101,6 @@ pub async fn patch_site(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(mut body): Json<PatchSite>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SiteConfig>>)> {
 	// Trimmed before it is checked: `is_safe_nav_target` judges the *trimmed* string,
@@ -133,7 +135,7 @@ pub async fn patch_site(
 	// Re-read rather than echo the request back: `created_at` / `updated_at` are
 	// written by the row's triggers, so only the stored row knows them.
 	let config = read_config(&app, tn_id).await?;
-	Ok((StatusCode::OK, Json(ApiResponse::new(config).with_req_id(req_id.unwrap_or_default()))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(config))))
 }
 
 /// One published page, as the navigation editor's target picker lists it.
@@ -170,7 +172,7 @@ struct PagesManifestPage {
 	archetype: Option<Box<str>>,
 }
 
-/// `GET /api/sites/pages` — every published page of every mount, for the
+/// `GET /api/site/pages` — every published page of every mount, for the
 /// navigation editor's target picker.
 ///
 /// Read on demand and **never cached**: one blob read per *mount* on a leader-only
@@ -182,7 +184,6 @@ struct PagesManifestPage {
 pub async fn list_site_pages(
 	State(app): State<App>,
 	tn_id: TnId,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<SitePage>>>)> {
 	let docs = app.meta_adapter.list_site_docs(tn_id).await?;
 	let mut pages: Vec<SitePage> = Vec::new();
@@ -216,10 +217,10 @@ pub async fn list_site_pages(
 	// A manifest's pages are a hash map, so without this the order changes between
 	// two identical requests and the picker reshuffles under the cursor.
 	pages.sort_by(|a, b| a.mount_path.cmp(&b.mount_path).then_with(|| a.path.cmp(&b.path)));
-	Ok((StatusCode::OK, Json(ApiResponse::new(pages).with_req_id(req_id.unwrap_or_default()))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(pages))))
 }
 
-/// Body of `POST /api/sites/publish`.
+/// Body of `POST /api/site/publish`.
 ///
 /// Both ids are already the caller's: the browser built the container, the shell
 /// uploaded it, and this call is the commit half. Nothing here describes the site —
@@ -247,7 +248,7 @@ struct ContainerManifest {
 /// The manifest version this server understands.
 const MANIFEST_VERSION: u32 = 1;
 
-/// `POST /api/sites/publish` — commit an uploaded container as a document's live
+/// `POST /api/site/publish` — commit an uploaded container as a document's live
 /// generation.
 ///
 /// Answers with the `site_docs` row after the flip, so `publishedFileId` echoes the
@@ -290,7 +291,6 @@ pub async fn publish_site(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(body): Json<PublishRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SiteDoc>>)> {
 	// Publishing into an unconfigured tenant would succeed and serve nothing; into a
@@ -434,7 +434,7 @@ pub async fn publish_site(
 	// has never published, which this path cannot reach.
 	reindex_generations(&app, tn_id, &doc);
 
-	Ok((StatusCode::OK, Json(ApiResponse::new(doc).with_req_id(req_id.unwrap_or_default()))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(doc))))
 }
 
 /// Re-index both container generations a document points at.
@@ -460,7 +460,7 @@ fn reindex_generations(app: &App, tn_id: TnId, doc: &SiteDoc) {
 	}
 }
 
-/// Body of `POST /api/sites/mounts` — one document, one site path.
+/// Body of `POST /api/site/mounts` — one document, one site path.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MountRequest {
@@ -471,7 +471,7 @@ pub struct MountRequest {
 	pub mount_path: String,
 }
 
-/// `POST /api/sites/mounts` — add a document to the site, or move one.
+/// `POST /api/site/mounts` — add a document to the site, or move one.
 ///
 /// Writes `mount_path` and nothing else, so it is safe on a published row: the
 /// container being served was built for `published_mount_path` and keeps serving from
@@ -485,7 +485,6 @@ pub async fn mount_site_doc(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(body): Json<MountRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SiteConfig>>)> {
 	if body.doc_file_id.trim().is_empty() {
@@ -520,18 +519,11 @@ pub async fn mount_site_doc(
 	info!("User {} mounted document {} at {}", auth.id_tag, body.doc_file_id, mount_path);
 
 	let config = read_config(&app, tn_id).await?;
-	Ok((StatusCode::OK, Json(ApiResponse::new(config).with_req_id(req_id.unwrap_or_default()))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(config))))
 }
 
-/// Body of `DELETE /api/sites/mounts`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UnmountRequest {
-	/// The document to take out of the site.
-	pub doc_file_id: String,
-}
-
-/// `DELETE /api/sites/mounts` — take a document out of the site.
+/// `DELETE /api/site/mounts/{mountId}` — take a document out of the site. `{mountId}` is
+/// the mounted document's file id.
 ///
 /// Unconditional, including a row that is currently serving: both generations lose
 /// their last reference and `GcTask` reaps them, exactly as a displaced generation is
@@ -550,23 +542,22 @@ pub async fn unmount_site_doc(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
-	Json(body): Json<UnmountRequest>,
-) -> ClResult<(StatusCode, Json<ApiResponse<SiteConfig>>)> {
+	Path(doc_file_id): Path<String>,
+) -> ClResult<StatusCode> {
 	// Read first: after the delete there is no row left to name the two containers
 	// whose page rows have to go.
 	let doc = app
 		.meta_adapter
-		.read_site_doc(tn_id, &body.doc_file_id)
+		.read_site_doc(tn_id, &doc_file_id)
 		.await?
 		.ok_or_else(|| Error::ValidationError("document is not part of the site".into()))?;
 
 	// Kept for the concurrent-delete case: the read above raced someone else's
 	// unmount of the same document.
-	if !app.meta_adapter.delete_site_mount(tn_id, &body.doc_file_id).await? {
+	if !app.meta_adapter.delete_site_mount(tn_id, &doc_file_id).await? {
 		return Err(Error::ValidationError("document is not part of the site".into()));
 	}
-	info!("User {} removed document {} from the site", auth.id_tag, body.doc_file_id);
+	info!("User {} removed document {} from the site", auth.id_tag, doc_file_id);
 
 	// Unlike the mount write above, this one *is* visible to serving: the removed
 	// row may have been the mount answering a live prefix.
@@ -577,11 +568,10 @@ pub async fn unmount_site_doc(
 	// Both generations, because neither is live now.
 	reindex_generations(&app, tn_id, &doc);
 
-	let config = read_config(&app, tn_id).await?;
-	Ok((StatusCode::OK, Json(ApiResponse::new(config).with_req_id(req_id.unwrap_or_default()))))
+	Ok(StatusCode::NO_CONTENT)
 }
 
-/// Body of `POST /api/sites/rollback`.
+/// Body of `POST /api/site/rollback`.
 ///
 /// Only the document, because a `site_docs` row keeps exactly two generations and
 /// the operation is a swap — there is no version to name.
@@ -592,7 +582,7 @@ pub struct RollbackRequest {
 	pub doc_file_id: String,
 }
 
-/// `POST /api/sites/rollback` — put the previous container back in service.
+/// `POST /api/site/rollback` — put the previous container back in service.
 ///
 /// Reached for when a publish went wrong, so it depends on nothing but the two ids
 /// already in the row: no generator, no container read, no manifest parse, and
@@ -611,7 +601,6 @@ pub async fn rollback_site(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(body): Json<RollbackRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SiteDoc>>)> {
 	// The adapter answers `false` for both "no such row" and "published once only".
@@ -637,7 +626,7 @@ pub async fn rollback_site(
 
 	reindex_generations(&app, tn_id, &doc);
 
-	Ok((StatusCode::OK, Json(ApiResponse::new(doc).with_req_id(req_id.unwrap_or_default()))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(doc))))
 }
 
 /// The longest mount path a manifest may declare. The manifest is

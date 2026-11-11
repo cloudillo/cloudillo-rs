@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use crate::perm::ResolvedEntry;
 use crate::prelude::*;
 use cloudillo_core::dir_cache::DirCache;
-use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
+use cloudillo_core::extract::{Auth, IdTag};
 use cloudillo_core::file_access;
 use cloudillo_types::auth_adapter::AuditCategory;
 use cloudillo_types::meta_adapter::{self, UpdateFileOptions};
@@ -49,16 +49,6 @@ pub(crate) async fn purge_entry(
 		cloudillo_core::search_index_file(app, tn_id, id);
 	}
 	Ok(purged)
-}
-
-/// PATCH /file/:fileId - Update file metadata
-/// Uses UpdateFileOptions with Patch<> fields for proper null/undefined handling
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PatchFileResponse {
-	pub entry_id: String,
-	pub file_id: Option<String>,
 }
 
 /// May `caller` write the two publication columns (`visibility`, `status`) of a row?
@@ -112,6 +102,7 @@ pub async fn check_reference_subject(
 
 /// PATCH body: the placement fields, plus the target drive of a root move.
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PatchFileRequest {
 	#[serde(flatten)]
 	pub opts: UpdateFileOptions,
@@ -234,7 +225,7 @@ async fn check_cross_drive_move(
 	{
 		Ok(())
 	} else {
-		Err(Error::PermissionDenied)
+		Err(Error::FileCrossRoom)
 	}
 }
 
@@ -266,6 +257,7 @@ async fn relocate(
 		.await
 }
 
+/// PATCH /api/files/{id} - Update file metadata; answers with the updated file
 pub async fn patch_file(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -274,7 +266,7 @@ pub async fn patch_file(
 	Path(file_id): Path<String>,
 	Extension(ResolvedEntry(file)): Extension<ResolvedEntry>,
 	Json(req): Json<PatchFileRequest>,
-) -> ClResult<Json<PatchFileResponse>> {
+) -> ClResult<Json<ApiResponse<meta_adapter::FileView>>> {
 	let mut opts = req.opts;
 	// `status` rides along on the same read as `visibility`, and is further held to `'A'` under
 	// the lifecycle gate below: `'D'` is a tombstone the GC hard-deletes, and delete / restore
@@ -338,24 +330,16 @@ pub async fn patch_file(
 
 	info!("User {} patched file {}", auth.id_tag, entry_id);
 
-	Ok(Json(PatchFileResponse { file_id: file.file_id.as_deref().map(Into::into), entry_id }))
+	Ok(Json(ApiResponse::new(read_updated(&app, auth.tn_id, &entry_id, &auth.id_tag).await?)))
 }
 
 /// DELETE /file/:fileId - Move file to trash (soft delete)
 /// DELETE /file/:fileId?permanent=true - Permanently delete file (only from trash)
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeleteFileQuery {
 	/// If true, permanently delete the file (only works for files already in trash)
 	#[serde(default)]
-	pub permanent: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeleteFileResponse {
-	pub entry_id: String,
-	pub file_id: Option<String>,
-	/// True if file was permanently deleted, false if moved to trash
 	pub permanent: bool,
 }
 
@@ -385,10 +369,9 @@ pub async fn delete_file(
 	Auth(auth): Auth,
 	Extension(ResolvedEntry(file)): Extension<ResolvedEntry>,
 	Query(query): Query<DeleteFileQuery>,
-) -> ClResult<Json<DeleteFileResponse>> {
+) -> ClResult<StatusCode> {
 	require_lifecycle(&app, &auth, &tenant_id_tag, &file).await?;
 	let entry_id = file.entry_id.to_string();
-	let file_id = file.file_id.as_deref().map(Into::into);
 
 	if query.permanent {
 		// Permanent delete - only allowed if file is in trash
@@ -413,7 +396,7 @@ pub async fn delete_file(
 			purged.share_entries_removed
 		);
 
-		Ok(Json(DeleteFileResponse { entry_id, file_id, permanent: true }))
+		Ok(StatusCode::NO_CONTENT)
 	} else {
 		// Soft delete - move to trash folder
 		// No cascade to document tree children: they follow the root implicitly
@@ -435,24 +418,29 @@ pub async fn delete_file(
 
 		info!("User {} moved file {} to trash", auth.id_tag, entry_id);
 
-		Ok(Json(DeleteFileResponse { entry_id, file_id, permanent: false }))
+		Ok(StatusCode::NO_CONTENT)
 	}
 }
 
 /// POST /file/:fileId/restore - Restore file from trash
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RestoreFileRequest {
 	/// Target folder to restore to. If null/missing, restores to the root of the entry's drive.
-	#[serde(rename = "parentId")]
 	pub parent_id: Option<String>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RestoreFileResponse {
-	pub entry_id: String,
-	pub file_id: Option<String>,
-	pub parent_id: Option<String>,
+/// The updated entry, re-read with the caller's user data, for a 200 PATCH/PUT/restore body.
+pub(crate) async fn read_updated(
+	app: &App,
+	tn_id: TnId,
+	entry_id: &str,
+	id_tag: &str,
+) -> ClResult<meta_adapter::FileView> {
+	app.meta_adapter
+		.read_file_with_user_data(tn_id, entry_id, id_tag)
+		.await?
+		.ok_or(Error::NotFound)
 }
 
 pub async fn restore_file(
@@ -461,7 +449,7 @@ pub async fn restore_file(
 	Auth(auth): Auth,
 	Extension(ResolvedEntry(file)): Extension<ResolvedEntry>,
 	Json(req): Json<RestoreFileRequest>,
-) -> ClResult<Json<RestoreFileResponse>> {
+) -> ClResult<Json<ApiResponse<meta_adapter::FileView>>> {
 	require_lifecycle(&app, &auth, &tenant_id_tag, &file).await?;
 
 	if file.parent_id.as_deref() != Some(TRASH_FOLDER_ID) {
@@ -506,15 +494,12 @@ pub async fn restore_file(
 
 	info!("User {} restored file {} to {:?}", auth.id_tag, entry_id, target_parent_id);
 
-	Ok(Json(RestoreFileResponse {
-		entry_id,
-		file_id: file.file_id.as_deref().map(Into::into),
-		parent_id: target_parent_id,
-	}))
+	Ok(Json(ApiResponse::new(read_updated(&app, auth.tn_id, &entry_id, &auth.id_tag).await?)))
 }
 
-/// DELETE /trash - Empty trash (permanently delete all files in trash)
+/// POST /api/trash/empty - Empty trash (permanently delete all files in trash)
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EmptyTrashResponse {
 	/// Number of trash entries permanently deleted. Not the total number of rows tombstoned: a
 	/// trashed file takes its whole document tree with it, and those children were never in the
@@ -526,7 +511,7 @@ pub async fn empty_trash(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
-) -> ClResult<Json<EmptyTrashResponse>> {
+) -> ClResult<Json<ApiResponse<EmptyTrashResponse>>> {
 	// A scope carries no lifecycle authority. Everyone else purges the rows they may manage
 	// (`file_access::can_manage_lifecycle`, per row) and leaves the rest in place.
 	if auth.scope.is_some() {
@@ -571,36 +556,19 @@ pub async fn empty_trash(
 		auth.id_tag, deleted_count, files_deleted, refs_removed, share_entries_removed
 	);
 
-	Ok(Json(EmptyTrashResponse { deleted_count }))
+	Ok(Json(ApiResponse::new(EmptyTrashResponse { deleted_count })))
 }
 
-/// PATCH /file/:fileId/user - Update user-specific file data (pinned/starred)
+/// PATCH /api/files/{id}/user-data - Update user-specific file data (pinned/starred)
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PatchFileUserDataRequest {
-	/// Pin file for quick access
-	pub pinned: Option<bool>,
-	/// Star/favorite file
-	pub starred: Option<bool>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PatchFileUserDataResponse {
-	pub entry_id: String,
-	pub file_id: Option<String>,
-	#[serde(
-		serialize_with = "cloudillo_types::types::serialize_timestamp_iso_opt",
-		skip_serializing_if = "Option::is_none"
-	)]
-	pub accessed_at: Option<cloudillo_types::types::Timestamp>,
-	#[serde(
-		serialize_with = "cloudillo_types::types::serialize_timestamp_iso_opt",
-		skip_serializing_if = "Option::is_none"
-	)]
-	pub modified_at: Option<cloudillo_types::types::Timestamp>,
-	pub pinned: bool,
-	pub starred: bool,
+	/// Pin file for quick access; `null` clears
+	#[serde(default)]
+	pub pinned: Patch<bool>,
+	/// Star/favorite file; `null` clears
+	#[serde(default)]
+	pub starred: Patch<bool>,
 }
 
 pub async fn patch_file_user_data(
@@ -609,7 +577,7 @@ pub async fn patch_file_user_data(
 	IdTag(tenant_id_tag): IdTag,
 	Path(file_id): Path<String>,
 	Json(req): Json<PatchFileUserDataRequest>,
-) -> ClResult<Json<PatchFileUserDataResponse>> {
+) -> ClResult<Json<ApiResponse<meta_adapter::FileView>>> {
 	// Pins and stars are kept per user: a share link (`sub`-less and scoped, so its id_tag
 	// names the tenant) or a guest has no user to keep them for. The owner's own session is
 	// `sub`-less too, but unscoped.
@@ -632,6 +600,7 @@ pub async fn patch_file_user_data(
 		Err(Error::PermissionDenied) => return Err(Error::NotFound),
 		Err(e) => return Err(e),
 	};
+	file_access::require_entry_id(&file, &file_id)?;
 
 	// A scoped token (app iframe, file API key) marks only the file it is scoped to.
 	if matches!(
@@ -648,14 +617,7 @@ pub async fn patch_file_user_data(
 	}
 
 	// Update user-specific data
-	let pinned = match req.pinned {
-		Some(v) => Patch::Value(v),
-		None => Patch::Undefined,
-	};
-	let starred = match req.starred {
-		Some(v) => Patch::Value(v),
-		None => Patch::Undefined,
-	};
+	let PatchFileUserDataRequest { pinned, starred } = req;
 	let user_data = app
 		.meta_adapter
 		.update_file_user_data(
@@ -673,14 +635,7 @@ pub async fn patch_file_user_data(
 		auth.id_tag, file.entry_id, user_data.pinned, user_data.starred
 	);
 
-	Ok(Json(PatchFileUserDataResponse {
-		entry_id: file.entry_id.to_string(),
-		file_id: file.file_id.as_deref().map(Into::into),
-		accessed_at: user_data.accessed_at,
-		modified_at: user_data.modified_at,
-		pinned: user_data.pinned,
-		starred: user_data.starred,
-	}))
+	Ok(Json(ApiResponse::new(read_updated(&app, auth.tn_id, &file.entry_id, &auth.id_tag).await?)))
 }
 
 /// POST /api/files/:fileId/duplicate - Copy a file.
@@ -699,9 +654,8 @@ pub async fn duplicate_file(
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
 	Path(file_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<DuplicateFileRequest>,
-) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
+) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::FileView>>)> {
 	// Read access to the *source* is required before copying its contents, otherwise
 	// any private CRDT/RTDB document could be exfiltrated by duplicating it. The check
 	// loads the row, so its `file_view` doubles as the source metadata.
@@ -713,6 +667,7 @@ pub async fn duplicate_file(
 			file_access::FileAccessError::AccessDenied => Error::PermissionDenied,
 			file_access::FileAccessError::InternalError(m) => Error::Internal(m),
 		})?;
+	file_access::require_entry_id(&access.file_view, &file_id)?;
 
 	// A scoped (share-link) caller needs editor access, and only within its own scope —
 	// `check_file_access` resolved both, returning the scope's own level for
@@ -812,9 +767,8 @@ pub async fn duplicate_file(
 			.await?;
 		info!("User {} copied file {} -> entry {}", auth.id_tag, file_id, entry_id);
 		cloudillo_core::search_index_file(&app, tn_id, &entry_id);
-		let data = super::handler::created_response(&entry_id, Some(&content_id));
-		let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
-		return Ok((StatusCode::CREATED, Json(response)));
+		let view = super::handler::read_created(&app, tn_id, &entry_id, &auth.id_tag).await?;
+		return Ok((StatusCode::CREATED, Json(ApiResponse::new(view))));
 	}
 
 	let new_file_id = utils::random_id()?;
@@ -862,9 +816,8 @@ pub async fn duplicate_file(
 	info!("User {} duplicated file {} -> {}", auth.id_tag, file_id, new_file_id);
 	cloudillo_core::search_index_file(&app, tn_id, &new_file_id);
 
-	let data = super::handler::created_response(&created.entry_id, Some(&new_file_id));
-	let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
-	Ok((StatusCode::CREATED, Json(response)))
+	let view = super::handler::read_created(&app, tn_id, &created.entry_id, &auth.id_tag).await?;
+	Ok((StatusCode::CREATED, Json(ApiResponse::new(view))))
 }
 
 #[cfg(test)]

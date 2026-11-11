@@ -95,7 +95,7 @@ pub(crate) async fn before_receive(app: App, ctx: BeforeReceive) -> ClResult<()>
 		if throttled(ctx.tn_id, conv_id, &a.iss) {
 			return Err(Error::PermissionDenied);
 		}
-		if a.t.as_ref() == "PRES:TYPING" {
+		if a.t.as_ref() == "PRES:TYPING" && ctx.effects.propagate {
 			relay_typing(&app, ctx.tn_id, &ctx.token, &conv, &a.iss).await;
 		}
 	} else {
@@ -139,7 +139,7 @@ pub(crate) async fn on_create(app: App, ctx: HookContext) -> ClResult<HookResult
 	else {
 		return done;
 	};
-	if !throttled(ctx.tn_id, conv_id, &ctx.issuer) {
+	if ctx.effects.propagate && !throttled(ctx.tn_id, conv_id, &ctx.issuer) {
 		relay_typing(&app, ctx.tn_id, token, &conv, &ctx.issuer).await;
 	}
 	done

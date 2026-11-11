@@ -24,10 +24,7 @@ use serde_with::skip_serializing_none;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use cloudillo_core::{
-	Auth,
-	extract::{IdTag, OptionalRequestId},
-};
+use cloudillo_core::{Auth, extract::IdTag};
 use cloudillo_email::{EmailModule, EmailTaskParams, get_tenant_lang};
 use cloudillo_types::types::{ApiResponse, SHARED_TN};
 
@@ -393,13 +390,11 @@ pub async fn get_totp(
 	State(app): State<App>,
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<TotpStatus>>)> {
 	cloudillo_core::abac::require_tenant_account(&auth, &id_tag)?;
 	let mode = mfa_mode(&app).await?;
 	let enrolled = app.auth_adapter.get_totp(auth.tn_id).await?.is_some();
-	let response =
-		ApiResponse::new(TotpStatus { mode, enrolled }).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(TotpStatus { mode, enrolled });
 	Ok((StatusCode::OK, Json(response)))
 }
 
@@ -410,7 +405,6 @@ pub async fn post_enroll(
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<TotpEnrollReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<TotpEnrollRes>>)> {
 	cloudillo_core::abac::require_tenant_account(&auth, &id_tag)?;
@@ -433,7 +427,7 @@ pub async fn post_enroll(
 	let secret = generate_secret();
 	app.ext::<MfaStore>()?.start_enroll(auth.tn_id, &secret)?;
 	let res = TotpEnrollRes { otpauth_uri: otpauth_uri(&auth.id_tag, &secret), secret };
-	Ok((StatusCode::OK, Json(ApiResponse::new(res).with_req_id(req_id.unwrap_or_default()))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(res))))
 }
 
 /// POST /api/auth/totp/confirm `{code}` - store the pending secret once a code checks out.
@@ -442,7 +436,6 @@ pub async fn post_confirm(
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<TotpCodeReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<TotpStatus>>)> {
 	cloudillo_core::abac::require_tenant_account(&auth, &id_tag)?;
@@ -467,8 +460,7 @@ pub async fn post_confirm(
 	record_auth(&app, "auth.mfa.enroll", "success", Some(auth.tn_id), &auth.id_tag, &addr, None)
 		.await;
 	notify_mfa_enrolled(&app, auth.tn_id, &auth.id_tag, &addr).await;
-	let response = ApiResponse::new(TotpStatus { mode, enrolled: true })
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(TotpStatus { mode, enrolled: true });
 	Ok((StatusCode::OK, Json(response)))
 }
 
@@ -479,12 +471,10 @@ pub async fn delete_totp(
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<TotpCodeReq>,
-) -> ClResult<(StatusCode, Json<ApiResponse<TotpStatus>>)> {
+) -> ClResult<StatusCode> {
 	cloudillo_core::abac::require_tenant_account(&auth, &id_tag)?;
-	let mode = mfa_mode(&app).await?;
-	if mode == "required" {
+	if mfa_mode(&app).await? == "required" {
 		return Err(Error::PermissionDenied);
 	}
 	let (secret, last_step) =
@@ -501,9 +491,7 @@ pub async fn delete_totp(
 	app.auth_adapter.clear_totp(auth.tn_id).await?;
 	record_auth(&app, "auth.mfa.disable", "success", Some(auth.tn_id), &auth.id_tag, &addr, None)
 		.await;
-	let response = ApiResponse::new(TotpStatus { mode, enrolled: false })
-		.with_req_id(req_id.unwrap_or_default());
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

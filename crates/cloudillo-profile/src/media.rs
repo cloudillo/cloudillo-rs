@@ -13,6 +13,7 @@ use crate::prelude::*;
 use cloudillo_core::extract::{Auth, IdTag};
 use cloudillo_core::scheduler::{Task, TaskId};
 use cloudillo_file::{image, preset};
+use cloudillo_types::types::ApiResponse;
 use cloudillo_types::{auth_adapter, meta_adapter};
 
 /// Image type for tenant profile updates
@@ -153,7 +154,7 @@ pub async fn put_profile_image(
 	Auth(auth): Auth,
 	IdTag(tenant): IdTag,
 	body: Bytes,
-) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
+) -> ClResult<(StatusCode, Json<ApiResponse<TenantImageResponse>>)> {
 	put_tenant_image(app, auth, &tenant, body, TenantImageType::ProfilePic).await
 }
 
@@ -163,8 +164,18 @@ pub async fn put_cover_image(
 	Auth(auth): Auth,
 	IdTag(tenant): IdTag,
 	body: Bytes,
-) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
+) -> ClResult<(StatusCode, Json<ApiResponse<TenantImageResponse>>)> {
 	put_tenant_image(app, auth, &tenant, body, TenantImageType::CoverPic).await
+}
+
+/// Body of a profile-picture / cover-image upload. `file_id` is the pending `@<f_id>` until the
+/// content id is computed.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenantImageResponse {
+	pub file_id: String,
+	#[serde(rename = "type")]
+	pub typ: &'static str,
 }
 
 /// Shared body of the profile-picture and cover-image upload handlers.
@@ -174,7 +185,7 @@ async fn put_tenant_image(
 	tenant: &str,
 	body: Bytes,
 	kind: TenantImageType,
-) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
+) -> ClResult<(StatusCode, Json<ApiResponse<TenantImageResponse>>)> {
 	let image_data = body.to_vec();
 
 	if image_data.is_empty() {
@@ -229,13 +240,9 @@ async fn put_tenant_image(
 				crate::reload_site_cache_after_profile_change(&app, auth.tn_id).await;
 			}
 			info!("User {} uploaded {} (existing): {}", auth.id_tag, kind.log_label(), fid);
-			return Ok((
-				StatusCode::OK,
-				Json(json!({
-					"fileId": fid,
-					"type": kind.response_type()
-				})),
-			));
+			// Tenant already updated: 200, not 202.
+			let body = TenantImageResponse { file_id: fid.into(), typ: kind.response_type() };
+			return Ok((StatusCode::OK, Json(ApiResponse::new(body))));
 		}
 	};
 
@@ -254,13 +261,9 @@ async fn put_tenant_image(
 
 	info!("User {} uploaded {}: {}", auth.id_tag, kind.log_label(), pending_file_id);
 
-	Ok((
-		StatusCode::OK,
-		Json(json!({
-			"fileId": pending_file_id,
-			"type": kind.response_type()
-		})),
-	))
+	// 202: `TenantImageUpdaterTask` writes the tenant field once the file_id exists.
+	let body = TenantImageResponse { file_id: pending_file_id, typ: kind.response_type() };
+	Ok((StatusCode::ACCEPTED, Json(ApiResponse::new(body))))
 }
 
 // vim: ts=4

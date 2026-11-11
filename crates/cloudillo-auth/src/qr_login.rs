@@ -19,10 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-use cloudillo_core::{
-	Auth,
-	extract::{IdTag, OptionalRequestId},
-};
+use cloudillo_core::{Auth, extract::IdTag};
 use cloudillo_types::types::ApiResponse;
 
 use crate::handler::{Login, return_login};
@@ -92,7 +89,7 @@ fn hash_secret(secret: &str) -> String {
 }
 
 // ============================================================================
-// POST /api/auth/qr-login/init
+// POST /api/auth/login/qr
 // ============================================================================
 
 #[derive(Clone, Serialize)]
@@ -151,18 +148,17 @@ pub async fn post_init(
 	State(app): State<App>,
 	tn_id: TnId,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	headers: HeaderMap,
 ) -> ClResult<(StatusCode, Json<ApiResponse<InitResponse>>)> {
 	let result = create_session(&app, tn_id, &addr, &headers)?;
 
-	let response = ApiResponse::new(result).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(result);
 
 	Ok((StatusCode::CREATED, Json(response)))
 }
 
 // ============================================================================
-// GET /api/auth/qr-login/{session_id}/status
+// GET /api/auth/login/qr/{sessionId}
 // ============================================================================
 
 /// Maximum long-poll timeout in seconds
@@ -172,13 +168,14 @@ const MAX_POLL_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_POLL_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StatusQuery {
 	/// Long-poll timeout in seconds (default 15, max 30)
 	timeout: Option<u64>,
 }
 
 /// Custom header for QR login secret (avoids leaking secret in query string / logs / Referer)
-const QR_SECRET_HEADER: &str = "x-qr-secret";
+const QR_SECRET_HEADER: &str = "cloudillo-qr-secret";
 
 #[derive(Serialize)]
 pub struct StatusResponse {
@@ -201,16 +198,11 @@ fn verify_secret(store: &QrLoginStore, session_id: &str, secret: &str) -> ClResu
 
 /// Try to resolve the current session status into a response.
 /// Returns `Ok(response)` if terminal or non-pending, `Err(notify)` if pending (for long-poll).
-fn try_resolve_status(
-	store: &QrLoginStore,
-	session_id: &str,
-	req_id: &str,
-) -> Result<StatusResult, Arc<Notify>> {
+fn try_resolve_status(store: &QrLoginStore, session_id: &str) -> Result<StatusResult, Arc<Notify>> {
 	let entry = store.sessions.get(session_id);
 	let Some(session) = entry else {
 		let response =
-			ApiResponse::new(StatusResponse { status: "expired".to_string(), login: None })
-				.with_req_id(req_id.to_string());
+			ApiResponse::new(StatusResponse { status: "expired".to_string(), login: None });
 		return Ok((StatusCode::OK, Json(response)));
 	};
 
@@ -221,8 +213,7 @@ fn try_resolve_status(
 		// drop and remove, so only remove if still expired.
 		store.sessions.remove_if(session_id, |_, s| Instant::now() >= s.expires_at);
 		let response =
-			ApiResponse::new(StatusResponse { status: "expired".to_string(), login: None })
-				.with_req_id(req_id.to_string());
+			ApiResponse::new(StatusResponse { status: "expired".to_string(), login: None });
 		return Ok((StatusCode::OK, Json(response)));
 	}
 
@@ -235,8 +226,7 @@ fn try_resolve_status(
 			let response = ApiResponse::new(StatusResponse {
 				status: "approved".to_string(),
 				login: login_data,
-			})
-			.with_req_id(req_id.to_string());
+			});
 			Ok((StatusCode::OK, Json(response)))
 		}
 		QrLoginStatus::Denied => {
@@ -244,8 +234,7 @@ fn try_resolve_status(
 			// Safe to remove unconditionally: Denied is a terminal state
 			store.sessions.remove(session_id);
 			let response =
-				ApiResponse::new(StatusResponse { status: "denied".to_string(), login: None })
-					.with_req_id(req_id.to_string());
+				ApiResponse::new(StatusResponse { status: "denied".to_string(), login: None });
 			Ok((StatusCode::OK, Json(response)))
 		}
 		QrLoginStatus::Pending => {
@@ -260,12 +249,9 @@ pub async fn get_status(
 	State(app): State<App>,
 	Path(session_id): Path<String>,
 	Query(query): Query<StatusQuery>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	headers: HeaderMap,
 ) -> ClResult<(StatusCode, Json<ApiResponse<StatusResponse>>)> {
 	let store = app.ext::<QrLoginStore>()?;
-	let req_id_str = req_id.unwrap_or_default();
-
 	// Extract secret from header
 	let secret = headers
 		.get(QR_SECRET_HEADER)
@@ -276,7 +262,7 @@ pub async fn get_status(
 	verify_secret(store, &session_id, secret)?;
 
 	// Check current status (reuses shared resolution logic)
-	let notify_and_wait = match try_resolve_status(store, &session_id, &req_id_str) {
+	let notify_and_wait = match try_resolve_status(store, &session_id) {
 		Ok(response) => return Ok(response),
 		Err(notify) => {
 			// Still pending — compute long-poll wait time
@@ -295,19 +281,18 @@ pub async fn get_status(
 	let _ = tokio::time::timeout(wait, notify.notified()).await;
 
 	// Re-check after wait
-	if let Ok(response) = try_resolve_status(store, &session_id, &req_id_str) {
+	if let Ok(response) = try_resolve_status(store, &session_id) {
 		Ok(response)
 	} else {
 		// Still pending after timeout
 		let response =
-			ApiResponse::new(StatusResponse { status: "pending".to_string(), login: None })
-				.with_req_id(req_id_str);
+			ApiResponse::new(StatusResponse { status: "pending".to_string(), login: None });
 		Ok((StatusCode::OK, Json(response)))
 	}
 }
 
 // ============================================================================
-// GET /api/auth/qr-login/{session_id}/details (protected)
+// GET /api/auth/login/qr/{sessionId}/details (protected)
 // ============================================================================
 
 #[derive(Serialize)]
@@ -323,7 +308,6 @@ pub async fn get_details(
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
 	Path(session_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<DetailsResponse>>)> {
 	let store = app.ext::<QrLoginStore>()?;
 
@@ -356,14 +340,13 @@ pub async fn get_details(
 		(session.user_agent.clone(), session.ip_address.clone())
 	};
 
-	let response = ApiResponse::new(DetailsResponse { user_agent, ip_address })
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(DetailsResponse { user_agent, ip_address });
 
 	Ok((StatusCode::OK, Json(response)))
 }
 
 // ============================================================================
-// POST /api/auth/qr-login/{session_id}/respond (protected)
+// POST /api/auth/login/qr/{sessionId}/respond (protected)
 // ============================================================================
 
 #[derive(Deserialize)]
@@ -377,7 +360,6 @@ pub async fn post_respond(
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
 	Path(session_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(body): Json<RespondRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<StatusResponse>>)> {
 	let store = app.ext::<QrLoginStore>()?;
@@ -464,8 +446,7 @@ pub async fn post_respond(
 
 	let status_str = if body.approved { "approved" } else { "denied" };
 
-	let response = ApiResponse::new(StatusResponse { status: status_str.to_string(), login: None })
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(StatusResponse { status: status_str.to_string(), login: None });
 
 	Ok((StatusCode::OK, Json(response)))
 }

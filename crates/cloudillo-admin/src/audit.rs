@@ -1,20 +1,21 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
 // SPDX-License-Identifier: MPL-2.0
 
-//! Admin audit trail: `admin.*` event helper, `GET /api/admin/audit` and its CSV export.
+//! Admin audit trail: `admin.*` event helper and `GET /api/admin/audit` (JSON, or CSV on
+//! `Accept: text/csv`).
 
 use axum::{
 	Json,
 	extract::{Query, State},
-	http::{StatusCode, header},
-	response::IntoResponse,
+	http::{HeaderMap, StatusCode, header},
+	response::{IntoResponse, Response},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::net::SocketAddr;
 
 use cloudillo_core::audit;
 use cloudillo_types::auth_adapter::{AuditCategory, AuditEventRow, AuditQuery};
-use cloudillo_types::types::ApiResponse;
+use cloudillo_types::types::{ApiResponse, ApiTime, CursorData};
 
 use crate::prelude::*;
 
@@ -38,29 +39,23 @@ pub(crate) async fn record_admin(
 	audit::record_event(app, cat, event, outcome, tn_id, Some(actor), addr, details).await;
 }
 
-/// Query of `GET /api/admin/audit[.csv]`. `from`/`to` are unix seconds (inclusive), `event` is
-/// a prefix. `tnId` or `idTag` narrows to one tenant; without either, every row (incl.
+/// Query of `GET /api/admin/audit`. `createdAfter`/`createdBefore` are RFC 3339 (inclusive),
+/// `event` is a prefix, `actorIdTag` the acting identity. `tnId` or `idTag` narrows to one tenant; without either, every row (incl.
 /// server-wide ones) is returned.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminAuditQuery {
 	pub tn_id: Option<u32>,
 	pub id_tag: Option<String>,
-	pub from: Option<i64>,
-	pub to: Option<i64>,
+	pub created_after: Option<ApiTime>,
+	pub created_before: Option<ApiTime>,
 	pub category: Option<String>,
 	pub event: Option<String>,
-	pub actor: Option<String>,
+	pub actor_id_tag: Option<String>,
 	pub outcome: Option<String>,
 	pub limit: Option<u32>,
-	pub cursor: Option<i64>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AdminAuditRes {
-	pub events: Vec<AuditEventRow>,
-	pub next_cursor: Option<i64>,
+	/// Opaque cursor: the previous page's `next`
+	pub cursor: Option<String>,
 }
 
 async fn to_query(app: &App, q: AdminAuditQuery) -> ClResult<AuditQuery> {
@@ -69,42 +64,50 @@ async fn to_query(app: &App, q: AdminAuditQuery) -> ClResult<AuditQuery> {
 		(None, Some(id_tag)) => Some(app.auth_adapter.read_tn_id(id_tag).await?),
 		(None, None) => None,
 	};
-	Ok(AuditQuery {
-		tn_id,
-		from: q.from.map(Timestamp),
-		to: q.to.map(Timestamp),
-		category: audit::parse_category(q.category.as_deref())?,
-		event_prefix: q.event.map(Into::into),
-		actor: q.actor.map(Into::into),
-		outcome: q.outcome.map(Into::into),
-		limit: Some(audit::page_limit(q.limit)),
+	// Flat fields, not `#[serde(flatten)] AuditFilter`: flatten breaks the numeric `tnId` /
+	// `limit` under urlencoded queries.
+	let filter = audit::AuditFilter {
+		created_after: q.created_after,
+		created_before: q.created_before,
+		category: q.category,
+		event: q.event,
+		outcome: q.outcome,
+		limit: q.limit,
 		cursor: q.cursor,
-	})
+	};
+	filter.into_query(tn_id, q.actor_id_tag.map(Into::into))
 }
 
-/// GET /api/admin/audit - All audit rows, filtered and paged (newest first).
+/// GET /api/admin/audit - All audit rows, filtered and paged (newest first). With
+/// `Accept: text/csv` the answer is the CSV export instead ([`export_audit_csv`]).
 pub async fn list_audit(
 	State(app): State<App>,
+	headers: HeaderMap,
 	Query(q): Query<AdminAuditQuery>,
-) -> ClResult<(StatusCode, Json<ApiResponse<AdminAuditRes>>)> {
+) -> ClResult<Response> {
+	let wants_csv = headers
+		.get(header::ACCEPT)
+		.and_then(|v| v.to_str().ok())
+		.is_some_and(|v| v.contains("text/csv"));
+	if wants_csv {
+		return Ok(export_audit_csv(&app, q).await?.into_response());
+	}
 	let (events, next_cursor) = audit::list_page(&app, to_query(&app, q).await?).await?;
-	Ok((StatusCode::OK, Json(ApiResponse::new(AdminAuditRes { events, next_cursor }))))
+	let next = next_cursor.map(|c| CursorData::int("audit", c));
+	Ok((StatusCode::OK, Json(ApiResponse::with_next(events, next))).into_response())
 }
 
-/// GET /api/admin/audit.csv - Same filters as the list, every page up to `CSV_MAX_ROWS` rows.
-/// `limit` is the page size used internally; `cursor` is the starting point.
-pub async fn export_audit_csv(
-	State(app): State<App>,
-	Query(q): Query<AdminAuditQuery>,
-) -> ClResult<impl IntoResponse> {
-	let mut query = to_query(&app, q).await?;
+/// CSV form of [`list_audit`]: same filters, every page up to `CSV_MAX_ROWS` rows. `limit` is
+/// the page size used internally; `cursor` is the starting point.
+async fn export_audit_csv(app: &App, q: AdminAuditQuery) -> ClResult<impl IntoResponse> {
+	let mut query = to_query(app, q).await?;
 	query.limit = Some(audit::MAX_LIMIT);
 
 	let mut out = CSV_COLUMNS.join(",");
 	out.push_str("\r\n");
 	let mut rows = 0;
 	while rows < CSV_MAX_ROWS {
-		let (page, next) = audit::list_page(&app, query.clone()).await?;
+		let (page, next) = audit::list_page(app, query.clone()).await?;
 		for row in page.iter().take(CSV_MAX_ROWS - rows) {
 			push_csv_row(&mut out, row)?;
 		}

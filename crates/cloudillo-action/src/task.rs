@@ -539,8 +539,8 @@ pub async fn create_action_as(
 
 	let a_id = match action_result {
 		meta_adapter::ActionId::AId(a_id) => a_id,
-		meta_adapter::ActionId::ActionId(_) => {
-			// This shouldn't happen for new actions
+		meta_adapter::ActionId::ActionId(_) | meta_adapter::ActionId::SupersededOnArrival => {
+			// This shouldn't happen for new actions (newer-wins is inbound only)
 			return Err(Error::Internal("Unexpected ActionId result".into()));
 		}
 	};
@@ -1230,7 +1230,7 @@ impl Task<App> for DraftPublishTask {
 				.as_ref()
 				.map(|a| a.iter().map(|av| av.file_id.clone()).collect()),
 			subject: action_view.subject.clone(),
-			expires_at: action_view.expires_at,
+			expires_at: action_view.expires_at.map(Into::into),
 			visibility: action_view.visibility,
 			flags: action_view.flags.clone(),
 			x: action_view.x.clone(),
@@ -1325,6 +1325,7 @@ impl Task<App> for ActionVerifierTask {
 			&self.token,
 			false,
 			self.client_address.as_ref().map(ToString::to_string),
+			crate::post_store::Origin::Live,
 		)
 		.await?;
 

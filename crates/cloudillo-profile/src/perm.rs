@@ -25,10 +25,11 @@ use cloudillo_types::types::ProfileAttrs;
 /// id_tag would authorize against a different subject.
 #[derive(Deserialize)]
 pub struct IdTagParam {
+	#[serde(rename = "idTag")]
 	id_tag: String,
 }
 
-/// The guard's path extraction, kept fallible: a route with no `{id_tag}` capture
+/// The guard's path extraction, kept fallible: a route with no `{idTag}` capture
 /// gets a logged `PermissionDenied` rather than axum's bare 400 with the serde
 /// message in it.
 type IdTagPath = Result<Path<IdTagParam>, PathRejection>;
@@ -43,7 +44,7 @@ type IdTagPath = Result<Path<IdTagParam>, PathRejection>;
 /// # Returns
 /// A cloneable middleware function with return type `PermissionCheckOutput`
 ///
-/// The route must capture the subject as `{id_tag}` — the guard reads it by name,
+/// The route must capture the subject as `{idTag}` — the guard reads it by name,
 /// not by position. Other captures are ignored.
 pub fn check_perm_profile(
 	action: &'static str,
@@ -65,7 +66,7 @@ async fn check_profile_permission(
 	use tracing::warn;
 
 	let Ok(Path(IdTagParam { id_tag })) = params else {
-		warn!("Profile permission guard on a route with no {{id_tag}} capture");
+		warn!("Profile permission guard on a route with no {{idTag}} capture");
 		return Err(Error::PermissionDenied);
 	};
 

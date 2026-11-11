@@ -141,20 +141,22 @@ async fn retire_oldest(app: &App, context: &HookContext) -> ClResult<()> {
 			}
 			continue;
 		}
-		if let Err(e) = crate::task::create_action(
-			app,
-			tn_id,
-			&context.tenant_tag,
-			CreateAction {
-				typ: "PIN".into(),
-				sub_typ: Some("DEL".into()),
-				subject: old.subject.clone(),
-				parent_id: parent.map(Into::into),
-				audience_tag: audience.map(Into::into),
-				..Default::default()
-			},
-		)
-		.await
+		// The PIN:DEL is an emitted action: without `propagate` the cap waits for a live pin.
+		if context.effects.propagate
+			&& let Err(e) = crate::task::create_action(
+				app,
+				tn_id,
+				&context.tenant_tag,
+				CreateAction {
+					typ: "PIN".into(),
+					sub_typ: Some("DEL".into()),
+					subject: old.subject.clone(),
+					parent_id: parent.map(Into::into),
+					audience_tag: audience.map(Into::into),
+					..Default::default()
+				},
+			)
+			.await
 		{
 			tracing::warn!("PIN cap: retiring pin {} failed: {}", old.action_id, e);
 		}

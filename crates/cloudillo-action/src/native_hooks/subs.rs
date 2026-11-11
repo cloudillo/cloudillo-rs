@@ -654,7 +654,8 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 				.meta_adapter
 				.get_action_by_key(tn_id, &format!("SUBS:{}:{}", subject_id, context.issuer))
 				.await? && let Err(e) =
-			crate::fanout::maybe_relay_child_to_subscribers(&app, tn_id, &stored).await
+			crate::fanout::maybe_relay_child_to_subscribers(&app, tn_id, &stored, context.effects)
+				.await
 		{
 			tracing::warn!(action_id = %context.action_id, error = %e, "Failed to relay the accepted knock");
 		}

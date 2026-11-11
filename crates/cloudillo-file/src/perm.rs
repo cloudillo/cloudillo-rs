@@ -18,19 +18,18 @@ use cloudillo_core::middleware::PermissionCheckOutput;
 use cloudillo_types::auth_adapter::AuthCtx;
 use cloudillo_types::types::FileAttrs;
 
-/// The one path parameter this guard authorizes on.
+/// The path parameter this guard authorizes on: `{id}` (a file route) or `{variantId}`
+/// (`/api/variants/{variantId}`, resolved to its file id). A route carries one of them.
 ///
 /// Extracted by name, so trailing captures like the `{tag}` of
-/// `/api/files/{file_id}/tag/{tag}` are simply ignored — `Path<T>` over a struct
+/// `/api/files/{id}/tags/{tag}` are simply ignored — `Path<T>` over a struct
 /// goes through serde's map deserializer, which does not arity-check the way a
 /// single-field `Path<String>` (a *sequence*) does.
 #[derive(Deserialize)]
 pub struct FileIdParam {
-	/// `/api/files/variant/{variant_id}` captures under a different name;
-	/// `resolve_entry` below detects the `b…~` shape and resolves the variant
-	/// id to its file id.
-	#[serde(alias = "variant_id")]
-	file_id: String,
+	id: Option<String>,
+	#[serde(rename = "variantId")]
+	variant_id: Option<String>,
 }
 
 /// The guard's path extraction, kept fallible: a route with no accepted capture
@@ -48,7 +47,7 @@ type FileIdPath = Result<Path<FileIdParam>, PathRejection>;
 /// # Returns
 /// A cloneable middleware function with return type `PermissionCheckOutput`
 ///
-/// The route must capture the file id as `{file_id}` (or `{variant_id}`) — the
+/// The route must capture the file id as `{id}` (or a variant id as `{variantId}`) — the
 /// guard reads it by name, not by position. Other captures are ignored.
 pub fn check_perm_file(
 	action: &'static str,
@@ -72,9 +71,17 @@ async fn check_file_permission(
 ) -> Result<Response, Error> {
 	use tracing::warn;
 
-	let Ok(Path(FileIdParam { file_id })) = params else {
-		warn!("File permission guard on a route with no {{file_id}} capture");
-		return Err(Error::PermissionDenied);
+	let file_id = match params {
+		Ok(Path(FileIdParam { id: Some(id), variant_id: None })) => id,
+		// Only a variant route names a variant: it resolves to its file id here, so
+		// `resolve_entry` never has to guess it from the id's shape.
+		Ok(Path(FileIdParam { id: None, variant_id: Some(variant_id) })) => {
+			app.meta_adapter.read_file_id_by_variant(tn_id, &variant_id).await?.to_string()
+		}
+		_ => {
+			warn!("File permission guard on a route with no single {{id}}/{{variantId}} capture");
+			return Err(Error::PermissionDenied);
+		}
 	};
 
 	// Create auth context or guest context if not authenticated
@@ -108,7 +115,6 @@ async fn check_file_permission(
 		&tenant_id_tag,
 		&auth_ctx,
 		via_action,
-		&full_action,
 		action != "read",
 	)
 	.await?;
@@ -135,7 +141,10 @@ async fn check_file_permission(
 			access_level = ?attrs.access_level,
 			"File permission denied"
 		);
-		return Err(Error::PermissionDenied);
+		// 403 only for a caller who can see the file; otherwise it answers as a missing id.
+		let readable = action != "read"
+			&& checker.has_permission(&auth_ctx, "file:read", &attrs, &environment);
+		return Err(if readable { Error::PermissionDenied } else { Error::NotFound });
 	}
 	drop(checker);
 
@@ -148,7 +157,7 @@ async fn check_file_permission(
 	Ok(next.run(req).await)
 }
 
-/// The entry the guard resolved `{file_id}` to, for the handler behind it: placement handlers act
+/// The entry the guard resolved `{id}` to, for the handler behind it: placement handlers act
 /// on this entry and never re-resolve the path id.
 #[derive(Clone)]
 pub struct ResolvedEntry(pub cloudillo_types::meta_adapter::FileView);
@@ -157,10 +166,9 @@ pub struct ResolvedEntry(pub cloudillo_types::meta_adapter::FileView);
 #[derive(Clone)]
 pub struct ResolvedLevel(pub cloudillo_types::types::AccessLevel);
 
-/// Resolve `{file_id}` to the entry the caller's context admits, with its ABAC attributes. A read
-/// takes the admitted entry granting the most; a placement takes the one admitted entry ABAC lets
-/// `full_action` through on — several is `Conflict` ("use the entry id").
-#[expect(clippy::too_many_arguments, reason = "permission check requires all context fields")]
+/// Resolve `{id}` to the entry the caller's context admits, with its ABAC attributes. A read
+/// takes the admitted entry granting the most and accepts an entry, content or variant id; a
+/// placement (any non-read action) accepts the entry id only — anything else is `NotFound`.
 async fn resolve_entry(
 	app: &App,
 	tn_id: TnId,
@@ -168,7 +176,6 @@ async fn resolve_entry(
 	tenant_id_tag: &str,
 	auth: &AuthCtx,
 	via_action: Option<&str>,
-	full_action: &str,
 	placement: bool,
 ) -> ClResult<(cloudillo_types::meta_adapter::FileView, FileAttrs)> {
 	use std::borrow::Cow;
@@ -194,28 +201,15 @@ async fn resolve_entry(
 		return Ok((view, attrs));
 	}
 
-	let mut candidates = file_access::admitted(app, tn_id, entries, &ctx, via_action).await?;
-	if candidates.len() == 1 {
-		let (view, level) = file_access::single_placement(candidates)?;
-		let attrs = load_file_attrs(app, tn_id, &view, level, tenant_id_tag, auth).await?;
-		return Ok((view, attrs));
+	// A placement names exactly one entry by its own id, before any access is weighed.
+	match entries.as_slice() {
+		[v] => file_access::require_entry_id(v, file_or_variant_id)?,
+		_ => return Err(Error::NotFound),
 	}
-	// Several admitted entries of one content: keep those ABAC lets the action through on.
-	let environment = Environment::new();
-	let mut passing = Vec::new();
-	for (view, level) in candidates.drain(..) {
-		let Ok(attrs) = load_file_attrs(app, tn_id, &view, level, tenant_id_tag, auth).await else {
-			continue;
-		};
-		let capped =
-			file_access::room_capped(app, tn_id, tenant_id_tag, auth, view.channel.as_deref())
-				.await;
-		let checker = app.permission_checker.read().await;
-		if checker.has_permission(&capped, full_action, &attrs, &environment) {
-			passing.push((view, attrs));
-		}
-	}
-	file_access::single_placement(passing)
+	let candidates = file_access::admitted(app, tn_id, entries, &ctx, via_action).await?;
+	let (view, level) = file_access::single_placement(candidates)?;
+	let attrs = load_file_attrs(app, tn_id, &view, level, tenant_id_tag, auth).await?;
+	Ok((view, attrs))
 }
 
 /// ABAC attributes of the resolved entry `file_view`, at the `access_level` the caller holds on it.

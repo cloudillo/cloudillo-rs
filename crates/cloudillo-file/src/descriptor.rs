@@ -337,24 +337,23 @@ impl Task<App> for FileIdGeneratorTask {
 		// `file_id` at all.
 		cloudillo_core::search_index_file(app, self.tn_id, &file_id);
 
-		// Send FILE_ID_GENERATED to the uploader's connections (`owner_tag`), or to the
+		// Send `fileIdGenerated` to the uploader's connections (`owner_tag`), or to the
 		// tenant account's bus for the tenant's own upload. Frontend clients filter on
 		// whether they're tracking this temp ID.
 		let msg = cloudillo_core::ws_broadcast::BroadcastMessage::new(
-			"FILE_ID_GENERATED",
+			"fileIdGenerated",
 			serde_json::json!({
 				"tempId": format!("@{}", self.f_id),
-				"fileId": file_id,
-				"rootId": root_id
+				"contentId": file_id
 			}),
 			"system",
 		);
 		if let Some(owner) = owner_tag {
 			let result = app.broadcast.send_to_user(self.tn_id, &owner, msg).await;
-			debug!("FILE_ID_GENERATED sent to {}: {:?}", owner, result);
+			debug!("fileIdGenerated sent to {}: {:?}", owner, result);
 		} else {
 			let delivered = app.broadcast.send_to_tenant(self.tn_id, msg).await;
-			debug!("FILE_ID_GENERATED delivered to {} tenant connections", delivered);
+			debug!("fileIdGenerated delivered to {} tenant connections", delivered);
 		}
 
 		info!("Finished task file.id-generate {} → {}", descriptor, file_id);

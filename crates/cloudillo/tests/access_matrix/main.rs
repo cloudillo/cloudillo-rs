@@ -30,7 +30,9 @@ use cloudillo::meta_adapter::{ProfileConnectionStatus, ProfileStatus, ProfileTyp
 use cloudillo::settings::SettingValue;
 use cloudillo::types::Patch;
 
-use fixture::{ALICE, CLUB, Fixture, PASSWORD, TRASH, call, find_str, fixture, prof, remote, req};
+use fixture::{
+	ALICE, CLUB, Fixture, PASSWORD, TRASH, call, find_str, fixture, post_q, prof, remote, req,
+};
 use ops::{Actual, InboxCell, Op, all_ops, bearer, classify_mint};
 use oracle::{check_mint_claims, expected_inbox, expected_mint};
 use report::{Mismatch, Report};
@@ -199,7 +201,7 @@ async fn management() {
 		let n = format!("owner@{}", host.trim_end_matches(".test"));
 		fx.subject(&n)
 	};
-	let held = r#"{"publisherTag":"zqm-other.test","appName":"zqm-other"}"#;
+	let held = r#"{"publisherIdTag":"zqm-other.test","appName":"zqm-other"}"#;
 	for host in [ALICE, CLUB] {
 		let uri = "/api/doc-formats/zqm%2Fheld";
 		let r = req(host, Method::PUT, uri, bearer(owner(host)), Body::from(held));
@@ -248,7 +250,8 @@ async fn management() {
 		.create_ref(fx.tenants.alice.tn_id, "zqref-alice-register", &register)
 		.await
 		.unwrap();
-	// A cert row for SADM's own tenant, so `cert-status` (MG-313) has something to report.
+	// A cert row for SADM's own tenant, so `GET /api/admin/certificates` (MG-313) has something
+	// to report.
 	let admin = &fx.tenants.admin;
 	let cert = cloudillo::auth_adapter::CertData {
 		tn_id: admin.tn_id,
@@ -452,7 +455,7 @@ async fn channel() {
 	rep.finish();
 }
 
-/// `FILE_ID_GENERATED` for the tenant's own upload reaches the tenant account's bus; a member's
+/// `fileIdGenerated` for the tenant's own upload reaches the tenant account's bus; a member's
 /// upload goes to that member alone (`send_to_user`), never to the tenant's bus. The
 /// fixture runs no scheduler, so the task is run here, as it would be.
 #[tokio::test]
@@ -501,7 +504,7 @@ async fn file_id_generated_reaches_only_the_uploader() {
 		let temp_id = format!("@{f_id}");
 		for (tag, rx) in &mut rxs {
 			while let Ok(m) = rx.try_recv() {
-				if m.cmd == "FILE_ID_GENERATED" && m.data["tempId"] == temp_id.as_str() {
+				if m.cmd == "fileIdGenerated" && m.data["tempId"] == temp_id.as_str() {
 					got.push((i, *tag));
 				}
 			}
@@ -510,7 +513,7 @@ async fn file_id_generated_reaches_only_the_uploader() {
 	for tag in conns {
 		bc.unregister_user(club, tag, "zqm-fid").await;
 	}
-	assert_eq!(got, [(1, CLUB)], "FILE_ID_GENERATED");
+	assert_eq!(got, [(1, CLUB)], "fileIdGenerated");
 }
 
 /// Connected community profile `id_tag` on `tn`.
@@ -590,7 +593,7 @@ async fn mfa_required_api_keys() {
 	for name in ["apikey-unscoped@alice", "apikey-file@alice"] {
 		let key = bearer(fx.subject(name)).unwrap();
 		let uri = format!("/api/auth/access-token?apiKey={key}");
-		xchg.push(call(&fx.api, req(ALICE, Method::GET, &uri, None, Body::empty())).await.0);
+		xchg.push(call(&fx.api, post_q(ALICE, &uri, None)).await.0);
 	}
 
 	fx.app.settings.delete(shared, "auth.mfa").await.unwrap();
@@ -932,7 +935,7 @@ async fn channel_patch() {
 		body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
 		let (status, body) = send(Method::POST, "/api/actions".into(), body).await;
 		assert!(status.is_success(), "draft: {status} {body}");
-		find_str(&body, "actionId").expect("draft id")
+		find_str(&body, "id").expect("draft id")
 	};
 	let patch = |id: String, channel: serde_json::Value| {
 		send(Method::PATCH, format!("/api/actions/{id}"), serde_json::json!({ "channel": channel }))
@@ -1009,10 +1012,10 @@ async fn managed_attachment_entry() {
 	assert!(ma.read_file(alice, file).await.unwrap().is_some(), "the user entry stays");
 }
 
-/// The owner's own `file:` app token keeps tenant level inside its scope: it lists a hidden
-/// in-scope file with `hidden=true`. A share link on the same root does not.
+/// A hidden (legacy) entry never lists, whoever asks: the `hidden` filter is gone, so neither
+/// the owner's scoped token nor a share link on the same root can reach it by listing.
 #[tokio::test]
-async fn owner_scoped_hidden() {
+async fn hidden_rows_never_list() {
 	use cloudillo::meta_adapter::UpdateFileOptions;
 	let _g = FIXTURE_LOCK.write().await;
 	let fx = setup().await;
@@ -1028,7 +1031,8 @@ async fn owner_scoped_hidden() {
 		let file = file.clone();
 		async move {
 			let s = fx.subject(name);
-			let r = req(ALICE, Method::GET, "/api/files?hidden=true", bearer(s), Body::empty());
+			let uri = format!("/api/files?contentId={file}");
+			let r = req(ALICE, Method::GET, &uri, bearer(s), Body::empty());
 			let (status, body) = call(&fx.api, r).await;
 			assert!(status.is_success(), "{name}: {status} {body}");
 			body.to_string().contains(&file)
@@ -1037,8 +1041,25 @@ async fn owner_scoped_hidden() {
 	let owner = lists("owner-scoped-r@alice").await;
 	let link = lists("sharelink-r@alice").await;
 	set_hidden(false).await;
-	assert!(owner, "the owner's scoped token lists its hidden in-scope file");
-	assert!(!link, "a share link never lists hidden files");
+	assert!(!owner, "the owner's scoped token lists a hidden file");
+	assert!(!link, "a share link lists a hidden file");
+}
+
+/// A stranger cannot tell a private file from a missing one: both answer the same 404 and code.
+#[tokio::test]
+async fn private_and_missing_file_answer_the_same_404() {
+	let _g = FIXTURE_LOCK.read().await;
+	let fx = setup().await;
+	let s = fx.subject("stranger@alice.test");
+	let private = alice_file(fx, "docchild-crdt-d-active").file_id.clone();
+	let mut seen = Vec::new();
+	for id in [private.as_str(), "f1~zqm-no-such-file"] {
+		let uri = format!("/api/files/{id}");
+		let (st, b) = call(&fx.api, req(ALICE, Method::GET, &uri, bearer(s), Body::empty())).await;
+		assert_eq!(st, StatusCode::NOT_FOUND, "{id}: {b}");
+		seen.push(b["error"]["code"].clone());
+	}
+	assert_eq!(seen[0], seen[1], "private vs missing file codes differ");
 }
 
 /// A hat's APRV relaying a hatted POST into a club room: `(id, signer, POST ch, APRV ch,
@@ -1261,7 +1282,7 @@ async fn attachment_audience() {
 	}
 	// The variant route shares the guard (the `b` id resolves to its file).
 	let blob = d_file.blob_id.as_deref().expect("blob variant");
-	let path = format!("/api/files/variant/{blob}{}", query("A2"));
+	let path = format!("/api/variants/{blob}{}", query("A2"));
 	let act = probe("AAT-02v", "direct@alice.test", path.clone()).await;
 	check("AAT-02v", "direct@alice.test", &path, "Allow", act);
 
@@ -1334,7 +1355,7 @@ async fn share_lifecycle() {
 	let _g = FIXTURE_LOCK.write().await;
 	let fx = setup().await;
 	let alice = fx.tenants.alice.tn_id;
-	let file = alice_file(fx, "tenant-blob-d-active").file_id.clone();
+	let file = alice_file(fx, "tenant-blob-d-active").entry_id.clone();
 	let subj = |n: &str| fx.subject(n);
 	let (owner, stranger) = (subj("owner@alice"), subj("stranger@alice.test"));
 	let stranger_tag = stranger.facts.id_tag.clone().expect("stranger id_tag");
@@ -1347,10 +1368,14 @@ async fn share_lifecycle() {
 	let (st, _) = send(stranger, Method::GET, meta.clone(), String::new()).await;
 	assert!(!st.is_success(), "stranger reads a private file: {st}");
 
-	let body = format!(r#"{{"subjectType":"U","subjectId":"{stranger_tag}","permission":"R"}}"#);
+	let body =
+		format!(r#"{{"subjectType":"user","subjectId":"{stranger_tag}","permission":"read"}}"#);
 	let (st, created) = send(owner, Method::POST, shares.clone(), body).await;
 	assert!(st.is_success(), "create share: {st} {created}");
-	let id = created["data"]["id"].as_i64().expect("share id");
+	let id = created["data"]["id"]
+		.as_str()
+		.and_then(|s| s.parse::<i64>().ok())
+		.expect("share id");
 	let entry_id = fx.app.meta_adapter.read_file(alice, &file).await.unwrap().unwrap().entry_id;
 	assert_eq!(created["data"]["resourceId"].as_str(), Some(&*entry_id), "keyed by entry");
 
@@ -1361,7 +1386,7 @@ async fn share_lifecycle() {
 	// Write is not Admin: only the owner (or an Admin grantee) manages the file's shares.
 	for n in ["g-write@alice.test", "g-read@alice.test", "stranger@alice.test"] {
 		let s = subj(n);
-		let (st, _) = send(s, Method::PATCH, one.clone(), r#"{"permission":"W"}"#.into()).await;
+		let (st, _) = send(s, Method::PATCH, one.clone(), r#"{"permission":"write"}"#.into()).await;
 		assert_eq!(st, StatusCode::FORBIDDEN, "{n} updates a share");
 		let (st, _) = send(s, Method::DELETE, one.clone(), String::new()).await;
 		assert_eq!(st, StatusCode::FORBIDDEN, "{n} deletes a share");
@@ -1369,7 +1394,7 @@ async fn share_lifecycle() {
 	// Link and scoped credentials manage no share; the owner's PATCH below finds it intact.
 	for n in ["sharelink-w@alice", "sharelink-a@alice", "owner-scoped-w@alice"] {
 		let s = subj(n);
-		let (st, _) = send(s, Method::PATCH, one.clone(), r#"{"permission":"W"}"#.into()).await;
+		let (st, _) = send(s, Method::PATCH, one.clone(), r#"{"permission":"write"}"#.into()).await;
 		assert_eq!(ops::status_class(st), Actual::Deny, "{n} updates a share: {st}");
 		let (st, _) = send(s, Method::DELETE, one.clone(), String::new()).await;
 		assert_eq!(ops::status_class(st), Actual::Deny, "{n} deletes a share: {st}");
@@ -1379,23 +1404,25 @@ async fn share_lifecycle() {
 	let theirs = fx
 		.app
 		.meta_adapter
-		.list_share_entries(alice, 'F', &other.entry_id)
+		.list_share_entries(alice, 'F', &other.entry_id, None, None)
 		.await
 		.unwrap();
 	let foreign = format!("{shares}/{}", theirs.first().expect("seeded share").id);
-	let (st, _) = send(owner, Method::PATCH, foreign.clone(), r#"{"permission":"W"}"#.into()).await;
+	let (st, _) =
+		send(owner, Method::PATCH, foreign.clone(), r#"{"permission":"write"}"#.into()).await;
 	assert_eq!(st, StatusCode::NOT_FOUND, "PATCH another file's share");
 	let (st, _) = send(owner, Method::DELETE, foreign, String::new()).await;
 	assert_eq!(st, StatusCode::NOT_FOUND, "DELETE another file's share");
 	let left = fx
 		.app
 		.meta_adapter
-		.list_share_entries(alice, 'F', &other.entry_id)
+		.list_share_entries(alice, 'F', &other.entry_id, None, None)
 		.await
 		.unwrap();
 	assert_eq!(left.len(), theirs.len(), "another file's share was deleted");
 
-	let (st, body) = send(owner, Method::PATCH, one.clone(), r#"{"permission":"W"}"#.into()).await;
+	let (st, body) =
+		send(owner, Method::PATCH, one.clone(), r#"{"permission":"write"}"#.into()).await;
 	assert!(st.is_success(), "update share: {st} {body}");
 	let (st, body) = send(owner, Method::DELETE, one, String::new()).await;
 	assert!(st.is_success(), "delete share: {st} {body}");
@@ -1481,8 +1508,7 @@ async fn share_link_sees_only_its_entry() {
 	.await
 	.unwrap();
 
-	let mint =
-		req(ALICE, Method::GET, "/api/auth/access-token?refId=zqref-multi", None, Body::empty());
+	let mint = post_q(ALICE, "/api/auth/access-token?refId=zqref-multi", None);
 	let (st, body) = call(&fx.api, mint).await;
 	assert!(st.is_success(), "mint: {st} {body}");
 	let token = find_str(&body, "token").expect("link token");
@@ -1532,7 +1558,8 @@ async fn share_link_sees_only_its_entry() {
 	assert!(st.is_success(), "stranger reads via the public entry: {st} {body}");
 	let (st, _) = send(stranger, Method::GET, format!("{secret_uri}/metadata"), "").await;
 	assert!(!st.is_success(), "stranger reads the room entry: {st}");
-	let (_, list) = send(stranger, Method::GET, "/api/files?fileId=f1~zqm-multi".into(), "").await;
+	let (_, list) =
+		send(stranger, Method::GET, "/api/files?contentId=f1~zqm-multi".into(), "").await;
 	let list = list.to_string();
 	assert!(!list.contains(&*secret), "stranger lists the room entry: {list}");
 	assert!(!list.contains("zqm-multi-secret"), "stranger sees the room entry's name: {list}");
@@ -1540,7 +1567,8 @@ async fn share_link_sees_only_its_entry() {
 	// A content id naming two entries is ambiguous on a placement endpoint.
 	let content_uri = "/api/files/f1~zqm-multi".to_owned();
 	let (st, body) = send(owner, Method::PATCH, content_uri, r#"{"fileName":"zqm-x"}"#).await;
-	assert_eq!(st, StatusCode::CONFLICT, "ambiguous content id: {body}");
+	// A placement endpoint takes the entry id only, so a content id is not found.
+	assert_eq!(st, StatusCode::NOT_FOUND, "content id on a placement: {body}");
 
 	// Trashing the public entry leaves the stranger nothing: the room entry is Direct.
 	let (st, body) = send(owner, Method::DELETE, format!("/api/files/{}", public), "").await;
@@ -1632,7 +1660,7 @@ async fn room_drives() {
 	)
 	.await;
 	assert!(st.is_success(), "room folder: {st} {body}");
-	let dir = find_str(&body, "entryId").expect("folder entryId");
+	let dir = find_str(&body, "id").expect("folder id");
 	let child = |name: &str| {
 		serde_json::json!({
 			"fileTp": "CRDT", "contentType": "cloudillo/quillo", "fileName": name, "parentId": dir,
@@ -1642,7 +1670,7 @@ async fn room_drives() {
 	// The child takes the folder's room.
 	let (st, body) = mk("owner@club", child("zqm-room-child")).await;
 	assert!(st.is_success(), "create in room folder: {st} {body}");
-	let kid = find_str(&body, "entryId").expect("child entryId");
+	let kid = find_str(&body, "id").expect("child id");
 	let channel = |id: String| async move {
 		meta.read_file(club, &id)
 			.await
@@ -1721,7 +1749,7 @@ async fn room_drives() {
 	)
 	.await;
 	assert!(st.is_success(), "closed-w folder: {st} {body}");
-	let cdir = find_str(&body, "entryId").expect("folder entryId");
+	let cdir = find_str(&body, "id").expect("folder id");
 	let sh = cloudillo::meta_adapter::CreateShareEntry {
 		subject_type: 'U',
 		subject_id: subj("m-moderator@club.test").facts.id_tag.clone().expect("id_tag"),
@@ -1806,7 +1834,7 @@ async fn inherited_shares_take_the_closest_ancestor() {
 		async move {
 			let (st, body) = send("owner@alice", Method::POST, "/api/files".into(), v).await;
 			assert!(st.is_success(), "create {st} {body}");
-			find_str(&body, "entryId").expect("entryId")
+			find_str(&body, "id").expect("id")
 		}
 	};
 	let grantee = subj("g-folder@alice.test").facts.id_tag.clone().expect("id_tag");
@@ -1903,7 +1931,7 @@ async fn access_reports_effective_grants() {
 		async move {
 			let (st, body) = send("owner@alice", Method::POST, "/api/files".into(), v).await;
 			assert!(st.is_success(), "create {st} {body}");
-			find_str(&body, "entryId").expect("entryId")
+			find_str(&body, "id").expect("id")
 		}
 	};
 	let share = |entry, who, permission| share_to(fx, alice, ALICE, entry, who, permission);
@@ -1949,7 +1977,7 @@ async fn access_reports_effective_grants() {
 	share(doc2.clone(), id_tag(outer), 'R').await;
 	let body = access("owner@alice", &doc2).await;
 	let o = person(&body, outer).unwrap_or_else(|| panic!("FC-207: not listed: {body}"));
-	assert_eq!(o["permission"], "R", "FC-207: the closest grant wins: {body}");
+	assert_eq!(o["permission"], "read", "FC-207: the closest grant wins: {body}");
 	assert!(o.get("inheritedFrom").is_none(), "FC-207: direct: {body}");
 
 	// FC-208: audience by visibility.
@@ -1978,7 +2006,7 @@ async fn access_reports_effective_grants() {
 	assert_eq!(body["data"]["audience"]["channel"]["name"], "closed-w", "FC-209: {body}");
 }
 
-/// The browse filters only narrow. FC-224..226: `tags`, `modifiedAfter` and `openedSince` list
+/// The browse filters only narrow. FC-224..226: `tags`, `modifiedAfter` and `openedAfter` list
 /// an owner-only file to the owner and to no denied subject. FC-227: a recursive listing under a
 /// folder share reports each row's closest grant, not the browsed folder's. FC-228: it lets the
 /// browsed folder's room through to a grantee off its roster; FC-229: a listing with no parentId
@@ -2002,13 +2030,13 @@ async fn browse_filters_keep_the_gates() {
 	let level = |rows: &Option<Vec<serde_json::Value>>, entry: &str| {
 		rows.iter()
 			.flatten()
-			.find(|r| r["entryId"] == entry || r["fileId"] == entry)
+			.find(|r| r["id"] == entry || r["contentId"] == entry)
 			.map(|r| r["accessLevel"].as_str().and_then(AccessLevel::from_str_name))
 	};
 	let mk = |n: &'static str, v: serde_json::Value| async move {
 		let (st, body) = send(n, Method::POST, "/api/files".into(), v).await;
 		assert!(st.is_success(), "create {st} {body}");
-		find_str(&body, "entryId").expect("entryId")
+		find_str(&body, "id").expect("id")
 	};
 	let doc = |name: &str, parent: Option<&str>| {
 		serde_json::json!({
@@ -2031,7 +2059,7 @@ async fn browse_filters_keep_the_gates() {
 	// FC-224..226: an owner-only (Direct) file, tagged and opened by the owner.
 	let since = Timestamp::now().0 - 1;
 	let file = mk("owner@alice", doc("zqm-bf-file", None)).await;
-	let tag = format!("/api/files/{file}/tag/zqm-bf");
+	let tag = format!("/api/files/{file}/tags/zqm-bf");
 	let (st, body) = send("owner@alice", Method::PUT, tag, serde_json::Value::Null).await;
 	assert!(st.is_success(), "tag: {st} {body}");
 	meta.record_file_access(alice, &id_tag("owner@alice"), &file).await.unwrap();
@@ -2043,8 +2071,8 @@ async fn browse_filters_keep_the_gates() {
 	];
 	for (fc, q) in [
 		("FC-224", "tags=zqm-bf".to_owned()),
-		("FC-225", format!("modifiedAfter={since}")),
-		("FC-226", "openedSince=0".to_owned()),
+		("FC-225", format!("modifiedAfter={}", cloudillo::types::ApiTime(since).to_iso_string())),
+		("FC-226", "openedAfter=1970-01-01T00:00:00Z".to_owned()),
 	] {
 		let rows = list("owner@alice", q.clone()).await;
 		assert!(level(&rows, &file).is_some(), "{fc}: owner misses it on {q}: {rows:?}");
@@ -2081,16 +2109,14 @@ async fn browse_filters_keep_the_gates() {
 	assert!(level(&rows, &cw).is_none(), "FC-229: the room file leaked: {rows:?}");
 
 	// FC-239: the off-roster moderator passes the `access=` gate by role, but SQL drops the room
-	// file it only reads, so neither the page nor `hasMore` nor a cursor reveals its grants.
+	// file it only reads, so neither the page nor a `next` cursor reveals its grants.
 	let shared = objects::file_id(CLUB, "cur-room-shared");
-	let uri = format!("/api/files?fileId={shared}&access=people&limit=1");
+	let uri = format!("/api/files?contentId={shared}&access=people&limit=1");
 	let (st, b) = send("m-moderator@club.test", Method::GET, uri, serde_json::Value::Null).await;
-	let page = &b["cursorPagination"];
 	assert!(
 		st.is_success()
 			&& b["data"].as_array().is_some_and(Vec::is_empty)
-			&& page["hasMore"] == false
-			&& page["nextCursor"].is_null(),
+			&& b.get("next").is_none(),
 		"FC-239: {st} {b}"
 	);
 }
@@ -2110,7 +2136,7 @@ async fn subtree_owner_moves_across_drives() {
 	let v = serde_json::json!({ "fileTp": "FLDR", "fileName": "zqm-own-dir", "channel": room });
 	let (st, body) = send(Method::POST, "/api/files".into(), v).await;
 	assert!(st.is_success(), "own room folder: {st} {body}");
-	let dir = find_str(&body, "entryId").expect("entryId");
+	let dir = find_str(&body, "id").expect("id");
 	let v = serde_json::json!({
 		"fileTp": "CRDT", "contentType": "cloudillo/quillo", "fileName": "zqm-own-kid", "parentId": dir,
 	});
@@ -2144,7 +2170,7 @@ async fn same_drive_moves() {
 		async move {
 			let (st, body) = send("owner@alice", Method::POST, "/api/files".into(), v).await;
 			assert!(st.is_success(), "create {st} {body}");
-			find_str(&body, "entryId").expect("entryId")
+			find_str(&body, "id").expect("id")
 		}
 	};
 	let share = |n: &'static str, entry: String, permission: char| async move {
@@ -2296,7 +2322,7 @@ async fn patch_status_is_lifecycle_gated() {
 		async move {
 			let (st, body) = send("owner@alice", Method::POST, "/api/files".into(), v).await;
 			assert!(st.is_success(), "create {st} {body}");
-			find_str(&body, "entryId").expect("entryId")
+			find_str(&body, "id").expect("id")
 		}
 	};
 	let dir = mk("FLDR", "zqm-st-dir", None).await;
@@ -2313,16 +2339,17 @@ async fn patch_status_is_lifecycle_gated() {
 
 	for n in ["g-folder@alice.test", "sharelink-w@alice", "idp-key@alice"] {
 		let (st, body) =
-			send(n, Method::PATCH, uri.clone(), serde_json::json!({"status": "D"})).await;
+			send(n, Method::PATCH, uri.clone(), serde_json::json!({"status": "deleted"})).await;
 		assert!(st.is_client_error(), "{n} tombstones via PATCH: {st} {body}");
 		let row = meta.read_file(alice, &doc).await.unwrap().expect("doc");
 		assert!(matches!(row.status, FileStatus::Active), "{n}: doc no longer active");
 	}
 	let (st, body) =
-		send("owner@alice", Method::PATCH, uri.clone(), serde_json::json!({"status": "X"})).await;
-	assert_eq!(st, StatusCode::BAD_REQUEST, "owner writes an unknown status: {body}");
+		send("owner@alice", Method::PATCH, uri.clone(), serde_json::json!({"status": "bogus"}))
+			.await;
+	assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "owner writes an unknown status: {body}");
 	let (st, body) =
-		send("owner@alice", Method::PATCH, uri, serde_json::json!({"status": "D"})).await;
+		send("owner@alice", Method::PATCH, uri, serde_json::json!({"status": "deleted"})).await;
 	assert_eq!(st, StatusCode::BAD_REQUEST, "even the owner deletes through DELETE: {body}");
 	let row = meta.read_file(alice, &doc).await.unwrap().expect("doc");
 	assert!(matches!(row.status, FileStatus::Active), "doc no longer active");
@@ -2341,7 +2368,7 @@ async fn duplicating_a_mirror_does_not_launder_publish_rights() {
 	};
 	let up = subj("connected@alice.test").facts.id_tag.clone().expect("connected id_tag");
 	let mirror = seed_blob(fx, alice, "dup-mirror", "zqm-dup-mirror", None, None, Some(&up)).await;
-	let publish = serde_json::json!({ "visibility": "P" });
+	let publish = serde_json::json!({ "visibility": "public" });
 
 	let (st, body) =
 		send("owner@alice", Method::PATCH, format!("/api/files/{mirror}"), publish.clone()).await;
@@ -2375,8 +2402,10 @@ async fn duplicating_a_mirror_does_not_launder_publish_rights() {
 		.await
 		.unwrap();
 	seed_action(fx, alice, "a1~zqm-dup-sync", &up, None).await;
+	let sync_entry = fx.app.meta_adapter.list_content_entries(alice, sync).await.unwrap();
+	let sync_entry = sync_entry.first().map(|e| e.entry_id.clone()).expect("sync entry");
 	for v in [serde_json::json!({ "parentId": null }), serde_json::json!({})] {
-		let dup = format!("/api/files/{sync}/duplicate");
+		let dup = format!("/api/files/{sync_entry}/duplicate");
 		let (st, body) = send("owner@alice", Method::POST, dup, v.clone()).await;
 		assert_eq!(st, StatusCode::FORBIDDEN, "duplicated a sync mirror with {v}: {body}");
 	}
@@ -2400,7 +2429,7 @@ async fn duplicating_a_tree_part_is_refused_and_writes_nothing() {
 	});
 	let (st, body) = send("/api/files", doc).await;
 	assert!(st.is_success(), "doc: {st} {body}");
-	let doc = find_str(&body, "fileId").expect("doc fileId");
+	let doc = find_str(&body, "contentId").expect("doc contentId");
 	let part =
 		seed_part(fx, alice, "b1~zqm-m4-bytes", Some(&doc), None, "zqm-m4-part", "f1~zqm-m4").await;
 
@@ -2522,6 +2551,115 @@ async fn fshr_receive_mirrors_the_content_id() {
 	assert!(r.is_err(), "the forged FSHR grants Admin: {:?}", r.map(|a| a.access_level));
 }
 
+/// An unlisted FSHR sub-type is refused (422) and never touches an accepted grant: before strict
+/// subtypes, `FSHR:XYZ` fell back to the base type and downgraded a WRITE share to read.
+#[tokio::test]
+async fn fshr_unknown_sub_type_is_refused_without_downgrade() {
+	use cloudillo::types::AccessLevel;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let owner = fx.subject("owner@alice");
+	let up = connected_remote(fx, "zqm-fshr-xyz").await;
+	let shared = "f1~zqm-fshr-xyz";
+	let doc = |sub_typ: &str| {
+		let mut t = fshr_token(&up, sub_typ, shared);
+		t.c = Some(serde_json::json!({
+			"contentType": "cloudillo/quillo", "fileName": "zqm-fshr-doc", "fileTp": "CRDT"
+		}));
+		t
+	};
+	let (st, action_id) = inbox_sync(fx, &up, &doc("WRITE")).await;
+	assert!(st.is_success(), "FSHR:WRITE delivery: {st}");
+	let uri = format!("/api/actions/{action_id}/accept");
+	let (st, body) =
+		call(&fx.api, req(ALICE, Method::POST, &uri, bearer(owner), Body::empty())).await;
+	assert!(st.is_success(), "accept: {st} {body}");
+	let ctx = cloudillo_core::file_access::FileAccessCtx {
+		user_id_tag: ALICE,
+		tenant_id_tag: ALICE,
+		user_roles: &[],
+		hatted: false,
+		scope: None,
+		names_holder: true,
+	};
+	let writes = || async {
+		cloudillo_core::file_access::resolve_placement(
+			&fx.app,
+			alice,
+			shared,
+			&ctx,
+			AccessLevel::Write,
+		)
+		.await
+		.is_ok()
+	};
+	assert!(writes().await, "control: the accepted WRITE share grants Write");
+
+	let (st, action_id) = inbox_sync(fx, &up, &doc("XYZ")).await;
+	assert_eq!(st.as_u16(), 422, "FSHR:XYZ: {st}");
+	let stored = fx.app.meta_adapter.get_action_type(alice, &action_id).await.unwrap();
+	assert!(stored.is_none(), "FSHR:XYZ was stored");
+	assert!(writes().await, "FSHR:XYZ downgraded the share");
+}
+
+/// A delivery the target refused with 422 `E-FED-UNSUPPORTED` marks the sender's action
+/// `deliveryError: "unsupported"` only when the target is its audience, and pushes the marked
+/// action to the sender's sessions. A broadcast copy refused by one recipient, and any other
+/// terminal failure, mark nothing. The fixture has no remote peer and runs no scheduler, so the
+/// refusal is unreachable end to end: `on_failed` is driven with the string the scheduler hands
+/// over (`Error::Unsupported`'s `Display`).
+#[tokio::test]
+async fn delivery_refused_as_unsupported_marks_directed_actions_only() {
+	use cloudillo::action::delivery::ActionDeliveryTask;
+	use cloudillo_core::scheduler::Task;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let target = connected_remote(fx, "zqm-df-target").await;
+	let target = target.id_tag.as_str();
+	let refused = "Unsupported(\"MSG:XYZ\")";
+	let directed = "a1~zqm-df-directed";
+	let mut a = row(directed, "POST", ALICE);
+	a.audience_tag = Some(target);
+	seed_row(fx, alice, &a, None).await;
+	let broadcast = "a1~zqm-df-broadcast";
+	seed_row(fx, alice, &row(broadcast, "POST", ALICE), None).await;
+	let task = |id: &str| {
+		ActionDeliveryTask::new(alice, id.into(), "zqm-df-target.test".into(), target.into())
+	};
+	let marker = |id: &'static str| async move {
+		meta.get_action(alice, id)
+			.await
+			.unwrap()
+			.and_then(|a| a.delivery_error)
+			.map(String::from)
+	};
+
+	// Another terminal failure of the directed delivery: no marker.
+	task(directed).on_failed(&fx.app, 1, "NetworkError(\"x\")").await;
+	assert_eq!(marker(directed).await, None, "a network failure marked the action");
+	// A broadcast copy refused by one recipient: no marker.
+	task(broadcast).on_failed(&fx.app, 1, refused).await;
+	assert_eq!(marker(broadcast).await, None, "a refused broadcast copy marked the action");
+
+	let mut rx = fx.app.broadcast.register_user(alice, ALICE, "zqm-df-ws").await;
+	task(directed).on_failed(&fx.app, 1, refused).await;
+	let mut pushed = false;
+	while let Ok(m) = rx.try_recv() {
+		pushed |= m.cmd == "action" && m.data["id"] == directed;
+	}
+	fx.app.broadcast.unregister_user(alice, ALICE, "zqm-df-ws").await;
+	assert_eq!(marker(directed).await.as_deref(), Some("unsupported"), "directed refusal");
+	assert!(pushed, "the marked action was not pushed to the sender's sessions");
+	let uri = format!("/api/actions/{directed}");
+	let s = fx.subject("owner@alice");
+	let (st, body) = call(&fx.api, req(ALICE, Method::GET, &uri, bearer(s), Body::empty())).await;
+	assert!(st.is_success(), "GET {directed}: {st}");
+	assert_eq!(body["data"]["deliveryError"], "unsupported", "{body}");
+}
+
 /// An accepted inbound FSHR on a document grants the level its sub-type names: COMMENT →
 /// Comment (FC-135), ADMIN → Admin (FC-136). (A BLOB's is capped at Read.)
 #[tokio::test]
@@ -2641,7 +2779,7 @@ async fn mixed_origin_entries_are_judged_apart() {
 		"owner@alice",
 		Method::PATCH,
 		format!("/api/files/{local}"),
-		r#"{"visibility":"F"}"#,
+		r#"{"visibility":"followers"}"#,
 	)
 	.await;
 	assert!(st.is_success(), "the local entry is publishable: {st} {body}");
@@ -2768,7 +2906,7 @@ async fn fshr_content_key() {
 	assert!(body.contains(&*main), "grantee gets the main entry: {body}");
 	assert!(!body.contains("close-friends") && !body.contains("zqm-fshr-room"), "{body}");
 	for id in [&*content, &*main] {
-		let uri = format!("/api/files/{id}/tag/zqm-fshr");
+		let uri = format!("/api/files/{id}/tags/zqm-fshr");
 		let r = req(ALICE, Method::PUT, &uri, bearer(subj("stranger@alice.test")), Body::empty());
 		let (st, body) = call(&fx.api, r).await;
 		assert!(!st.is_success(), "the content grant tags {id}: {st} {body}");
@@ -2840,20 +2978,19 @@ async fn content_id_resolves_in_the_callers_context() {
 	assert!(!body.contains(&*secret), "the room sibling's entry leaks: {body}");
 	assert!(!body.contains("zqmctx secret") && !body.contains("closed-w"), "{body}");
 
-	// Placement by content id: one admitted writable entry → that one.
-	let tag = format!("/api/files/{content}/tag/zqm-ctx");
-	let (st, body) = send("m-moderator@club.test", Method::PUT, tag.clone()).await;
-	assert!(st.is_success(), "moderator tags the main-drive entry: {st} {body}");
-	assert!(body.to_string().contains(&*public), "tagged the public entry: {body}");
-	// Several → 409; the entry id resolves to itself.
-	let (st, body) = send("owner@club", Method::PUT, tag).await;
-	assert_eq!(st, StatusCode::CONFLICT, "the tenant writes both: {body}");
+	// A placement takes the entry id only; a content id is not found, admitted or not.
+	let tag = format!("/api/files/{content}/tags/zqm-ctx");
+	for n in ["m-moderator@club.test", "owner@club"] {
+		let (st, body) = send(n, Method::PUT, tag.clone()).await;
+		assert_eq!(st, StatusCode::NOT_FOUND, "{n} tags by content id: {body}");
+	}
+	// The entry id resolves to itself.
 	let (st, body) =
-		send("owner@club", Method::PUT, format!("/api/files/{secret}/tag/zqm-ctx")).await;
+		send("owner@club", Method::PUT, format!("/api/files/{secret}/tags/zqm-ctx")).await;
 	assert!(st.is_success(), "by entry id: {st} {body}");
 	// Denied subjects place nothing, and a reader without write is not resolved to a sibling.
 	for n in ["stranger@club.test", "m-follower@club.test", "sharelink-r@club"] {
-		let (st, _) = send(n, Method::PUT, format!("/api/files/{content}/tag/zqm-ctx-x")).await;
+		let (st, _) = send(n, Method::PUT, format!("/api/files/{content}/tags/zqm-ctx-x")).await;
 		assert!(!st.is_success(), "{n} tags by content id: {st}");
 	}
 	let (st, _) =
@@ -2935,7 +3072,7 @@ async fn content_token_no_placement() {
 	let owner = fx.subject("owner@alice");
 	let mint = |lvl: char| {
 		let uri = format!("/api/auth/access-token?scope=file:f1~zqm-{key}:{lvl}");
-		call(&fx.api, req(ALICE, Method::GET, &uri, bearer(owner), Body::empty()))
+		call(&fx.api, post_q(ALICE, &uri, bearer(owner)))
 	};
 	let (st, body) = mint('W').await;
 	assert_eq!(st, StatusCode::CONFLICT, "a write scope by an ambiguous content id: {body}");
@@ -2951,12 +3088,12 @@ async fn content_token_no_placement() {
 				base.clone(),
 				r#"{"parentId":null,"channel":"@alice.test~close-friends"}"#,
 			),
-			(Method::PATCH, base.clone(), r#"{"visibility":"P"}"#),
+			(Method::PATCH, base.clone(), r#"{"visibility":"public"}"#),
 			(Method::DELETE, base.clone(), ""),
 			(
 				Method::POST,
 				format!("{base}/shares"),
-				r#"{"subjectType":"U","subjectId":"zqm.test","permission":"R"}"#,
+				r#"{"subjectType":"user","subjectId":"zqm.test","permission":"read"}"#,
 			),
 		]
 	};
@@ -3088,7 +3225,13 @@ async fn naming_anothers_mirror_adds_no_entry_without_proof() {
 	let token = fixture::sign(&issuer, &claims);
 	let action_id = cloudillo::hasher::hash("a", token.as_bytes());
 	let r = cloudillo_action::process_inbound_action_token(
-		&fx.app, alice, &action_id, &token, false, None,
+		&fx.app,
+		alice,
+		&action_id,
+		&token,
+		false,
+		None,
+		cloudillo_action::Origin::Live,
 	)
 	.await;
 	assert!(r.is_err(), "an unproven reuse must stay pending: {r:?}");
@@ -3138,7 +3281,13 @@ async fn an_inbound_public_action_never_widens_local_content() {
 	let token = fixture::sign(&issuer, &claims);
 	let action_id = cloudillo::hasher::hash("a", token.as_bytes());
 	let r = cloudillo_action::process_inbound_action_token(
-		&fx.app, alice, &action_id, &token, false, None,
+		&fx.app,
+		alice,
+		&action_id,
+		&token,
+		false,
+		None,
+		cloudillo_action::Origin::Live,
 	)
 	.await;
 	assert!(r.is_ok(), "the refused attachment is skipped, not retried: {r:?}");
@@ -3186,7 +3335,13 @@ async fn a_half_synced_mirror_is_retried_not_refused() {
 	let token = fixture::sign(&issuer, &claims);
 	let action_id = cloudillo::hasher::hash("a", token.as_bytes());
 	let r = cloudillo_action::process_inbound_action_token(
-		&fx.app, alice, &action_id, &token, false, None,
+		&fx.app,
+		alice,
+		&action_id,
+		&token,
+		false,
+		None,
+		cloudillo_action::Origin::Live,
 	)
 	.await;
 	assert!(r.is_err(), "the half-synced mirror was skipped instead of retried");
@@ -3253,6 +3408,42 @@ fn row<'a>(
 	}
 }
 
+/// `GET /api/actions` pages on SQL-guarded rows: a followers-only or Direct post newer than a
+/// public one never shows to a guest or stranger, neither as a row nor as the `next` cursor's
+/// anchor (AL-01..02).
+#[tokio::test]
+async fn action_list_cursor_skips_hidden_rows() {
+	use cloudillo::types::{CursorData, Timestamp};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	// Far-future timestamps put these three on top of the newest-first list.
+	let base = Timestamp::now().0 + 10_000_000;
+	let mut public = row("a1~zqm-alc-public", "POST", ALICE);
+	public.created_at = Timestamp(base);
+	let mut fllw = row("a1~zqm-alc-fllw", "POST", ALICE);
+	fllw.created_at = Timestamp(base + 1);
+	fllw.visibility = Some('F');
+	let mut direct = row("a1~zqm-alc-direct", "POST", ALICE);
+	direct.created_at = Timestamp(base + 2);
+	direct.visibility = None;
+	for a in [&public, &fllw, &direct] {
+		seed_row(fx, alice, a, None).await;
+	}
+	for (case, name) in [("AL-01", "anon@alice.test"), ("AL-02", "stranger@alice.test")] {
+		let s = fx.subject(name);
+		let uri = "/api/actions?type=POST&limit=1";
+		let (st, b) = call(&fx.api, req(ALICE, Method::GET, uri, bearer(s), Body::empty())).await;
+		assert!(st.is_success(), "{case} {name}: {st} {b}");
+		let next = b["next"].as_str().and_then(CursorData::decode).map(|c| c.id);
+		for hidden in [fllw.action_id, direct.action_id] {
+			assert!(!b["data"].to_string().contains(hidden), "{case} {name} row {hidden}: {b}");
+			assert_ne!(next.as_deref(), Some(hidden), "{case} {name} cursor: {b}");
+		}
+		assert!(b["data"].to_string().contains(public.action_id), "{case} {name}: {b}");
+	}
+}
+
 /// `includeSubject` embeds a REPOST's subject only where the caller could read the subject
 /// itself (report ids LV-176..183); `includeTokens` never reaches into an embedded subject.
 #[tokio::test]
@@ -3298,18 +3489,18 @@ async fn include_subject_follows_read_rules() {
 	for (id, name, repost, want) in rows {
 		rep.cell();
 		let s = fx.subject(name);
-		let uri = format!("/api/actions?actionId={repost}&includeSubject=true&includeTokens=true");
+		let uri = format!("/api/actions?actionId={repost}&include=subject,tokens");
 		let (st, body) =
 			call(&fx.api, req(&s.host, Method::GET, &uri, bearer(s), Body::empty())).await;
 		assert!(st.is_success(), "{id} {name}: {st} {body}");
 		let row = &body["data"][0];
-		assert_eq!(row["actionId"], repost, "{id} {name}: the REPOST itself is listed: {body}");
+		assert_eq!(row["id"], repost, "{id} {name}: the REPOST itself is listed: {body}");
 		let sub = &row["subjectAction"];
 		if sub.is_null() != want && sub.get("token").is_none() {
 			continue;
 		}
 		rep.add(Mismatch {
-			op: "action:list?includeSubject".into(),
+			op: "action:list?include=subject".into(),
 			rule: id,
 			expected: if want { "Embedded" } else { "Absent" }.into(),
 			actual: if sub.is_null() { "Absent" } else { "Embedded" }.into(),
@@ -3357,8 +3548,7 @@ async fn content_scope_binds_granting_entry() {
 	for n in ["stranger@alice.test", "follower@alice.test"] {
 		let s = fx.subject(n);
 		let mint = format!("/api/auth/access-token?scope=file:{content}:R");
-		let (st, body) =
-			call(&fx.api, req(ALICE, Method::GET, &mint, bearer(s), Body::empty())).await;
+		let (st, body) = call(&fx.api, post_q(ALICE, &mint, bearer(s))).await;
 		assert!(st.is_success(), "{n} mint: {st} {body}");
 		let tok = find_str(&body, "token").expect("token");
 		let claims = fx.app.auth_adapter.validate_access_token(alice, ALICE, &tok).await.unwrap();
@@ -3443,8 +3633,7 @@ async fn a_content_id_scope_cannot_remint_through_via() {
 		};
 		let tok = fx.app.auth_adapter.create_access_token(alice, &claims).await.unwrap();
 		let tok = tok.into_string();
-		let (st, body) =
-			call(&fx.api, req(ALICE, Method::GET, &uri, Some(&tok), Body::empty())).await;
+		let (st, body) = call(&fx.api, post_q(ALICE, &uri, Some(&tok))).await;
 		assert_eq!(st.is_success(), ok, "via re-mint from {scope}: {st} {body}");
 	}
 }
@@ -3602,7 +3791,7 @@ async fn draft_patch_and_publish_check_attachments() {
 		let v = serde_json::json!({ "type": "POST", "content": "zqm m2", "draft": true });
 		let (st, body) = send(owner, Method::POST, "/api/actions".into(), v).await;
 		assert!(st.is_success(), "draft: {st} {body}");
-		find_str(&body, "actionId").expect("draft actionId")
+		find_str(&body, "id").expect("draft id")
 	};
 	let up = subj("connected@alice.test").facts.id_tag.clone().expect("connected id_tag");
 	let pin = seed_blob(fx, alice, "m2-pin", "zqm-m2-pin", None, None, Some(&up)).await;
@@ -3788,7 +3977,7 @@ async fn an_entry_id_starting_with_b_is_not_a_variant() {
 		let (st, _) = get(n).await;
 		assert!(!st.is_success(), "{n} reads a Direct entry: {st}");
 	}
-	let uri = format!("/api/files/{entry}/tag/zqm-b");
+	let uri = format!("/api/files/{entry}/tags/zqm-b");
 	let r = req(ALICE, Method::PUT, &uri, bearer(subj("owner@alice")), Body::empty());
 	let (st, body) = call(&fx.api, r).await;
 	assert!(st.is_success(), "owner tags a b-prefixed entry id: {st} {body}");
@@ -3822,7 +4011,7 @@ async fn link_token(
 		.await
 		.unwrap();
 	let uri = format!("/api/auth/access-token?refId={ref_id}");
-	let (st, body) = call(&fx.api, req(host, Method::GET, &uri, None, Body::empty())).await;
+	let (st, body) = call(&fx.api, post_q(host, &uri, None)).await;
 	assert!(st.is_success(), "mint {ref_id}: {st} {body}");
 	find_str(&body, "token").expect("link token")
 }
@@ -3898,8 +4087,8 @@ async fn doc_link_stays_inside_its_tree_and_drive() {
 	});
 	let (st, body) = post(owner, ALICE, doc_json).await;
 	assert!(st.is_success(), "doc: {st} {body}");
-	let doc_entry = find_str(&body, "entryId").expect("doc entryId");
-	let doc = find_str(&body, "fileId").expect("doc fileId");
+	let doc_entry = find_str(&body, "id").expect("doc id");
+	let doc = find_str(&body, "contentId").expect("doc contentId");
 
 	let orig = "b1~zqm-h1-bytes";
 	let room = format!("@{ALICE}~close-friends");
@@ -3958,7 +4147,7 @@ async fn doc_link_stays_inside_its_tree_and_drive() {
 	});
 	let (st, body) = post(club_owner, CLUB, doc_json).await;
 	assert!(st.is_success(), "club doc: {st} {body}");
-	let club_doc = find_str(&body, "fileId").expect("club doc fileId");
+	let club_doc = find_str(&body, "contentId").expect("club doc contentId");
 	let child = serde_json::json!({
 		"fileTp": "CRDT", "contentType": "cloudillo/quillo", "fileName": "zqm-h1-child",
 		"rootId": club_doc
@@ -3969,7 +4158,7 @@ async fn doc_link_stays_inside_its_tree_and_drive() {
 	}
 	let (st, body) = post(club_owner, CLUB, child).await;
 	assert!(st.is_success(), "owner adds a part: {st} {body}");
-	let child = find_str(&body, "entryId").expect("child entryId");
+	let child = find_str(&body, "id").expect("child id");
 	let view = meta.read_file(fx.tenants.club.tn_id, &child).await.unwrap().expect("child");
 	assert_eq!(view.channel.as_deref(), Some(club_room), "the part joins its root's drive");
 }
@@ -4033,7 +4222,7 @@ async fn a_pin_holds_no_local_bytes() {
 			format!("/api/files/{pin}"),
 			format!("/api/files/{content}/descriptor"),
 			format!("/api/files/{content}"),
-			format!("/api/files/variant/b1~zqm-{key}"),
+			format!("/api/variants/b1~zqm-{key}"),
 		] {
 			let (st, body) = get(placer, uri.clone()).await;
 			assert!(!st.is_success(), "{placer} reads local bytes via {uri}: {st} {body}");
@@ -4350,9 +4539,11 @@ async fn placement_skips_managed() {
 		let s = fx.subject(n);
 		call(&fx.api, req(ALICE, m, &uri, bearer(s), Body::empty()))
 	};
-	let tag = format!("/api/files/{}/tag/pmg", f.file_id);
-
-	// PMG-01: the owner tags by content id; the tag lands on the upload entry.
+	// PMG-01: a content id is refused on a placement; the upload entry's own id tags it.
+	let by_content = format!("/api/files/{}/tags/pmg", f.file_id);
+	let (st, body) = send("owner@alice", Method::PUT, by_content).await;
+	assert_eq!(st, StatusCode::NOT_FOUND, "PMG-01 by content id: {body}");
+	let tag = format!("/api/files/{}/tags/pmg", f.entry_id);
 	let (st, body) = send("owner@alice", Method::PUT, tag.clone()).await;
 	assert!(st.is_success(), "PMG-01: {st} {body}");
 	let uri = format!("/api/files/{}/metadata", f.entry_id);
@@ -4442,7 +4633,7 @@ async fn a_pin_cannot_launder_attach_rights() {
 		};
 
 		let v = serde_json::json!({
-			"type": "POST", "content": "zqm launder", "visibility": "P", "attachments": [content]
+			"type": "POST", "content": "zqm launder", "visibility": "public", "attachments": [content]
 		});
 		let (st, body) = send(Method::POST, "/api/actions".into(), v).await;
 		assert!(st.is_client_error(), "{placer} attaches through a Pin: {st} {body}");
@@ -4451,7 +4642,7 @@ async fn a_pin_cannot_launder_attach_rights() {
 		let (st, body) = send(Method::POST, "/api/actions".into(), v).await;
 		// A placer that may not post at all is refused before the attachment check; the other
 		// arms above and below still run.
-		let Some(id) = st.is_success().then(|| find_str(&body, "actionId")).flatten() else {
+		let Some(id) = st.is_success().then(|| find_str(&body, "id")).flatten() else {
 			assert!(st.is_client_error(), "{placer} draft: {st} {body}");
 			continue;
 		};
@@ -4643,8 +4834,8 @@ async fn duplicating_a_blob_adds_an_entry_only() {
 	let r = req(ALICE, Method::POST, &uri, bearer(owner), Body::from("{}"));
 	let (st, body) = call(&fx.api, r).await;
 	assert!(st.is_success(), "duplicate a BLOB: {st} {body}");
-	assert_eq!(find_str(&body, "fileId").as_deref(), Some(content.as_str()), "same content");
-	let copy = find_str(&body, "entryId").expect("entryId");
+	assert_eq!(find_str(&body, "contentId").as_deref(), Some(content.as_str()), "same content");
+	let copy = find_str(&body, "id").expect("id");
 	assert_ne!(copy, &*entry, "a new entry");
 	let after = fx.app.meta_adapter.list_content_entries(alice, &content).await.unwrap().len();
 	assert_eq!(after, before + 1, "one more entry over the same content");
@@ -4689,7 +4880,7 @@ async fn a_deduped_draft_attachment_still_publishes() {
 	});
 	let (st, body) = send("owner@alice", Method::POST, "/api/actions".into(), v).await;
 	assert!(st.is_success(), "draft with a pending attachment: {st} {body}");
-	let id = find_str(&body, "actionId").expect("draft actionId");
+	let id = find_str(&body, "id").expect("draft id");
 
 	meta.finalize_file(alice, old, "f1~zqm-dd").await.unwrap();
 	let uri = format!("/api/actions/{id}/publish");
@@ -4700,7 +4891,7 @@ async fn a_deduped_draft_attachment_still_publishes() {
 		let v = serde_json::json!({ "type": "POST", "content": "zqm dd", "draft": true });
 		let (st, body) = send("owner@alice", Method::POST, "/api/actions".into(), v).await;
 		assert!(st.is_success(), "draft: {st} {body}");
-		let id = find_str(&body, "actionId").expect("draft actionId");
+		let id = find_str(&body, "id").expect("draft id");
 		let patch = serde_json::json!({ "attachments": [att.clone()] });
 		let (st, _) = send(n, Method::PATCH, format!("/api/actions/{id}"), patch).await;
 		assert!(!st.is_success(), "{n} PATCHes the deduped attachment: {st}");
@@ -4730,8 +4921,8 @@ async fn room_doc_meta_joins_its_drive() {
 	});
 	let (st, body) = send(Method::POST, "/api/files".into(), v).await;
 	assert!(st.is_success(), "room doc: {st} {body}");
-	let entry = find_str(&body, "entryId").expect("entryId");
-	let content = find_str(&body, "fileId").expect("fileId");
+	let entry = find_str(&body, "id").expect("id");
+	let content = find_str(&body, "contentId").expect("contentId");
 	let meta_id = format!("{content}~meta");
 
 	// What the RTDB upgrade runs once access is granted.
@@ -4770,13 +4961,19 @@ async fn revoking_one_sibling_share_keeps_the_content_fshr() {
 		cloudillo::meta_adapter::CreateFile { file_name: "zqm-sib-b".into(), ..Default::default() };
 	let b = meta.create_entry_for_content(alice, &content, opts).await.unwrap();
 	let peer = connected_remote(fx, "zqm-sib-peer").await;
-	let body = format!(r#"{{"subjectType":"U","subjectId":"{}","permission":"R"}}"#, peer.id_tag);
+	let body =
+		format!(r#"{{"subjectType":"user","subjectId":"{}","permission":"read"}}"#, peer.id_tag);
 	let mut ids = Vec::new();
 	for entry in [&a, &b] {
 		let uri = format!("/api/files/{entry}/shares");
 		let (st, created) = send(Method::POST, uri, body.clone()).await;
 		assert!(st.is_success(), "share {entry}: {st} {created}");
-		ids.push(created["data"]["id"].as_i64().expect("share id"));
+		ids.push(
+			created["data"]["id"]
+				.as_str()
+				.and_then(|s| s.parse::<i64>().ok())
+				.expect("share id"),
+		);
 	}
 	let fshr_key = format!("FSHR:{content}:{}", peer.id_tag);
 	let sub_typ = || async {
@@ -4934,7 +5131,7 @@ async fn outbound_hooks() {
 	assert_eq!(st, StatusCode::FORBIDDEN, "a contributor invites to the CONV: {body}");
 	let (st, body) = post_action_as(fx, "m-moderator@club.test", &invt("m-follower.test")).await;
 	assert!(st.is_success(), "a moderator subscriber invites: {st} {body}");
-	let a_id = find_str(&body, "actionId").expect("actionId");
+	let a_id = find_str(&body, "id").expect("id");
 	finalize(fx, club, &a_id).await;
 	let row = meta.get_action(club, &a_id).await.unwrap().expect("INVT row");
 	assert_eq!(row.status.as_deref(), Some("A"), "the INVT settles active");
@@ -4943,7 +5140,7 @@ async fn outbound_hooks() {
 		serde_json::json!({ "type": "CONV", "content": { "name": format!("{} ob", ops::MARK) } });
 	let (st, body) = post_action_as(fx, "owner@alice", &v).await;
 	assert!(st.is_success(), "owner creates a CONV: {st} {body}");
-	let a_id = find_str(&body, "actionId").expect("actionId");
+	let a_id = find_str(&body, "id").expect("id");
 	finalize(fx, alice, &a_id).await;
 	let row = meta.get_action(alice, &a_id).await.unwrap().expect("CONV row");
 	let key = format!("SUBS:{}:{ALICE}", row.action_id);
@@ -5085,7 +5282,7 @@ async fn draft_subtype_is_frozen() {
 		body["draft"] = serde_json::json!(true);
 		let (st, b) = post_action_as(fx, n, &body).await;
 		assert!(st.is_success(), "{n} drafts {body}: {st} {b}");
-		find_str(&b, "actionId").expect("draft actionId")
+		find_str(&b, "id").expect("draft id")
 	};
 	let send = |n: &str, m: Method, uri: String, v: serde_json::Value| {
 		call(&fx.api, req(CLUB, m, &uri, bearer(fx.subject(n)), Body::from(v.to_string())))
@@ -5118,22 +5315,28 @@ async fn draft_subtype_is_frozen() {
 		// The same value stays a no-op.
 		let (st, b) = send(n, Method::PATCH, uri, serde_json::json!({ "subType": "DEL" })).await;
 		assert!(st.is_success(), "{n} re-sends its own subtype: {st} {b}");
-		let v = serde_json::json!({ "publishAt": cloudillo::types::Timestamp::now().0 + 86400 });
+		// A null publishAt would store a NULL created_at and break every read of the draft.
+		let null_at = serde_json::json!({ "publishAt": null });
+		let (st, b) = send(n, Method::PATCH, format!("/api/actions/{id}"), null_at).await;
+		assert_eq!(st, StatusCode::BAD_REQUEST, "{n} clears publishAt: {b}");
+		assert!(sub_typ().await.is_some(), "the draft no longer reads");
+		let at = cloudillo::types::Timestamp::from_now(86400).to_iso_string();
+		let v = serde_json::json!({ "publishAt": at });
 		let (st, b) = send(n, Method::POST, format!("/api/actions/{id}/publish"), v).await;
 		assert!(st.is_success(), "{n} publishes its draft: {st} {b}");
 		assert_eq!(sub_typ().await.as_deref(), Some("DEL"), "published a new subtype");
 	}
 }
 
-/// The listed level of `file_id` on alice for `s` (`GET /api/files?fileId=`): `None` = unlisted.
+/// The listed level of `file_id` on alice for `s` (`GET /api/files?contentId=`): `None` = unlisted.
 async fn listed_level(fx: &Fixture, s: &subjects::Subject, file_id: &str) -> Option<String> {
-	let uri = format!("/api/files?fileId={file_id}");
+	let uri = format!("/api/files?contentId={file_id}");
 	let (st, b) = call(&fx.api, req(&s.host, Method::GET, &uri, bearer(s), Body::empty())).await;
 	assert!(st.is_success(), "list {uri}: {st} {b}");
 	b["data"]
 		.as_array()?
 		.iter()
-		.find(|r| r["fileId"] == file_id)
+		.find(|r| r["contentId"] == file_id)
 		.map(|r| r["accessLevel"].as_str().unwrap_or("none").to_owned())
 }
 
@@ -5186,7 +5389,7 @@ async fn mirror_badge_follows_the_live_grant() {
 	assert_eq!(after.as_deref(), Some("none"), "FC-146: listed at {after:?} after FSHR:DEL");
 }
 
-/// Create a file on alice as its owner (`POST /api/files`): its `entryId`.
+/// Create a file on alice as its owner (`POST /api/files`): its `id` (entry id).
 async fn owner_creates(fx: &Fixture, tp: &str, name: &str, parent: Option<&str>) -> String {
 	let v = serde_json::json!({
 		"fileTp": tp, "contentType": "cloudillo/quillo", "fileName": name, "parentId": parent,
@@ -5195,7 +5398,7 @@ async fn owner_creates(fx: &Fixture, tp: &str, name: &str, parent: Option<&str>)
 	let r = req(ALICE, Method::POST, "/api/files", bearer(owner), Body::from(v.to_string()));
 	let (st, body) = call(&fx.api, r).await;
 	assert!(st.is_success(), "create {name}: {st} {body}");
-	find_str(&body, "entryId").expect("entryId")
+	find_str(&body, "id").expect("id")
 }
 
 /// A recursive listing under a user share reaches a subfolder whose own grant to the caller has
@@ -5230,7 +5433,7 @@ async fn recursive_listing_below_a_lapsed_grant() {
 	let row = |b: &serde_json::Value| {
 		b["data"]
 			.as_array()
-			.and_then(|a| a.iter().find(|r| r["entryId"] == file.as_str()).cloned())
+			.and_then(|a| a.iter().find(|r| r["id"] == file.as_str()).cloned())
 	};
 	let (st, b) = send_as(fx, who, Method::GET, uri.clone(), serde_json::Value::Null).await;
 	let level =
@@ -5295,17 +5498,17 @@ async fn access_filter_agrees_with_access_endpoint() {
 			"owner" => "private",
 			"members" | "room" => "audience",
 			"public" => "public",
-			"verified" | "secondDegree" | "followers" | "connections" | "subscribers" => "network",
+			"verified" | "secondDegree" | "followers" | "connected" | "subscribed" => "network",
 			other => panic!("FC-252 {name}@{host}: unmapped audience {other}: {b}"),
 		};
-		let uri = format!("/api/files?fileId={id}&access={filter}");
+		let uri = format!("/api/files?contentId={id}&access={filter}");
 		let (st, l) = send_as(fx, owner, Method::GET, uri, serde_json::Value::Null).await;
 		let listed = l["data"].as_array().is_some_and(|a| !a.is_empty());
 		assert!(st.is_success() && listed, "FC-252 {name}@{host}: not under {filter}: {b} {l}");
 	}
 }
 
-/// A folder link on a folder nested under another: a `fileId` batch keeps only the subtree's
+/// A folder link on a folder nested under another: a `contentId` batch keeps only the subtree's
 /// ids (FC-149, 150), breadcrumbs stop at the share root (FC-151), the share root's own parent
 /// stays unnamed (FC-152), a grandchild reads at the link's level (FC-153), and a recursive
 /// listing of the share root returns its whole subtree but nothing beside it (FC-172).
@@ -5328,27 +5531,24 @@ async fn folder_scope_listing_edges() {
 	};
 	let rows = |b: &serde_json::Value| b["data"].as_array().cloned().unwrap_or_default();
 	let entries = |b: &serde_json::Value| -> Vec<String> {
-		rows(b)
-			.iter()
-			.filter_map(|r| r["entryId"].as_str().map(str::to_owned))
-			.collect()
+		rows(b).iter().filter_map(|r| r["id"].as_str().map(str::to_owned)).collect()
 	};
 
-	let (st, b) = get(format!("/api/files?fileId={child},{outside}")).await;
+	let (st, b) = get(format!("/api/files?contentId={child},{outside}")).await;
 	assert!(st.is_success(), "FC-149: {st} {b}");
 	assert_eq!(entries(&b), vec![child.clone()], "FC-149: a mixed batch keeps the subtree only");
-	let (st, b) = get(format!("/api/files?fileId={outside}")).await;
+	let (st, b) = get(format!("/api/files?contentId={outside}")).await;
 	assert!(st.is_success() && entries(&b).is_empty(), "FC-150: {st} {b}");
-	let (_, b) = get(format!("/api/files?fileId={child}&withPath=true")).await;
+	let (_, b) = get(format!("/api/files?contentId={child}&include=path")).await;
 	let path = rows(&b).first().map(|r| r["path"].clone()).unwrap_or_default();
 	let ids: Vec<&str> = path
 		.as_array()
 		.map(|a| a.iter().filter_map(|s| s["id"].as_str()).collect())
 		.unwrap_or_default();
 	assert_eq!(ids, vec![shared.as_str()], "FC-151: breadcrumbs past the share root: {b}");
-	let (_, b) = get(format!("/api/files?fileId={shared}&withParent=true")).await;
+	let (_, b) = get(format!("/api/files?contentId={shared}&include=parent")).await;
 	let row = rows(&b).first().cloned().unwrap_or_default();
-	assert_eq!(row["entryId"], shared.as_str(), "FC-152: the share root is listed: {b}");
+	assert_eq!(row["id"], shared.as_str(), "FC-152: the share root is listed: {b}");
 	assert!(row["parentName"].is_null(), "FC-152: the share root's parent is named: {b}");
 	let (st, b) = get(format!("/api/files/{grand}/metadata")).await;
 	let level = b["data"]["accessLevel"].as_str().and_then(AccessLevel::from_str_name);
@@ -5380,8 +5580,8 @@ async fn folder_link_writes() {
 		async move { call(&fx.api, r).await }
 	};
 	let upload = |parent: Option<&str>| match parent {
-		Some(p) => format!("/api/files/file/zqm-fw.txt?parentId={p}"),
-		None => "/api/files/file/zqm-fw.txt".to_owned(),
+		Some(p) => format!("/api/uploads/file?name=zqm-fw.txt&parentId={p}"),
+		None => "/api/uploads/file?name=zqm-fw.txt".to_owned(),
 	};
 	for (id, tok, parent, allowed) in [
 		("FC-155", &w, Some(folder.as_str()), true),
@@ -5450,7 +5650,7 @@ async fn subject_bridge_and_subscriber_status() {
 		("LV-203", "follower@alice.test", false),
 	] {
 		let s = fx.subject(who);
-		let rows = ops::list_paged(fx, s, &format!("/api/actions?actionId={invt}&"), "actionId")
+		let rows = ops::list_paged(fx, s, &format!("/api/actions?actionId={invt}&"), "id")
 			.await
 			.unwrap_or_default();
 		assert_eq!(rows.contains_key(invt), want, "{id}: {who} lists the INVT");
@@ -5469,7 +5669,7 @@ async fn pin_placer_publishes() {
 	let pin = seed_reference(fx, club, "f1~zqm-pin-pub", "BLOB", "m-contributor@club.test").await;
 	let patch = |who: &str, host: &str, entry: &str| {
 		let s = fx.subject(who);
-		let body = Body::from(r#"{"visibility":"P"}"#);
+		let body = Body::from(r#"{"visibility":"public"}"#);
 		let r = req(host, Method::PATCH, &format!("/api/files/{entry}"), bearer(s), body);
 		async move { call(&fx.api, r).await }
 	};
@@ -5519,7 +5719,7 @@ async fn inactive_tenant_refresh_denied() {
 	let auth = &fx.app.auth_adapter;
 	let refresh = |name: &str| {
 		let s = fx.subject(name);
-		let r = req(TRASH, Method::GET, "/api/auth/access-token", bearer(s), Body::empty());
+		let r = post_q(TRASH, "/api/auth/access-token", bearer(s));
 		call(&fx.api, r)
 	};
 	let check = async |id: &str, want: Actual| {
@@ -5541,7 +5741,7 @@ async fn inactive_tenant_refresh_denied() {
 	auth.set_tenant_expiry(trash, None).await.unwrap();
 }
 
-/// `GET /api/profiles/batch` carries `badges` for the tenant account only: a share link, an
+/// `GET /api/profile-lookups` carries `badges` for the tenant account only: a share link, an
 /// anonymous caller (refused by the tier) and a visitor get no `badges`.
 #[tokio::test]
 async fn profiles_batch_badges_owner_only() {
@@ -5568,7 +5768,7 @@ async fn profiles_batch_badges_owner_only() {
 		}),
 	};
 	fx.app.meta_adapter.replace_profile_badges(alice, holder, &[row]).await.unwrap();
-	let uri = format!("/api/profiles/batch?idTags={holder}");
+	let uri = format!("/api/profile-lookups?idTags={holder}");
 	let get = |cred: Option<&str>| {
 		let r = req(ALICE, Method::GET, &uri, cred, Body::empty());
 		call(&fx.api, r)
@@ -5580,7 +5780,7 @@ async fn profiles_batch_badges_owner_only() {
 	assert_eq!(badge["community"]["type"], "community", "owner: {b}");
 	assert_eq!(badge["slot"], "STD", "owner: {b}");
 	assert_eq!(badge["level"], "verified", "owner: {b}");
-	assert!(badge["exp"].is_i64(), "owner: {b}");
+	assert!(badge["exp"].is_string(), "owner: {b}");
 	// The public-data tier admits any valid token but no anonymous caller.
 	let (st, b) = get(None).await;
 	assert_eq!(st, StatusCode::FORBIDDEN, "anonymous: {b}");
@@ -5599,7 +5799,7 @@ async fn profiles_batch_badges_owner_only() {
 	}
 }
 
-/// `POST /api/actions/verify` (with `sync`, an outbound fetch) is the tenant account's only:
+/// `POST /api/action-verifications` (with `sync`, an outbound fetch) is the tenant account's only:
 /// share links and `idp_` credentials carry alice's id_tag without being her.
 ///
 /// The fixture cannot reach the handler's `is_tenant_account` check with a non-owner
@@ -5612,7 +5812,7 @@ async fn actions_verify_owner_only() {
 	let fx = setup().await;
 	let post = |cred: Option<&str>| {
 		let body = Body::from(r#"{"tokens":["x.y.z"],"sync":true}"#);
-		call(&fx.api, req(ALICE, Method::POST, "/api/actions/verify", cred, body))
+		call(&fx.api, req(ALICE, Method::POST, "/api/action-verifications", cred, body))
 	};
 	let (st, b) = post(bearer(fx.subject("owner@alice"))).await;
 	assert!(st.is_success(), "owner: {st} {b}");
@@ -5935,7 +6135,8 @@ async fn community_group_gates() {
 		("AC-194", "m-contributor@club.test", true),
 		("AC-195", "m-supporter@club.test", false),
 	] {
-		let (st, b) = call_as(who, Method::GET, "/api/actions?type=SUBS&status=C".into()).await;
+		let (st, b) =
+			call_as(who, Method::GET, "/api/actions?type=SUBS&status=confirmation".into()).await;
 		assert!(st.is_success(), "{id}: {who} knock list → {st} {b}");
 		assert_eq!(b.to_string().contains(knock), present, "{id}: {who} knock list {b}");
 	}
@@ -6229,4 +6430,303 @@ async fn reader_state_stays_private() {
 	let b = b.to_string();
 	assert!(b.contains("zqm-rsp-dm-own"), "MG-607 owner sees its DM: {b}");
 	assert!(!b.contains("zqm-rsp-dm-other"), "MG-608 a DM between others: {b}");
+}
+
+/// Token minting is POST with the credential in the body: the old GET reaches no
+/// handler, so it never uses up a share link; `refId`, `token` and `apiKey` in the query of the
+/// POST are ignored. MG-620..622 pin the 405 for other subjects.
+#[tokio::test]
+async fn access_token_post_only_body_only() {
+	use cloudillo::meta_adapter::{CreateRefOptions, SHARE_FILE_REF_TYPE};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let entry = seed_blob(fx, alice, "p6-once", "zqm-p6-once", None, None, None).await;
+	let ref_id = "zqref-p6-once";
+	let opts = CreateRefOptions {
+		typ: SHARE_FILE_REF_TYPE.into(),
+		count: Some(1),
+		resource_id: Some(entry.to_string()),
+		access_level: Some('R'),
+		..Default::default()
+	};
+	meta.create_ref(alice, ref_id, &opts).await.unwrap();
+	let mint = |m: Method, uri: String, body: String| {
+		call(&fx.api, req(ALICE, m, &uri, None, Body::from(body)))
+	};
+	let query_uri = format!("/api/auth/access-token?refId={ref_id}");
+	for _ in 0..2 {
+		let (st, b) = mint(Method::GET, query_uri.clone(), String::new()).await;
+		assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED, "GET access-token: {b}");
+	}
+	let (st, b) = mint(Method::POST, query_uri, "{}".into()).await;
+	assert!(!st.is_success(), "a refId in the query minted: {st} {b}");
+	let kept = meta.validate_ref(ref_id, &[SHARE_FILE_REF_TYPE]).await;
+	assert!(kept.is_ok(), "a GET or a query POST used up the one-use link");
+	let body = format!(r#"{{"refId":"{ref_id}"}}"#);
+	let uri = "/api/auth/access-token".to_owned();
+	let (st, b) = mint(Method::POST, uri.clone(), body.clone()).await;
+	assert!(st.is_success(), "the one-use link mints by POST body: {st} {b}");
+	let (st, b) = mint(Method::POST, uri, body).await;
+	assert!(!st.is_success(), "the one-use link minted twice: {st} {b}");
+	// A session token and a `cl_` key in the query are not credentials either.
+	let owner = bearer(fx.subject("owner@alice")).unwrap();
+	let key = bearer(fx.subject("apikey-dav@alice")).unwrap();
+	for (what, q) in [("token", format!("token={owner}")), ("apiKey", format!("apiKey={key}"))] {
+		let (st, b) = mint(Method::POST, format!("/api/auth/access-token?{q}"), "{}".into()).await;
+		assert!(!st.is_success(), "?{what}= on POST access-token minted: {st}");
+		assert!(find_str(&b, "token").is_none(), "?{what}= on POST access-token minted a token");
+	}
+}
+
+/// `GET /api/export/download` survives retries for the account and is refused to everyone else
+/// while the export is ready. Community roles are covered where nothing is ready (OWNER_DATA
+/// grid MG-572 on club) and by `data_export_flow` (trash member). The fixture runs no
+/// scheduler, so the queued `ExportTask` is run here.
+#[tokio::test]
+async fn export_download_repeats_for_owner_only() {
+	use cloudillo::file::export::{ExportStatus, ExportTask};
+	use cloudillo_core::scheduler::Task;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let tn_id = fx.tenants.alice.tn_id;
+	let owner = fx.subject("owner@alice");
+	let send = |s: &'static subjects::Subject, m: Method, uri: &str| {
+		call(&fx.api, req(ALICE, m, uri, bearer(s), Body::empty()))
+	};
+	let (st, b) = send(owner, Method::POST, "/api/export").await;
+	assert_eq!(st, StatusCode::ACCEPTED, "request export: {b}");
+	let raw = tokio::fs::read(fx.app.export_path(tn_id, "json")).await.unwrap();
+	let status: ExportStatus = serde_json::from_slice(&raw).unwrap();
+	let task = ExportTask::build(0, &format!("{}:{}", tn_id.0, status.created_at.0)).unwrap();
+	task.run(&fx.app).await.unwrap();
+	for n in 1..=2 {
+		let (st, b) = send(owner, Method::GET, "/api/export/download").await;
+		assert_eq!(st, StatusCode::OK, "owner download {n}: {b}");
+	}
+	for n in [
+		"anon@alice.test",
+		"stranger@alice.test",
+		"follower@alice.test",
+		"g-read@alice.test",
+		"sharelink-r@alice",
+		"idp-key@alice",
+		"owner-scoped-r@alice",
+		"sadm-visit@alice",
+	] {
+		let (st, _) = send(fx.subject(n), Method::GET, "/api/export/download").await;
+		assert_eq!(ops::status_class(st), Actual::Deny, "{n} downloads alice's export: {st}");
+	}
+	for ext in ["zip", "json"] {
+		let _ = tokio::fs::remove_file(fx.app.export_path(tn_id, ext)).await;
+	}
+}
+
+/// `POST /api/uploads/{preset}?name=restore` is an upload of a file named `restore`: it can no
+/// longer collide with `POST /api/files/{id}/restore`. Refusals: MG-632..636.
+#[tokio::test]
+async fn upload_named_restore_creates_a_file() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let owner = bearer(fx.subject("owner@alice"));
+	let uri = "/api/uploads/file?name=restore";
+	let (st, b) = call(&fx.api, req(ALICE, Method::POST, uri, owner, Body::from("zqm-p6"))).await;
+	assert!(st.is_success(), "upload named restore: {st} {b}");
+	assert_eq!(find_str(&b, "fileName").as_deref(), Some("restore"), "{b}");
+	assert_eq!(find_str(&b, "fileType").as_deref(), Some("BLOB"), "{b}");
+}
+
+/// A share link reads its own file's variant (`/api/variants/{variantId}`, by header and by
+/// `?token=`), never another file's; uploads stay refused to a read link as under the old
+/// `/api/files/{preset}/…` route (whether `require_auth` honours `?token=` on uploads is an open
+/// question — the refusal holds either way). `?include=descriptor` on `GET /api/files/{id}`
+/// sends `Cloudillo-Descriptor` to the owner and an in-scope link only; no `include`, no header;
+/// the variant route never sends it.
+#[tokio::test]
+async fn share_link_variants_and_descriptor() {
+	use cloudillo::blob_adapter::CreateBlobOptions;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	for key in ["p6-var", "p6-var-other"] {
+		let blob = format!("b1~zqm-{key}");
+		fx.app
+			.blob_adapter
+			.create_blob_buf(alice, &blob, b"x", &CreateBlobOptions {})
+			.await
+			.unwrap();
+	}
+	let entry = seed_blob(fx, alice, "p6-var", "zqm-p6-var", None, None, None).await;
+	let other = seed_blob(fx, alice, "p6-var-other", "zqm-p6-var-other", None, None, None).await;
+	let link = link_token(fx, alice, ALICE, "zqref-p6-var", &entry, 'R').await;
+	let other_link = link_token(fx, alice, ALICE, "zqref-p6-var-other", &other, 'R').await;
+	let owner = bearer(fx.subject("owner@alice")).unwrap();
+	let stranger = bearer(fx.subject("stranger@alice.test")).unwrap();
+	let (link, other_link) = (link.as_str(), other_link.as_str());
+	// `(status, has Cloudillo-Descriptor, has Cloudillo-Variant-Id)`.
+	let fetch = async |uri: &str, tok: Option<&str>| {
+		let r = req(ALICE, Method::GET, uri, tok, Body::empty());
+		let resp = tower::ServiceExt::oneshot(fx.api.clone(), r).await.unwrap();
+		let h = resp.headers();
+		(
+			resp.status(),
+			h.contains_key("cloudillo-descriptor"),
+			h.contains_key("cloudillo-variant-id"),
+		)
+	};
+
+	let var = "/api/variants/b1~zqm-p6-var";
+	let var_other = "/api/variants/b1~zqm-p6-var-other";
+	let (st, desc, vid) = fetch(var, Some(link)).await;
+	assert!(st.is_success() && vid && !desc, "link reads its variant: {st} {desc} {vid}");
+	let (st, ..) = fetch(&format!("{var}?token={link}"), None).await;
+	assert!(st.is_success(), "link reads its variant via ?token=: {st}");
+	let (st, ..) = fetch(var_other, Some(link)).await;
+	assert!(!st.is_success(), "link reads another file's variant: {st}");
+	let (st, ..) = fetch(&format!("{var_other}?token={link}"), None).await;
+	assert!(!st.is_success(), "link reads another file's variant via ?token=: {st}");
+	let (st, desc, _) = fetch(&format!("{var}?include=descriptor"), Some(owner)).await;
+	assert!(st.is_success() && !desc, "the variant route sent a descriptor: {st} {desc}");
+
+	let file = "/api/files/f1~zqm-p6-var";
+	let with = format!("{file}?include=descriptor");
+	for (who, tok) in [("owner", owner), ("in-scope link", link)] {
+		let (st, desc, _) = fetch(&with, Some(tok)).await;
+		assert!(st.is_success() && desc, "{who} asks for the descriptor: {st} {desc}");
+		let (st, desc, _) = fetch(file, Some(tok)).await;
+		assert!(st.is_success() && !desc, "{who} without include: {st} {desc}");
+	}
+	for (who, tok) in [("stranger", stranger), ("link of another file", other_link)] {
+		let (st, desc, _) = fetch(&with, Some(tok)).await;
+		assert!(!st.is_success() && !desc, "{who} reads the file or its descriptor: {st} {desc}");
+	}
+
+	let up = "/api/uploads/file?name=zqm-p6.txt";
+	let r = req(ALICE, Method::POST, up, Some(link), Body::from("zqm"));
+	let (st, b) = call(&fx.api, r).await;
+	assert!(!st.is_success(), "a read link uploads: {st} {b}");
+	let r = req(ALICE, Method::POST, &format!("{up}&token={link}"), None, Body::from("zqm"));
+	let (st, b) = call(&fx.api, r).await;
+	assert!(!st.is_success(), "a read link uploads via ?token=: {st} {b}");
+}
+
+/// `/api/settings*` act on the caller's own tenant: `?tenant=<other>` reads and writes nothing
+/// of the other tenant, for a stranger, a leader and SADM alike.
+/// Each tenant holds a distinct value, so a body tells whose it is.
+#[tokio::test]
+async fn settings_never_cross_tenant() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let t = &fx.tenants;
+	let key = "file.sync_max_vis";
+	let roles = ["leader", "SADM"];
+	let tenants = [(t.alice.tn_id, "sd"), (t.club.tn_id, "hd"), (t.admin.tn_id, "tn")];
+	let mut saved = Vec::new();
+	for (tn, _) in tenants {
+		saved.push(fx.app.settings.get_raw(tn, key).await.unwrap());
+	}
+	let seed = async || {
+		for (tn, v) in tenants {
+			fx.app
+				.settings
+				.set(tn, key, SettingValue::String(v.into()), &roles)
+				.await
+				.unwrap();
+		}
+	};
+	let raw =
+		async |tn: cloudillo::types::TnId| match fx.app.settings.get_raw(tn, key).await.unwrap() {
+			Some(SettingValue::String(s)) => s,
+			other => format!("{other:?}"),
+		};
+	// `(caller, own value, other tenant, its id_tag, its value)`.
+	let cases = [
+		("stranger@alice.test", "sd", t.club.tn_id, CLUB, "hd"),
+		("m-leader@club.test", "hd", t.alice.tn_id, ALICE, "sd"),
+		("owner-sadm@admin", "tn", t.club.tn_id, CLUB, "hd"),
+	];
+	for (name, own_v, other_tn, other_tag, other_v) in cases {
+		seed().await;
+		let s = fx.subject(name);
+		let send = |m: Method, uri: String, body: &'static str| {
+			let body = if body.is_empty() { Body::empty() } else { Body::from(body) };
+			call(&fx.api, req(&s.host, m, &uri, bearer(s), body))
+		};
+		let theirs = format!("\"{other_v}\"");
+		for q in ["", "level=tenant&"] {
+			let (st, b) =
+				send(Method::GET, format!("/api/settings/{key}?{q}tenant={other_tag}"), "").await;
+			let b = b.to_string();
+			assert!(!b.contains(&theirs), "{name} reads {other_tag}'s {key} ({q}): {b}");
+			if st.is_success() {
+				assert!(b.contains(&format!("\"{own_v}\"")), "{name} ({q}) not its own: {b}");
+			}
+		}
+		let (_, b) =
+			send(Method::GET, format!("/api/settings?prefix={key}&tenant={other_tag}"), "").await;
+		assert!(!b.to_string().contains(&theirs), "{name} lists {other_tag}'s {key}: {b}");
+		for q in ["", "level=tenant&"] {
+			let uri = format!("/api/settings/{key}?{q}tenant={other_tag}");
+			send(Method::PUT, uri, r#"{"value":"xd"}"#).await;
+		}
+		send(Method::DELETE, format!("/api/settings/{key}?level=tenant&tenant={other_tag}"), "")
+			.await;
+		assert_eq!(raw(other_tn).await, other_v, "{name} changed {other_tag}'s {key}");
+	}
+	for ((tn, _), old) in tenants.into_iter().zip(saved) {
+		match old {
+			Some(v) => {
+				fx.app.settings.set(tn, key, v, &roles).await.unwrap();
+			}
+			None => {
+				fx.app.settings.delete(tn, key).await.unwrap();
+			}
+		}
+	}
+}
+
+/// Public auth routes after the move: the QR poll reads its secret only from
+/// `Cloudillo-QR-Secret` — the old `X-QR-Secret` name with the right secret is refused, as is
+/// a wrong secret under the new name (`public_auth_refusals` covers no secret); a registration
+/// with a bad token is refused whatever bearer comes along.
+#[tokio::test]
+async fn moved_public_auth_routes() {
+	use axum::http::HeaderValue;
+	let _g = FIXTURE_LOCK.read().await;
+	let fx = setup().await;
+	let init = req(ALICE, Method::POST, "/api/auth/login/qr", None, Body::empty());
+	let (st, body) = call(&fx.api, init).await;
+	assert!(st.is_success(), "qr init: {st} {body}");
+	let id = find_str(&body, "sessionId").expect("sessionId");
+	let secret = find_str(&body, "secret").expect("secret");
+	let uri = format!("/api/auth/login/qr/{id}?timeout=1");
+	let poll = async |name: &'static str, value: &str| {
+		let mut r = req(ALICE, Method::GET, &uri, None, Body::empty());
+		r.headers_mut().insert(name, HeaderValue::from_str(value).unwrap());
+		call(&fx.api, r).await
+	};
+	let (st, b) = poll("x-qr-secret", &secret).await;
+	assert_eq!(ops::status_class(st), Actual::Deny, "old X-QR-Secret name: {st} {b}");
+	let (st, b) = poll("cloudillo-qr-secret", "zqm-wrong").await;
+	assert_eq!(ops::status_class(st), Actual::Deny, "wrong Cloudillo-QR-Secret: {st} {b}");
+	let (st, b) = poll("cloudillo-qr-secret", &secret).await;
+	assert!(st.is_success(), "the right Cloudillo-QR-Secret: {st} {b}");
+
+	let reg =
+		r#"{"type":"domain","idTag":"zqm-reg6.test","email":"zqm@zqm.test","token":"zqm-bad"}"#;
+	for n in [
+		"owner@alice",
+		"stranger@alice.test",
+		"follower@alice.test",
+		"g-read@alice.test",
+		"sharelink-r@alice",
+		"idp-key@alice",
+		"m-contributor@club.test",
+	] {
+		let s = fx.subject(n);
+		let r = req(&s.host, Method::POST, "/api/registrations", bearer(s), Body::from(reg));
+		let (st, b) = call(&fx.api, r).await;
+		assert!(st.is_client_error(), "{n} registers with a bad token: {st} {b}");
+	}
 }

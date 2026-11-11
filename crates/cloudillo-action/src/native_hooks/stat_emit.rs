@@ -23,6 +23,7 @@
 use std::sync::Arc;
 
 use crate::native_hooks::stat_emit_task::StatEmitTask;
+use crate::post_store::Effects;
 use crate::prelude::*;
 
 /// Read `(window_secs, max_window_secs)` for STAT coalescing.
@@ -49,13 +50,18 @@ async fn read_coalesce_window(app: &App, tn_id: TnId) -> (i64, i64) {
 ///
 /// Errors from `scheduler.schedule()` are logged and swallowed: STAT
 /// push is best-effort; the underlying count update has already been
-/// persisted by the caller.
+/// persisted by the caller. The STAT is an emitted action, so nothing is scheduled without
+/// `effects.propagate`.
 pub(crate) async fn emit_stat_for_subject(
 	app: &App,
 	tn_id: TnId,
 	tenant_tag: &str,
 	subject_id: &str,
+	effects: Effects,
 ) {
+	if !effects.propagate {
+		return;
+	}
 	let (window, max_window) = read_coalesce_window(app, tn_id).await;
 	let key = format!("stat.emit:{}:{}", tn_id, subject_id);
 	let now = Timestamp::now();

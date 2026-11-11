@@ -43,8 +43,8 @@
 //!   relative order does not matter.
 //! - `check_perm_file` / `check_perm_action` / `check_perm_profile` read their
 //!   subject from a **named** capture, so a route belongs under one of them only
-//!   if it captures the file id as `{file_id}` (or `{variant_id}`), the action id
-//!   as `{action_id}`, the profile as `{id_tag}`. Other captures are ignored.
+//!   if it captures the file id as `{id}` (or `{variantId}`), the action id
+//!   as `{action_id}`, the profile as `{idTag}`. Other captures are ignored.
 //!   `check_perm_create` reads no path parameter at all — it is a
 //!   collection-level quota/tier check.
 
@@ -64,7 +64,7 @@ use cloudillo_core::rate_limit::RateLimitLayer;
 use cloudillo_profile::perm::check_perm_profile;
 
 /// **The complete scope-agnostic tier.** Everything here is reachable by any
-/// *valid* token whatever its scope — including a `file:{file_id}:{R|C|W}`
+/// *valid* token whatever its scope — including a `file:{id}:{R|C|W}`
 /// share-link token handed to an untrusted third party for one document.
 ///
 /// The admission rule is stated in full on
@@ -73,7 +73,7 @@ use cloudillo_profile::perm::check_perm_profile;
 /// [`tests::public_data_tier_holds_exactly_the_admitted_tables`] pins the set so
 /// it cannot be made by accident.
 ///
-/// The batch route's one non-public field, `badges` (it reveals the tenant's own community
+/// The `/api/profile-lookups` route's one non-public field, `badges` (it reveals the tenant's own community
 /// memberships), is filled by the handler only for the tenant account itself
 /// (`abac::is_tenant_account`), so a scoped token admitted here never receives it.
 fn public_data_tables() -> Router<App> {
@@ -223,7 +223,7 @@ mod tests {
 	///
 	/// This is the tier's **inventory**: which table functions are mounted. What each
 	/// of them may contain is a separate guard —
-	/// `tables::profile::tests::batch_is_not_shadowed_by_the_id_tag_route` pins
+	/// `tables::profile::tests::batch_and_read_route_sets_are_pinned` pins
 	/// `batch()`'s route set exactly. Widening the tier and widening a table already on
 	/// it are two different mistakes.
 	///

@@ -136,6 +136,8 @@ impl<'a> OperationExecutor<'a> {
 			Operation::Merge { objects, r#as } => self.execute_merge(objects, r#as, context).await,
 
 			// Federation operations
+			// create/broadcast/send ops ignore `context.effects` (no bundled DSL hook
+			// uses them); gate them on `effects.propagate` before any DSL hook ships.
 			Operation::BroadcastToFollowers { action_id, token } => {
 				self.execute_broadcast_to_followers(action_id, token, context).await
 			}

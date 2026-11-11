@@ -7,6 +7,7 @@ use crate::utils::Db;
 use cloudillo_types::{
 	meta_adapter::{AppTrust, InstallApp, InstalledApp},
 	prelude::*,
+	types::ApiTime,
 	utils::normalize_id_tag,
 };
 use sqlx::{Row, SqlitePool};
@@ -129,7 +130,7 @@ pub async fn list(
 			capabilities,
 			auto_update: row.get::<i32, _>("auto_update") != 0,
 			trusted: row.get::<i32, _>("trusted") != 0,
-			installed_at: Timestamp(row.get::<i64, _>("installed_at")),
+			installed_at: ApiTime(row.get::<i64, _>("installed_at")),
 		});
 	}
 

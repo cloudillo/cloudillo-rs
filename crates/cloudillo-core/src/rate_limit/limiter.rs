@@ -478,7 +478,7 @@ mod tests {
 		// A `RateLimitLayer` naming a missing bucket 500s every request; `/api/search`
 		// names this one.
 		assert!(manager.categories.contains_key("search"));
-		// `/api/auth/qr-login/{session_id}/status` names this one.
+		// `/api/auth/login/qr/{sessionId}` names this one.
 		assert!(manager.categories.contains_key("qr_poll"));
 		assert!(manager.categories.contains_key("websocket"));
 	}

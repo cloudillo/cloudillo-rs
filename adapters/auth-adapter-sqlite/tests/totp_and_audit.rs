@@ -50,7 +50,7 @@ async fn audit_paging_and_purge() {
 	let (adapter, _tmp) = create_test_adapter().await;
 	for (i, ts) in [1_000, 2_000, 3_000].into_iter().enumerate() {
 		let mut ev = AuditEvent::new(AuditCategory::Auth, &format!("auth.e{i}"), "success");
-		ev.ts = Timestamp(ts);
+		ev.ts = Timestamp(ts).into();
 		ev.tn_id = Some(TnId(1));
 		adapter.append_audit_event(&ev).await.unwrap();
 	}

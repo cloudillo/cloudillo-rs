@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::hooks::{HookContext, HookResult};
+use crate::post_store::Effects;
 use crate::prelude::*;
 use crate::subject_ref::{SubjectRef, parse_subject_ref};
 use crate::task::{CreateAction, create_action};
@@ -85,12 +86,21 @@ async fn live_announcement(app: &App, tn_id: TnId, key: &str) -> ClResult<bool> 
 }
 
 /// A connection with `peer` ended (CONN:DEL either way). A community retracts its partnership;
-/// a person drops the partner edges of what was its membership.
-pub async fn connection_ended(app: &App, tn_id: TnId, tenant_type: &str, peer: &str) {
+/// a person drops the partner edges of what was its membership. The retraction is an emitted
+/// action, so it needs `effects.propagate`; the local writes always run.
+pub async fn connection_ended(
+	app: &App,
+	tn_id: TnId,
+	tenant_type: &str,
+	peer: &str,
+	effects: Effects,
+) {
 	// `/me` serves badges only from issuers in good standing.
 	app.profile_me.invalidate(tn_id);
 	if tenant_type == "community" {
-		retract_partnership(app, tn_id, peer).await;
+		if effects.propagate {
+			retract_partnership(app, tn_id, peer).await;
+		}
 	} else if let Err(e) = app.meta_adapter.delete_partner_edges_of(tn_id, peer).await {
 		warn!(%peer, "PTNR: failed to drop ex-membership partner edges: {e}");
 	}

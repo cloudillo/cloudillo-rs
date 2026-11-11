@@ -10,24 +10,110 @@ use crate::types::ErrorResponse;
 
 pub type ClResult<T> = std::result::Result<T, Error>;
 
+macro_rules! error_codes {
+	($($name:ident = $code:literal),* $(,)?) => {
+		/// The error-code registry: every `E-<DOMAIN>-<WORD>` code the server emits. No `"E-`
+		/// literal may appear outside this file.
+		pub mod codes {
+			$(pub const $name: &str = $code;)*
+			/// Every code above, so clients can check their own code list against the registry.
+			pub const ALL: &[&str] = &[$($name),*];
+		}
+	};
+}
+
+error_codes! {
+	CORE_NOTFOUND = "E-CORE-NOTFOUND",
+	CORE_GONE = "E-CORE-GONE",
+	CORE_INVALID = "E-CORE-INVALID",
+	CORE_CONFLICT = "E-CORE-CONFLICT",
+	CORE_DATABASE = "E-CORE-DATABASE",
+	CORE_INTERNAL = "E-CORE-INTERNAL",
+	CORE_UNAVAILABLE = "E-CORE-UNAVAILABLE",
+	CORE_CONFIG = "E-CORE-CONFIG",
+	CORE_CRYPTO = "E-CORE-CRYPTO",
+	AUTH_FORBIDDEN = "E-AUTH-FORBIDDEN",
+	AUTH_UNAUTHENTICATED = "E-AUTH-UNAUTHENTICATED",
+	AUTH_BADPASSWORD = "E-AUTH-BADPASSWORD",
+	FED_UNSUPPORTED = "E-FED-UNSUPPORTED",
+	SETTING_NOTFOUND = "E-SETTING-NOTFOUND",
+	NET_TIMEOUT = "E-NET-TIMEOUT",
+	NET_UPSTREAM = "E-NET-UPSTREAM",
+	RATE_LIMITED = "E-RATE-LIMITED",
+	RATE_BANNED = "E-RATE-BANNED",
+	RATE_POWREQUIRED = "E-RATE-POWREQUIRED",
+	REF_EXPIRED = "E-REF-EXPIRED",
+	REF_USED = "E-REF-USED",
+	IDP_NOTPENDING = "E-IDP-NOTPENDING",
+	FILE_PROCESSING = "E-FILE-PROCESSING",
+	FILE_SOURCENOTFOUND = "E-FILE-SOURCENOTFOUND",
+	FILE_SOURCEFORBIDDEN = "E-FILE-SOURCEFORBIDDEN",
+	FILE_SOURCEUNREACHABLE = "E-FILE-SOURCEUNREACHABLE",
+	FILE_CYCLE = "E-FILE-CYCLE",
+	FILE_QUOTA = "E-FILE-QUOTA",
+	FILE_ALREADYPLACED = "E-FILE-ALREADYPLACED",
+	FILE_ACCESSLEVEL = "E-FILE-ACCESSLEVEL",
+	FILE_CROSSROOM = "E-FILE-CROSSROOM",
+	EMAIL_NOTCONFIGURED = "E-EMAIL-NOTCONFIGURED",
+	EMAIL_SENDFAILED = "E-EMAIL-SENDFAILED",
+	RTDB_UNKNOWNCOMMAND = "E-RTDB-UNKNOWNCOMMAND",
+}
+
+/// Every error the server answers with. Each variant maps to one code in [`codes`], one HTTP
+/// status and, where the client needs more than the code, a typed camelCase `details` object
+/// (see [`Error::to_error_response`]).
 #[derive(Debug)]
 pub enum Error {
 	// Core errors
 	NotFound,
-	/// 410 - the resource existed but is permanently gone (used for the IDP
-	/// activation-resend endpoint when `Identity.expires_at` has passed —
-	/// resending after expiry is impossible because the deadline is fixed at
-	/// registration and not extended).
+	/// 410 - the resource existed but is permanently gone (e.g. an MFA login token that
+	/// expired or ran out of attempts, or a peer answering 410).
 	Gone,
 	PermissionDenied,
 	Unauthorized, // 401 - missing/invalid auth token
+	/// 403 `E-AUTH-BADPASSWORD` - password login with a wrong idTag/password pair.
+	BadPassword,
 	DbError,
+	/// 500 `E-CORE-INTERNAL` - malformed internal data (stored descriptors, peer or tool
+	/// output). Client input that fails to parse is a `ValidationError` at its call site.
 	Parse,
 
 	// Input validation and constraints
-	ValidationError(String),      // 400 - invalid input data
-	Conflict(String),             // 409 - constraint violation (unique, foreign key, etc)
-	PreconditionRequired(String), // 428 - precondition required (e.g., PoW)
+	ValidationError(String), // 400 - invalid input data
+	/// 400 `E-CORE-INVALID` with `details.field` naming the offending request field.
+	InvalidField {
+		field: &'static str,
+		message: String,
+	},
+	/// 422 `E-FED-UNSUPPORTED` - an action type, subtype or `crit` name this node does not
+	/// understand. Terminal for the sender: a later attempt cannot succeed until we upgrade.
+	Unsupported(String),
+	Conflict(String), // 409 - constraint violation (unique, foreign key, etc)
+	/// 409 `E-CORE-CONFLICT` with `details.fileCount` - a room still holds files.
+	ChannelNotEmpty {
+		file_count: u32,
+	},
+	/// 428 `E-RATE-POWREQUIRED` with `details {required, suffix}` - a CONN token lacks the
+	/// proof of work: it must end with `suffix` (`required` characters).
+	PowRequired {
+		required: u32,
+		suffix: String,
+	},
+	/// 429 `E-RATE-LIMITED` with `details {level, retryAfter}` (seconds).
+	RateLimited {
+		level: &'static str,
+		retry_after_secs: u64,
+	},
+	/// 403 `E-RATE-BANNED` with `details.remainingSecs` (null = permanent).
+	RateBanned {
+		remaining_secs: Option<u64>,
+	},
+	/// 410 `E-REF-EXPIRED` - the ref (invite, share link, activation, ...) has expired.
+	RefExpired,
+	/// 410 `E-REF-USED` - the ref has no uses left.
+	RefUsed,
+	/// 400 `E-IDP-NOTPENDING` - the identity is not in Pending status (already activated).
+	IdpNotPending,
 
 	/// 404 - settings registry has no entry for the requested key, or the
 	/// registered key has no default value and no override is configured.
@@ -36,8 +122,8 @@ pub enum Error {
 	SettingNotFound(String),
 
 	// Network and external services
-	NetworkError(String), // Network/federation failures
-	Timeout,              // Operation timeout
+	NetworkError(String), // 502 - network/federation failures
+	Timeout,              // 504 - operation timeout
 
 	// System and configuration
 	ConfigError(String),        // Missing or invalid configuration
@@ -53,7 +139,27 @@ pub enum Error {
 	FileSourceForbidden,   // 403: Caller has no READ on the source
 	FileSourceUnreachable, // 503: Source server unreachable during synchronous resolve
 	FileCycleRejected,     // 400: sourceFileId is itself a cross-context row
-	QuotaExceeded,         // 507: upload would pass the tenant's `limits.max_storage_gb`
+	QuotaExceeded,         // 413: upload would pass the tenant's `limits.max_storage_gb`
+	/// 409 `E-FILE-ALREADYPLACED` with `details.existingParentId` (null = drive root) - the
+	/// source is already placed in this context under another parent.
+	FileAlreadyPlaced {
+		existing_parent_id: Option<String>,
+	},
+	/// 403 `E-FILE-ACCESSLEVEL` - the requested access level exceeds what the caller may grant.
+	FileAccessLevel,
+	/// 403 `E-FILE-CROSSROOM` - a move out of a room carries other members' entries and the
+	/// caller is not moderator there.
+	FileCrossRoom,
+
+	// Email
+	/// 412 `E-EMAIL-NOTCONFIGURED` - no SMTP host; `details` is the SMTP diagnostic.
+	EmailNotConfigured(String, serde_json::Value),
+	/// 424 `E-EMAIL-SENDFAILED` - SMTP delivery failed; `details` is the SMTP diagnostic.
+	/// Not a 5xx: those never carry `details`, and the admin's email test needs it.
+	EmailSendFailed(String, serde_json::Value),
+
+	/// 400 `E-RTDB-UNKNOWNCOMMAND` - a `/ws/rtdb` frame named a command the server lacks.
+	RtdbUnknownCommand(String),
 
 	// externals
 	Io(std::io::Error),
@@ -91,14 +197,204 @@ impl Error {
 			Error::PermissionDenied
 				| Error::Unauthorized
 				| Error::ValidationError(_)
+				| Error::InvalidField { .. }
+				| Error::Unsupported(_)
 				| Error::Parse
 				| Error::Gone
+				| Error::RefExpired
+				| Error::RefUsed
 		)
 	}
 
 	/// The token itself is bad (forged, expired, malformed) — not a transient fetch failure.
 	pub fn is_invalid_token(&self) -> bool {
 		matches!(self, Self::Unauthorized | Self::ValidationError(_) | Self::PermissionDenied)
+	}
+
+	/// Every registered error code (`codes::ALL`).
+	pub fn all_codes() -> &'static [&'static str] {
+		codes::ALL
+	}
+
+	/// The registry code this error answers with.
+	pub fn code(&self) -> &'static str {
+		self.parts().1
+	}
+
+	/// The HTTP status and `{error: {code, message, details?}}` body for this error. 5xx
+	/// messages never carry internals.
+	pub fn to_error_response(&self) -> (StatusCode, ErrorResponse) {
+		let (status, code, message, details) = self.parts();
+		let mut body = ErrorResponse::new(code.to_string(), message);
+		// 5xx bodies never expose internals.
+		if let Some(details) = details.filter(|_| !status.is_server_error()) {
+			body = body.with_details(details);
+		}
+		(status, body)
+	}
+
+	fn parts(&self) -> (StatusCode, &'static str, String, Option<serde_json::Value>) {
+		use serde_json::json;
+		const INTERNAL: &str = "Internal server error";
+		let (status, code, message) = match self {
+			Error::NotFound => {
+				(StatusCode::NOT_FOUND, codes::CORE_NOTFOUND, "Resource not found".into())
+			}
+			Error::Gone => (StatusCode::GONE, codes::CORE_GONE, "Resource is gone".into()),
+			Error::PermissionDenied => (
+				StatusCode::FORBIDDEN,
+				codes::AUTH_FORBIDDEN,
+				"You do not have permission to access this resource".into(),
+			),
+			Error::Unauthorized => (
+				StatusCode::UNAUTHORIZED,
+				codes::AUTH_UNAUTHENTICATED,
+				"Authentication required or invalid token".into(),
+			),
+			Error::BadPassword => {
+				(StatusCode::FORBIDDEN, codes::AUTH_BADPASSWORD, "Wrong idTag or password".into())
+			}
+			Error::ValidationError(msg) => {
+				(StatusCode::BAD_REQUEST, codes::CORE_INVALID, msg.clone())
+			}
+			Error::InvalidField { message, .. } => {
+				(StatusCode::BAD_REQUEST, codes::CORE_INVALID, message.clone())
+			}
+			Error::Unsupported(msg) => (
+				StatusCode::UNPROCESSABLE_ENTITY,
+				codes::FED_UNSUPPORTED,
+				format!("Unsupported: {}", msg),
+			),
+			Error::Conflict(msg) => {
+				(StatusCode::CONFLICT, codes::CORE_CONFLICT, format!("Resource conflict: {}", msg))
+			}
+			Error::ChannelNotEmpty { file_count } => (
+				StatusCode::CONFLICT,
+				codes::CORE_CONFLICT,
+				format!("Resource conflict: room still holds {} files", file_count),
+			),
+			Error::PowRequired { required, suffix } => (
+				StatusCode::PRECONDITION_REQUIRED,
+				codes::RATE_POWREQUIRED,
+				format!(
+					"Proof of work required: token must end with '{}' ({} chars)",
+					suffix, required
+				),
+			),
+			Error::RateLimited { .. } => (
+				StatusCode::TOO_MANY_REQUESTS,
+				codes::RATE_LIMITED,
+				"Too many requests. Please slow down.".into(),
+			),
+			Error::RateBanned { .. } => (
+				StatusCode::FORBIDDEN,
+				codes::RATE_BANNED,
+				"Access temporarily blocked due to repeated violations.".into(),
+			),
+			Error::RefExpired => (StatusCode::GONE, codes::REF_EXPIRED, "Ref has expired".into()),
+			Error::RefUsed => {
+				(StatusCode::GONE, codes::REF_USED, "Ref has already been used".into())
+			}
+			Error::IdpNotPending => (
+				StatusCode::BAD_REQUEST,
+				codes::IDP_NOTPENDING,
+				"Identity is not in Pending status".into(),
+			),
+			Error::SettingNotFound(msg) => (
+				StatusCode::NOT_FOUND,
+				codes::SETTING_NOTFOUND,
+				format!("Setting not configured: {}", msg),
+			),
+			Error::Timeout => {
+				(StatusCode::GATEWAY_TIMEOUT, codes::NET_TIMEOUT, "Request timeout".into())
+			}
+			Error::ServiceUnavailable(msg) => (
+				StatusCode::SERVICE_UNAVAILABLE,
+				codes::CORE_UNAVAILABLE,
+				format!("Service temporarily unavailable: {}", msg),
+			),
+			// Server errors (5xx) - no message exposure for security
+			Error::DbError => {
+				(StatusCode::INTERNAL_SERVER_ERROR, codes::CORE_DATABASE, INTERNAL.into())
+			}
+			Error::Internal(_) | Error::Parse | Error::Io(_) => {
+				(StatusCode::INTERNAL_SERVER_ERROR, codes::CORE_INTERNAL, INTERNAL.into())
+			}
+			Error::NetworkError(_) => {
+				(StatusCode::BAD_GATEWAY, codes::NET_UPSTREAM, "Upstream request failed".into())
+			}
+			Error::ImageError(_) => {
+				(StatusCode::INTERNAL_SERVER_ERROR, codes::FILE_PROCESSING, INTERNAL.into())
+			}
+			Error::CryptoError(_) => {
+				(StatusCode::INTERNAL_SERVER_ERROR, codes::CORE_CRYPTO, INTERNAL.into())
+			}
+			Error::ConfigError(_) => {
+				(StatusCode::INTERNAL_SERVER_ERROR, codes::CORE_CONFIG, INTERNAL.into())
+			}
+			Error::FileSourceNotFound => {
+				(StatusCode::NOT_FOUND, codes::FILE_SOURCENOTFOUND, "source_not_found".into())
+			}
+			Error::FileSourceForbidden => {
+				(StatusCode::FORBIDDEN, codes::FILE_SOURCEFORBIDDEN, "source_forbidden".into())
+			}
+			Error::FileSourceUnreachable => (
+				StatusCode::SERVICE_UNAVAILABLE,
+				codes::FILE_SOURCEUNREACHABLE,
+				"source_unreachable".into(),
+			),
+			Error::FileCycleRejected => {
+				(StatusCode::BAD_REQUEST, codes::FILE_CYCLE, "cycle_rejected".into())
+			}
+			Error::QuotaExceeded => {
+				(StatusCode::PAYLOAD_TOO_LARGE, codes::FILE_QUOTA, "storage quota exceeded".into())
+			}
+			Error::FileAlreadyPlaced { .. } => (
+				StatusCode::CONFLICT,
+				codes::FILE_ALREADYPLACED,
+				"file is already placed in this context".into(),
+			),
+			Error::FileAccessLevel => (
+				StatusCode::FORBIDDEN,
+				codes::FILE_ACCESSLEVEL,
+				"access level exceeds what the caller may grant".into(),
+			),
+			Error::FileCrossRoom => (
+				StatusCode::FORBIDDEN,
+				codes::FILE_CROSSROOM,
+				"only a moderator can move other members' files out of the room".into(),
+			),
+			Error::EmailNotConfigured(msg, _) => {
+				(StatusCode::PRECONDITION_FAILED, codes::EMAIL_NOTCONFIGURED, msg.clone())
+			}
+			Error::EmailSendFailed(msg, _) => {
+				(StatusCode::FAILED_DEPENDENCY, codes::EMAIL_SENDFAILED, msg.clone())
+			}
+			Error::RtdbUnknownCommand(cmd) => (
+				StatusCode::BAD_REQUEST,
+				codes::RTDB_UNKNOWNCOMMAND,
+				format!("Unknown command: {}", cmd),
+			),
+		};
+		let details = match self {
+			Error::InvalidField { field, .. } => Some(json!({ "field": field })),
+			Error::ChannelNotEmpty { file_count } => Some(json!({ "fileCount": file_count })),
+			Error::PowRequired { required, suffix } => {
+				Some(json!({ "required": required, "suffix": suffix }))
+			}
+			Error::RateLimited { level, retry_after_secs } => {
+				Some(json!({ "level": level, "retryAfter": retry_after_secs }))
+			}
+			Error::RateBanned { remaining_secs } => {
+				Some(json!({ "remainingSecs": remaining_secs }))
+			}
+			Error::FileAlreadyPlaced { existing_parent_id } => {
+				Some(json!({ "existingParentId": existing_parent_id }))
+			}
+			Error::EmailNotConfigured(_, d) | Error::EmailSendFailed(_, d) => Some(d.clone()),
+			_ => None,
+		};
+		(status, code, message, details)
 	}
 }
 
@@ -112,127 +408,10 @@ impl std::error::Error for Error {}
 
 impl IntoResponse for Error {
 	fn into_response(self) -> axum::response::Response {
-		let (status, code, message) = match self {
-			Error::NotFound => (
-				StatusCode::NOT_FOUND,
-				"E-CORE-NOTFOUND".to_string(),
-				"Resource not found".to_string(),
-			),
-			Error::Gone => {
-				(StatusCode::GONE, "E-CORE-GONE".to_string(), "Resource is gone".to_string())
-			}
-			Error::PermissionDenied => (
-				StatusCode::FORBIDDEN,
-				"E-AUTH-NOPERM".to_string(),
-				"You do not have permission to access this resource".to_string(),
-			),
-			Error::Unauthorized => (
-				StatusCode::UNAUTHORIZED,
-				"E-AUTH-UNAUTH".to_string(),
-				"Authentication required or invalid token".to_string(),
-			),
-			Error::ValidationError(msg) => (
-				StatusCode::BAD_REQUEST,
-				"E-VAL-INVALID".to_string(),
-				format!("Request validation failed: {}", msg),
-			),
-			Error::Conflict(msg) => (
-				StatusCode::CONFLICT,
-				"E-CORE-CONFLICT".to_string(),
-				format!("Resource conflict: {}", msg),
-			),
-			Error::PreconditionRequired(msg) => (
-				StatusCode::PRECONDITION_REQUIRED,
-				"E-POW-REQUIRED".to_string(),
-				format!("Precondition required: {}", msg),
-			),
-			Error::SettingNotFound(msg) => (
-				StatusCode::NOT_FOUND,
-				"E-SET-NOTFOUND".to_string(),
-				format!("Setting not configured: {}", msg),
-			),
-			Error::Timeout => (
-				StatusCode::REQUEST_TIMEOUT,
-				"E-NET-TIMEOUT".to_string(),
-				"Request timeout".to_string(),
-			),
-			Error::ServiceUnavailable(msg) => (
-				StatusCode::SERVICE_UNAVAILABLE,
-				"E-SYS-UNAVAIL".to_string(),
-				format!("Service temporarily unavailable: {}", msg),
-			),
-			// Server errors (5xx) - no message exposure for security
-			Error::DbError => (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"E-CORE-DBERR".to_string(),
-				"Internal server error".to_string(),
-			),
-			Error::Internal(msg) => {
-				warn!("internal error: {}", msg);
-				(
-					StatusCode::INTERNAL_SERVER_ERROR,
-					"E-CORE-INTERNAL".to_string(),
-					"Internal server error".to_string(),
-				)
-			}
-			Error::Parse => (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"E-CORE-PARSE".to_string(),
-				"Internal server error".to_string(),
-			),
-			Error::Io(_) => (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"E-SYS-IO".to_string(),
-				"Internal server error".to_string(),
-			),
-			Error::NetworkError(_) => (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"E-NET-ERROR".to_string(),
-				"Internal server error".to_string(),
-			),
-			Error::ImageError(_) => (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"E-IMG-PROCFAIL".to_string(),
-				"Internal server error".to_string(),
-			),
-			Error::CryptoError(_) => (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"E-CRYPT-FAIL".to_string(),
-				"Internal server error".to_string(),
-			),
-			Error::ConfigError(_) => (
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"E-CONF-CFGERR".to_string(),
-				"Internal server error".to_string(),
-			),
-			Error::FileSourceNotFound => (
-				StatusCode::NOT_FOUND,
-				"E-FILE-SRCNOTFOUND".to_string(),
-				"source_not_found".to_string(),
-			),
-			Error::FileSourceForbidden => (
-				StatusCode::FORBIDDEN,
-				"E-FILE-SRCFORBID".to_string(),
-				"source_forbidden".to_string(),
-			),
-			Error::FileSourceUnreachable => (
-				StatusCode::SERVICE_UNAVAILABLE,
-				"E-FILE-SRCUNREACH".to_string(),
-				"source_unreachable".to_string(),
-			),
-			Error::FileCycleRejected => (
-				StatusCode::BAD_REQUEST,
-				"E-FILE-CYCLEREJ".to_string(),
-				"cycle_rejected".to_string(),
-			),
-			Error::QuotaExceeded => (
-				StatusCode::INSUFFICIENT_STORAGE,
-				"E-FILE-QUOTA".to_string(),
-				"storage quota exceeded".to_string(),
-			),
-		};
-
-		let error_response = ErrorResponse::new(code, message);
+		if let Error::Internal(msg) = &self {
+			warn!("internal error: {}", msg);
+		}
+		let (status, error_response) = self.to_error_response();
 		let mut response = (status, Json(error_response)).into_response();
 		response.headers_mut().insert(
 			axum::http::header::CACHE_CONTROL,
@@ -393,6 +572,44 @@ mod tests {
 		assert!(!Error::ValidationError("x".into()).is_retryable());
 		assert!(!Error::Parse.is_retryable());
 		assert!(!Error::Gone.is_retryable());
+		assert!(!Error::RefUsed.is_retryable());
+	}
+
+	#[test]
+	fn every_code_is_registered_once() {
+		let mut seen = std::collections::HashSet::new();
+		for code in Error::all_codes() {
+			assert!(seen.insert(*code), "duplicate code {code}");
+			let word = code.strip_prefix("E-").unwrap_or_default();
+			assert!(
+				word.split('-').count() == 2
+					&& word.chars().all(|c| c.is_ascii_uppercase() || c == '-'),
+				"{code} is not E-<DOMAIN>-<WORD>"
+			);
+		}
+		assert!(Error::all_codes().contains(&Error::BadPassword.code()));
+	}
+
+	#[test]
+	fn pow_details_reach_the_body() {
+		let (status, body) =
+			Error::PowRequired { required: 3, suffix: "AAA".into() }.to_error_response();
+		assert_eq!(status, StatusCode::PRECONDITION_REQUIRED);
+		assert_eq!(body.error.code, codes::RATE_POWREQUIRED);
+		assert_eq!(body.error.details, Some(serde_json::json!({"required": 3, "suffix": "AAA"})));
+	}
+
+	#[test]
+	fn server_errors_carry_no_details() {
+		for e in [Error::DbError, Error::Internal("secret".into())] {
+			let (status, body) = e.to_error_response();
+			assert!(status.is_server_error());
+			assert_eq!(body.error.details, None);
+		}
+		let d = serde_json::json!({"smtp": "550"});
+		let (status, body) = Error::EmailSendFailed("x".into(), d.clone()).to_error_response();
+		assert_eq!(status, StatusCode::FAILED_DEPENDENCY);
+		assert_eq!(body.error.details, Some(d));
 	}
 
 	#[test]

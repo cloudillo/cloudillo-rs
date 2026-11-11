@@ -12,11 +12,7 @@ use axum::{
 	extract::{Path, Query, State},
 	http::StatusCode,
 };
-use cloudillo_core::{
-	IdTag,
-	extract::{Auth, OptionalRequestId},
-	prelude::*,
-};
+use cloudillo_core::{IdTag, extract::Auth, prelude::*};
 use cloudillo_types::{
 	meta_adapter::{
 		Calendar, CalendarObject, CalendarObjectExtracted, CalendarObjectView, CalendarObjectWrite,
@@ -40,7 +36,7 @@ use crate::{
 
 fn cal_to_output(cal: &Calendar) -> CalendarOutput {
 	CalendarOutput {
-		cal_id: cal.cal_id,
+		cal_id: cal.cal_id.to_string(),
 		name: cal.name.to_string(),
 		description: cal.description.as_deref().map(str::to_string),
 		color: cal.color.as_deref().map(str::to_string),
@@ -65,8 +61,8 @@ fn object_to_output(row: &CalendarObject) -> CalendarObjectOutput {
 		.map(|ts| ical::ts_to_iso(*ts, row.extracted.all_day))
 		.collect();
 	CalendarObjectOutput {
-		co_id: row.co_id,
-		cal_id: row.cal_id,
+		co_id: row.co_id.to_string(),
+		cal_id: row.cal_id.to_string(),
 		uid: row.uid.to_string(),
 		etag: row.etag.to_string(),
 		component: row.extracted.component.to_string(),
@@ -86,8 +82,8 @@ fn object_to_output(row: &CalendarObject) -> CalendarObjectOutput {
 			.map(|ts| ical::ts_to_iso(ts, row.extracted.all_day)),
 		exdate: if exdate_iso.is_empty() { None } else { Some(exdate_iso) },
 		parse_error,
-		created_at: row.created_at,
-		updated_at: row.updated_at,
+		created_at: row.created_at.into(),
+		updated_at: row.updated_at.into(),
 	}
 }
 
@@ -99,8 +95,8 @@ fn view_to_list_item(row: &CalendarObjectView) -> CalendarObjectListItem {
 		.map(|ts| ical::ts_to_iso(*ts, row.extracted.all_day))
 		.collect();
 	CalendarObjectListItem {
-		co_id: row.co_id,
-		cal_id: row.cal_id,
+		co_id: row.co_id.to_string(),
+		cal_id: row.cal_id.to_string(),
 		uid: row.uid.to_string(),
 		etag: row.etag.to_string(),
 		component: row.extracted.component.to_string(),
@@ -116,7 +112,7 @@ fn view_to_list_item(row: &CalendarObjectView) -> CalendarObjectListItem {
 			.recurrence_id
 			.map(|ts| ical::ts_to_iso(ts, row.extracted.all_day)),
 		exdate: if exdate_iso.is_empty() { None } else { Some(exdate_iso) },
-		updated_at: row.updated_at,
+		updated_at: row.updated_at.into(),
 	}
 }
 
@@ -157,14 +153,10 @@ pub async fn list_calendars(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<CalendarOutput>>>)> {
 	let cals = app.meta_adapter.list_calendars(tn_id).await?;
 	let out: Vec<CalendarOutput> = cals.iter().map(cal_to_output).collect();
-	let mut resp = ApiResponse::new(out);
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(out);
 	Ok((StatusCode::OK, Json(resp)))
 }
 
@@ -173,7 +165,6 @@ pub async fn create_calendar(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(body): Json<CalendarCreate>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CalendarOutput>>)> {
 	let name = body.name.trim();
@@ -187,10 +178,7 @@ pub async fn create_calendar(
 		components,
 	};
 	let cal = app.meta_adapter.create_calendar(tn_id, &input).await?;
-	let mut resp = ApiResponse::new(cal_to_output(&cal));
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(cal_to_output(&cal));
 	Ok((StatusCode::CREATED, Json(resp)))
 }
 
@@ -199,14 +187,10 @@ pub async fn get_calendar(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path(cal_id): Path<u64>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CalendarOutput>>)> {
 	let cal = app.meta_adapter.get_calendar(tn_id, cal_id).await?.ok_or(Error::NotFound)?;
-	let mut resp = ApiResponse::new(cal_to_output(&cal));
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(cal_to_output(&cal));
 	Ok((StatusCode::OK, Json(resp)))
 }
 
@@ -215,7 +199,6 @@ pub async fn patch_calendar(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path(cal_id): Path<u64>,
 	Json(patch): Json<CalendarPatch>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CalendarOutput>>)> {
@@ -241,10 +224,7 @@ pub async fn patch_calendar(
 	};
 	app.meta_adapter.update_calendar(tn_id, cal_id, &update).await?;
 	let cal = app.meta_adapter.get_calendar(tn_id, cal_id).await?.ok_or(Error::NotFound)?;
-	let mut resp = ApiResponse::new(cal_to_output(&cal));
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(cal_to_output(&cal));
 	Ok((StatusCode::OK, Json(resp)))
 }
 
@@ -254,11 +234,9 @@ pub async fn delete_calendar(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path(cal_id): Path<u64>,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	app.meta_adapter.delete_calendar(tn_id, cal_id).await?;
-	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
 // Calendar object handlers
@@ -269,7 +247,6 @@ pub async fn list_objects(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path(cal_id): Path<u64>,
 	Query(query): Query<ListObjectsQuery>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<CalendarObjectListItem>>>)> {
@@ -280,7 +257,10 @@ pub async fn list_objects(
 		end: query.end.as_deref().and_then(parse_iso_ts),
 		cursor: query.cursor,
 		limit: query.limit,
-		include_exceptions: query.include_exceptions,
+		include_exceptions: cloudillo_types::meta_adapter::includes(
+			query.include.as_deref(),
+			"exceptions",
+		),
 	};
 	let mut rows = app.meta_adapter.list_calendar_objects(tn_id, cal_id, &opts).await?;
 
@@ -292,12 +272,9 @@ pub async fn list_objects(
 	}
 
 	let items: Vec<CalendarObjectListItem> = rows.iter().map(view_to_list_item).collect();
-	let next_cursor = if has_more { items.last().map(|last| last.co_id.to_string()) } else { None };
+	let next_cursor = if has_more { items.last().map(|last| last.co_id.clone()) } else { None };
 
-	let mut resp = ApiResponse::with_cursor_pagination(items, next_cursor, has_more);
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::with_next(items, next_cursor);
 	Ok((StatusCode::OK, Json(resp)))
 }
 
@@ -306,7 +283,6 @@ pub async fn get_object(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path((cal_id, uid)): Path<(u64, String)>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CalendarObjectOutput>>)> {
 	let stored = app
@@ -314,10 +290,7 @@ pub async fn get_object(
 		.get_calendar_object(tn_id, cal_id, &uid)
 		.await?
 		.ok_or(Error::NotFound)?;
-	let mut resp = ApiResponse::new(object_to_output(&stored));
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(object_to_output(&stored));
 	Ok((StatusCode::OK, Json(resp)))
 }
 
@@ -361,16 +334,12 @@ pub async fn create_object(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path(cal_id): Path<u64>,
 	Json(body): Json<CalendarObjectInput>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CalendarObjectOutput>>)> {
 	app.meta_adapter.get_calendar(tn_id, cal_id).await?.ok_or(Error::NotFound)?;
 	let out = write_object(&app, tn_id, cal_id, body).await?;
-	let mut resp = ApiResponse::new(out);
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(out);
 	Ok((StatusCode::CREATED, Json(resp)))
 }
 
@@ -379,17 +348,13 @@ pub async fn put_object(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path((cal_id, uid)): Path<(u64, String)>,
 	Json(mut body): Json<CalendarObjectInput>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CalendarObjectOutput>>)> {
 	app.meta_adapter.get_calendar(tn_id, cal_id).await?.ok_or(Error::NotFound)?;
 	body.uid = Some(uid);
 	let out = write_object(&app, tn_id, cal_id, body).await?;
-	let mut resp = ApiResponse::new(out);
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(out);
 	Ok((StatusCode::OK, Json(resp)))
 }
 
@@ -474,12 +439,20 @@ fn apply_todo_patch(target: &mut TodoInput, patch: TodoPatch) {
 	}
 }
 
+/// A non-clearable PATCH field: absent = no change, `null` = 400.
+fn non_null<T>(field: Patch<T>, name: &str) -> ClResult<Option<T>> {
+	match field {
+		Patch::Undefined => Ok(None),
+		Patch::Null => Err(Error::ValidationError(format!("{name} cannot be null"))),
+		Patch::Value(v) => Ok(Some(v)),
+	}
+}
+
 pub async fn patch_object(
 	State(app): State<App>,
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path((cal_id, uid)): Path<(u64, String)>,
 	Json(patch): Json<CalendarObjectPatch>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CalendarObjectOutput>>)> {
@@ -500,7 +473,9 @@ pub async fn patch_object(
 	// The patch routes to whichever sub-component the stored object has. If the client
 	// sends `event` for a VTODO (or vice versa), that's a client error — treat as a
 	// validation failure rather than silently upgrading the component type.
-	match (&merged.event, &merged.todo, patch.event, patch.todo) {
+	let event = non_null(patch.event, "event")?;
+	let todo = non_null(patch.todo, "todo")?;
+	match (&merged.event, &merged.todo, event, todo) {
 		(Some(_), _, Some(ev), None) => {
 			let target = merged.event.as_mut().ok_or(Error::Internal("event missing".into()))?;
 			apply_event_patch(target, ev);
@@ -522,10 +497,7 @@ pub async fn patch_object(
 	}
 
 	let out = write_object(&app, tn_id, cal_id, merged).await?;
-	let mut resp = ApiResponse::new(out);
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(out);
 	Ok((StatusCode::OK, Json(resp)))
 }
 
@@ -535,11 +507,9 @@ pub async fn delete_object(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path((cal_id, uid)): Path<(u64, String)>,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	app.meta_adapter.delete_calendar_object(tn_id, cal_id, &uid).await?;
-	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
 /// Regenerate iCalendar + extracted projection for an input. Mirrors the second half of
@@ -566,7 +536,6 @@ pub async fn split_series(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path((cal_id, uid)): Path<(u64, String)>,
 	Json(body): Json<SplitSeriesRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SplitSeriesResponse>>)> {
@@ -592,7 +561,9 @@ pub async fn split_series(
 
 	// Apply the master patch. Semantics mirror `patch_object`: component type is
 	// fixed by what's stored; a mismatched patch body is a validation error.
-	match (&merged.event, &merged.todo, body.master_patch.event, body.master_patch.todo) {
+	let event = non_null(body.master_patch.event, "event")?;
+	let todo = non_null(body.master_patch.todo, "todo")?;
+	match (&merged.event, &merged.todo, event, todo) {
 		(Some(_), _, Some(ev), None) => {
 			let target = merged.event.as_mut().ok_or(Error::Internal("event missing".into()))?;
 			apply_event_patch(target, ev);
@@ -653,13 +624,10 @@ pub async fn split_series(
 		.await?
 		.ok_or_else(|| Error::Internal("tail missing after split".into()))?;
 
-	let mut resp = ApiResponse::new(SplitSeriesResponse {
+	let resp = ApiResponse::new(SplitSeriesResponse {
 		master: object_to_output(&master_row),
 		tail: object_to_output(&tail_row),
 	});
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
 	Ok((StatusCode::OK, Json(resp)))
 }
 
@@ -676,16 +644,12 @@ pub async fn list_exceptions(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path((cal_id, uid)): Path<(u64, String)>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<CalendarObjectOutput>>>)> {
 	app.meta_adapter.get_calendar(tn_id, cal_id).await?.ok_or(Error::NotFound)?;
 	let rows = app.meta_adapter.list_calendar_object_overrides(tn_id, cal_id, &uid).await?;
 	let out: Vec<CalendarObjectOutput> = rows.iter().map(object_to_output).collect();
-	let mut resp = ApiResponse::new(out);
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(out);
 	Ok((StatusCode::OK, Json(resp)))
 }
 
@@ -694,7 +658,6 @@ pub async fn get_exception(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path((cal_id, uid, rid)): Path<(u64, String, String)>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CalendarObjectOutput>>)> {
 	let ts =
@@ -704,10 +667,7 @@ pub async fn get_exception(
 		.get_calendar_object_override(tn_id, cal_id, &uid, ts)
 		.await?
 		.ok_or(Error::NotFound)?;
-	let mut resp = ApiResponse::new(object_to_output(&row));
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(object_to_output(&row));
 	Ok((StatusCode::OK, Json(resp)))
 }
 
@@ -719,7 +679,6 @@ pub async fn put_exception(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path((cal_id, uid, rid)): Path<(u64, String, String)>,
 	Json(mut body): Json<CalendarObjectInput>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CalendarObjectOutput>>)> {
@@ -732,10 +691,7 @@ pub async fn put_exception(
 	body.uid = Some(uid);
 	body.recurrence_id = Some(rid);
 	let out = write_object(&app, tn_id, cal_id, body).await?;
-	let mut resp = ApiResponse::new(out);
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(out);
 	Ok((StatusCode::CREATED, Json(resp)))
 }
 
@@ -744,7 +700,6 @@ pub async fn patch_exception(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Path((cal_id, uid, rid)): Path<(u64, String, String)>,
 	Json(patch): Json<CalendarObjectPatch>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CalendarObjectOutput>>)> {
@@ -761,7 +716,9 @@ pub async fn patch_exception(
 	merged.uid = Some(uid.clone());
 	merged.recurrence_id = Some(rid);
 
-	match (&merged.event, &merged.todo, patch.event, patch.todo) {
+	let event = non_null(patch.event, "event")?;
+	let todo = non_null(patch.todo, "todo")?;
+	match (&merged.event, &merged.todo, event, todo) {
 		(Some(_), _, Some(ev), None) => {
 			let target = merged.event.as_mut().ok_or(Error::Internal("event missing".into()))?;
 			apply_event_patch(target, ev);
@@ -779,10 +736,7 @@ pub async fn patch_exception(
 	}
 
 	let out = write_object(&app, tn_id, cal_id, merged).await?;
-	let mut resp = ApiResponse::new(out);
-	if let Some(id) = req_id {
-		resp = resp.with_req_id(id);
-	}
+	let resp = ApiResponse::new(out);
 	Ok((StatusCode::OK, Json(resp)))
 }
 
@@ -792,15 +746,13 @@ pub async fn delete_exception(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path((cal_id, uid, rid)): Path<(u64, String, String)>,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	let ts =
 		parse_iso_ts(&rid).ok_or_else(|| Error::ValidationError("invalid recurrence_id".into()))?;
 	app.meta_adapter
 		.delete_calendar_object_override(tn_id, cal_id, &uid, ts)
 		.await?;
-	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
 // Tests

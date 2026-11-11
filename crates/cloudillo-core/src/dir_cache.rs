@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! Shared LRU cache of folder metadata (parent id, name, is_folder) used to
-//! resolve `withParent` / `withPath` listing options and bounded parent-chain
+//! resolve `include=parent,path` listing options and bounded parent-chain
 //! walks without recursive SQL. The cache holds folder rows only.
 //!
 //! Tenant safety invariants:

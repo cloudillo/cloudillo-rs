@@ -19,8 +19,8 @@ use cloudillo::meta_adapter::{
 use cloudillo::types::{Patch, Timestamp, TnId};
 
 use crate::fixture::{
-	ADMIN, ALICE, CLUB, PASSWORD, RemoteId, Remotes, TRASH, Tenants, call, find_str, prof, remote,
-	req, sign,
+	ADMIN, ALICE, CLUB, PASSWORD, RemoteId, Remotes, TRASH, Tenants, call, find_str, prof,
+	query_body, remote, req, sign,
 };
 use crate::objects::{ApiKeys, Obj, canon_folder, canon_root};
 
@@ -200,14 +200,16 @@ impl Minter<'_> {
 		tok
 	}
 
-	async fn get(
+	/// POST to a token endpoint; `uri`'s query pairs become the JSON body (see `query_body`).
+	async fn post(
 		&mut self,
 		name: &str,
 		host: &str,
 		uri: &str,
 		bearer: Option<&str>,
 	) -> Option<String> {
-		self.mint(name, host, Method::GET, uri, bearer, Body::empty()).await
+		let (path, body) = query_body(uri);
+		self.mint(name, host, Method::POST, path, bearer, Body::from(body)).await
 	}
 
 	async fn login(&mut self, host: &str) -> Option<String> {
@@ -217,10 +219,10 @@ impl Minter<'_> {
 			.await
 	}
 
-	/// `?token=` exchange of a PROXY token signed by `r` for `host`, plus `extra` params.
+	/// `token` exchange of a PROXY token signed by `r` for `host`, plus `extra` (`&k=v`) params.
 	async fn proxy(&mut self, name: &str, host: &str, r: &RemoteId, extra: &str) -> Option<String> {
 		let tok = sign(r, &proxy_claims(r, host));
-		self.get(name, host, &format!("/api/auth/access-token?token={tok}{extra}"), None)
+		self.post(name, host, &format!("/api/auth/access-token?token={tok}{extra}"), None)
 			.await
 	}
 
@@ -321,7 +323,7 @@ pub async fn mint_subjects(
 	app.meta_adapter.create_file(t.admin.tn_id, doc).await.unwrap();
 	let scope = format!("file:{admin_doc}:R");
 	let uri = format!("/api/auth/access-token?scope={scope}");
-	let tok = m.get("scope-sadm@admin", ADMIN, &uri, admin_owner.as_deref()).await;
+	let tok = m.post("scope-sadm@admin", ADMIN, &uri, admin_owner.as_deref()).await;
 	let mut facts = owner_facts(ADMIN, &["SADM"]);
 	facts.scope = Some(scope);
 	m.add("sadm-scoped@admin", ADMIN, tok, facts);
@@ -447,21 +449,21 @@ pub async fn mint_subjects(
 	let closed_scope = "file:f1~zqm-club-cur-chan-closed-w-crdt:R";
 	let hat = hat_tok.as_deref();
 	let scoped = m
-		.get("scope-hatted@club", CLUB, &format!("/api/auth/access-token?scope={club_scope}"), hat)
+		.post("scope-hatted@club", CLUB, &format!("/api/auth/access-token?scope={club_scope}"), hat)
 		.await;
 	if let Some(c) = m.mints.last_mut() {
 		c.parent_exp = hat_exp;
 	}
-	m.get(
+	m.post(
 		"scope-hatted-closed@club",
 		CLUB,
 		&format!("/api/auth/access-token?scope={closed_scope}"),
 		hat,
 	)
 	.await;
-	m.get("refresh-hatted@club", CLUB, "/api/auth/access-token", hat).await;
+	m.post("refresh-hatted@club", CLUB, "/api/auth/access-token", hat).await;
 	// Not `proxy-…`: that prefix marks mints `smoke` requires to succeed.
-	m.get("proxytoken-hatted@club", CLUB, "/api/auth/proxy-token", hat).await;
+	m.post("proxytoken-hatted@club", CLUB, "/api/auth/proxy-token", hat).await;
 	m.add(
 		"hatted-scoped@club",
 		CLUB,
@@ -481,7 +483,7 @@ pub async fn mint_subjects(
 		for lvl in ['r', 'c', 'w', 'a'] {
 			let name = format!("sharelink-{lvl}@{short}");
 			let uri = format!("/api/auth/access-token?refId=zqref-{short}-{lvl}");
-			let tok = m.get(&format!("ref-{name}"), host, &uri, None).await;
+			let tok = m.post(&format!("ref-{name}"), host, &uri, None).await;
 			let cap = if lvl == 'a' { 'W' } else { lvl.to_ascii_uppercase() };
 			if host == ALICE && lvl == 'r' {
 				guest_r_alice.clone_from(&tok);
@@ -504,7 +506,7 @@ pub async fn mint_subjects(
 		let scope = format!("file:{alice_root}:{lvl}");
 		let uri = format!("/api/auth/access-token?scope={scope}");
 		let name = format!("owner-scoped-{lvl}@alice").to_lowercase();
-		let tok = m.get(&format!("scope-{name}"), ALICE, &uri, alice_owner.as_deref()).await;
+		let tok = m.post(&format!("scope-{name}"), ALICE, &uri, alice_owner.as_deref()).await;
 		let mut facts = owner_facts(ALICE, &[]);
 		facts.scope = Some(scope.clone());
 		m.add(&name, ALICE, tok, facts);
@@ -528,7 +530,7 @@ pub async fn mint_subjects(
 	}
 	// A share link on the canonical folder: reaches its descendants only.
 	let uri = "/api/auth/access-token?refId=zqref-alice-folder";
-	let tok = m.get("ref-folderlink-r@alice", ALICE, uri, None).await;
+	let tok = m.post("ref-folderlink-r@alice", ALICE, uri, None).await;
 	m.add(
 		"folderlink-r@alice",
 		ALICE,
@@ -548,7 +550,7 @@ pub async fn mint_subjects(
 	// Via-embed: guest R on the doc root → its linked file; also from the owner session.
 	let target = link_target(ALICE);
 	let uri = format!("/api/auth/access-token?via={alice_root}&scope=file:{target}:R");
-	let tok = m.get("via-guest@alice", ALICE, &uri, guest_r_alice.as_deref()).await;
+	let tok = m.post("via-guest@alice", ALICE, &uri, guest_r_alice.as_deref()).await;
 	m.add(
 		"via-embed@alice",
 		ALICE,
@@ -559,11 +561,11 @@ pub async fn mint_subjects(
 			..Default::default()
 		},
 	);
-	m.get("via-owner@alice", ALICE, &uri, alice_owner.as_deref()).await;
+	m.post("via-owner@alice", ALICE, &uri, alice_owner.as_deref()).await;
 
 	// apkg:publish (owner; plus a club leader and a non-leader via PROXY, cells only).
 	let tok = m
-		.get(
+		.post(
 			"scope-apkg@alice",
 			ALICE,
 			"/api/auth/access-token?scope=apkg:publish",
@@ -584,7 +586,7 @@ pub async fn mint_subjects(
 		("apikey-file@alice", &keys.file_read, Some(format!("file:{alice_root}:R"))),
 		("apikey-dav@alice", &keys.dav, Some("carddav:read,caldav:read".to_owned())),
 	] {
-		m.get(
+		m.post(
 			&format!("xchg-{name}"),
 			ALICE,
 			&format!("/api/auth/access-token?apiKey={key}"),
@@ -682,9 +684,9 @@ async fn edge_mints(
 	let uri = "/api/auth/access-token";
 	for name in ["sharelink-r@alice", "sharelink-w@alice", "apikey-file@alice"] {
 		let tok = bearer_of(m, name);
-		m.get(&format!("refresh-{name}"), ALICE, uri, tok.as_deref()).await;
+		m.post(&format!("refresh-{name}"), ALICE, uri, tok.as_deref()).await;
 	}
-	m.get("ref-xtenant@club", CLUB, &format!("{uri}?refId=zqref-alice-r"), None)
+	m.post("ref-xtenant@club", CLUB, &format!("{uri}?refId=zqref-alice-r"), None)
 		.await;
 	let meta = &m.app.meta_adapter;
 	let opts = CreateRefOptions {
@@ -698,29 +700,34 @@ async fn edge_mints(
 	};
 	meta.create_ref(m.t.alice.tn_id, "zqref-alice-gone", &opts).await.unwrap();
 	meta.delete_ref(m.t.alice.tn_id, "zqref-alice-gone").await.unwrap();
-	m.get("ref-deleted@alice", ALICE, &format!("{uri}?refId=zqref-alice-gone"), None)
+	m.post("ref-deleted@alice", ALICE, &format!("{uri}?refId=zqref-alice-gone"), None)
 		.await;
-	m.get("ref-refresh@alice", ALICE, &format!("{uri}?refId=zqref-alice-r&refresh=true"), None)
+	m.post("ref-refresh@alice", ALICE, &format!("{uri}?refId=zqref-alice-r&refresh=true"), None)
 		.await;
 	// A single-use ref tried on the wrong host first: refused there, and not burned by it.
 	let once = CreateRefOptions { count: Some(1), resource_id: Some(canon_root(ALICE)), ..opts };
 	meta.create_ref(m.t.alice.tn_id, "zqref-alice-once", &once).await.unwrap();
-	m.get("ref-once-xtenant@club", CLUB, &format!("{uri}?refId=zqref-alice-once"), None)
+	m.post("ref-once-xtenant@club", CLUB, &format!("{uri}?refId=zqref-alice-once"), None)
 		.await;
-	m.get("ref-once@alice", ALICE, &format!("{uri}?refId=zqref-alice-once"), None)
+	m.post("ref-once@alice", ALICE, &format!("{uri}?refId=zqref-alice-once"), None)
 		.await;
-	m.get("scope-foreign-ask@alice", ALICE, &format!("{uri}?scope=foo:bar"), owner)
+	m.post("scope-foreign-ask@alice", ALICE, &format!("{uri}?scope=foo:bar"), owner)
 		.await;
-	m.get("scope-carddav@alice", ALICE, &format!("{uri}?scope=carddav:read"), owner)
+	m.post("scope-carddav@alice", ALICE, &format!("{uri}?scope=carddav:read"), owner)
 		.await;
 	let stranger = bearer_of(m, "stranger@alice.test");
 	let scope = format!("file:{}:R", canon_root(ALICE));
-	m.get("scope-stranger-root@alice", ALICE, &format!("{uri}?scope={scope}"), stranger.as_deref())
-		.await;
+	m.post(
+		"scope-stranger-root@alice",
+		ALICE,
+		&format!("{uri}?scope={scope}"),
+		stranger.as_deref(),
+	)
+	.await;
 	m.proxy("hatscope-hatted@club", CLUB, hatted, &format!("&hat={aprv}&scope={scope}"))
 		.await;
 	let key = &keys.unscoped;
-	m.get("xchg-apikey-xtenant@club", CLUB, &format!("{uri}?apiKey={key}"), None)
+	m.post("xchg-apikey-xtenant@club", CLUB, &format!("{uri}?apiKey={key}"), None)
 		.await;
 
 	// Via over a `W` link: the caller's own level caps the mint; no access or no link refuses.
@@ -733,10 +740,10 @@ async fn edge_mints(
 		("via-noaccess-stranger@alice", "stranger@alice.test"),
 	] {
 		let tok = bearer_of(m, who);
-		m.get(name, ALICE, &via_w, tok.as_deref()).await;
+		m.post(name, ALICE, &via_w, tok.as_deref()).await;
 	}
 	let unlinked = canon_root(ALICE).replace("tenant-crdt-d-active", "tenant-blob-d-active");
-	m.get("via-nolink@alice", ALICE, &format!("{uri}?via={root}&scope=file:{unlinked}:R"), owner)
+	m.post("via-nolink@alice", ALICE, &format!("{uri}?via={root}&scope=file:{unlinked}:R"), owner)
 		.await;
 }
 
@@ -925,7 +932,7 @@ async fn hostile_proxy_mints(m: &mut Minter<'_>) {
 		("hostile-proxy-expired@alice", past),
 		("hostile-proxy-bad-sig@alice", bad),
 	] {
-		m.get(name, ALICE, &format!("/api/auth/access-token?token={tok}"), None).await;
+		m.post(name, ALICE, &format!("/api/auth/access-token?token={tok}"), None).await;
 	}
 }
 

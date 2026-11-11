@@ -8,7 +8,6 @@ use axum::{
 	http::StatusCode,
 };
 use regex::Regex;
-use serde_json::json;
 use serde_with::skip_serializing_none;
 
 use crate::prelude::*;
@@ -47,6 +46,7 @@ pub struct DomainValidationResponse {
 
 /// IDP availability check response
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IdpAvailabilityResponse {
 	pub available: bool,
 	pub id_tag: String,
@@ -257,7 +257,7 @@ pub async fn verify_register_data(
 				}
 
 				// Make network request to IDP server to check availability
-				let check_path = format!("/idp/check-availability?idTag={}", id_tag);
+				let check_path = format!("/idp/availability?idTag={}", id_tag);
 
 				match app
 					.request
@@ -286,13 +286,13 @@ pub async fn verify_register_data(
 	Ok(response)
 }
 
-/// POST /api/profiles/verify - Validate domain/id_tag before profile creation
+/// POST /api/registrations/verify - Validate domain/id_tag before profile creation
 /// Requires either authentication OR a valid registration token
 pub async fn post_verify_profile(
 	State(app): State<cloudillo_core::app::App>,
 	OptionalAuth(auth): OptionalAuth,
 	Json(req): Json<RegisterVerifyCheckRequest>,
-) -> ClResult<(StatusCode, Json<DomainValidationResponse>)> {
+) -> ClResult<(StatusCode, Json<ApiResponse<DomainValidationResponse>>)> {
 	// Require either authentication OR valid token
 	let is_authenticated = auth.is_some();
 
@@ -310,7 +310,10 @@ pub async fn post_verify_profile(
 
 	// For "ref" type, just return identity providers
 	if req.typ == "ref" {
-		return Ok((StatusCode::OK, Json(base_validation_response(&app, providers))));
+		return Ok((
+			StatusCode::OK,
+			Json(ApiResponse::new(base_validation_response(&app, providers))),
+		));
 	}
 
 	// The canonical (UTS #46 U-label) form every other boundary stores and compares —
@@ -318,7 +321,7 @@ pub async fn post_verify_profile(
 	let Ok(id_tag_lower) = cloudillo_types::validation::canonicalize_id_tag(&req.id_tag) else {
 		let mut response = base_validation_response(&app, providers);
 		response.id_tag_error = "invalid".to_string();
-		return Ok((StatusCode::OK, Json(response)));
+		return Ok((StatusCode::OK, Json(ApiResponse::new(response))));
 	};
 
 	// Validate domain/local and get validation errors
@@ -326,7 +329,7 @@ pub async fn post_verify_profile(
 		verify_register_data(&app, &req.typ, &id_tag_lower, req.app_domain.as_deref(), providers)
 			.await?;
 
-	Ok((StatusCode::OK, Json(validation_result)))
+	Ok((StatusCode::OK, Json(ApiResponse::new(validation_result))))
 }
 
 /// Setting key under which deferred welcome-email params are stashed.
@@ -491,7 +494,7 @@ async fn handle_idp_registration(
 	email: String,
 	lang: Option<String>,
 	welcome_delay_seconds: Option<i64>,
-) -> ClResult<(StatusCode, Json<serde_json::Value>, TnId)> {
+) -> ClResult<TnId> {
 	#[derive(serde::Serialize)]
 	struct InboxRequest {
 		token: String,
@@ -685,9 +688,7 @@ async fn handle_idp_registration(
 		}
 	}
 
-	// Return empty response
-	let response = json!({});
-	Ok((StatusCode::CREATED, Json(response), tn_id))
+	Ok(tn_id)
 }
 
 /// Handle domain registration flow
@@ -699,7 +700,7 @@ async fn handle_domain_registration(
 	providers: Vec<String>,
 	lang: Option<String>,
 	welcome_delay_seconds: Option<i64>,
-) -> ClResult<(StatusCode, Json<serde_json::Value>, TnId)> {
+) -> ClResult<TnId> {
 	// Validate domain again before creating account
 	let validation_result =
 		verify_register_data(app, "domain", &id_tag_lower, app_domain.as_deref(), providers)
@@ -785,9 +786,8 @@ async fn handle_domain_registration(
 	)
 	.await?;
 
-	// Return empty response (user must login separately)
-	let response = json!({});
-	Ok((StatusCode::CREATED, Json(response), tn_id))
+	// The user must log in separately.
+	Ok(tn_id)
 }
 
 /// Default delay (seconds) applied to the welcome email when an invitation
@@ -964,12 +964,19 @@ async fn apply_invitation_effects(
 	}
 }
 
-/// POST /api/profiles/register - Create profile after validation
+/// Body of a successful registration: the canonical id_tag of the created profile.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterResponse {
+	pub id_tag: String,
+}
+
+/// POST /api/registrations - Create profile after validation
 /// Requires a valid registration token (invitation ref)
 pub async fn post_register(
 	State(app): State<cloudillo_core::app::App>,
 	Json(req): Json<RegisterRequest>,
-) -> ClResult<(StatusCode, Json<serde_json::Value>)> {
+) -> ClResult<(StatusCode, Json<ApiResponse<RegisterResponse>>)> {
 	// Validate request fields
 	if req.id_tag.is_empty() || req.token.is_empty() || req.email.is_empty() {
 		return Err(Error::ValidationError("id_tag, token, and email are required".into()));
@@ -1024,7 +1031,7 @@ pub async fn post_register(
 	// If registration succeeded, consume the token, then wire up invitation
 	// effects off the request path.
 	match result {
-		Ok((status, body, new_tn_id)) => {
+		Ok(new_tn_id) => {
 			if let Err(e) = app.meta_adapter.use_ref(&req.token, &[REGISTER_REF_TYPE]).await {
 				warn!(
 					error = %e,
@@ -1056,7 +1063,10 @@ pub async fn post_register(
 				});
 			}
 
-			Ok((status, body))
+			Ok((
+				StatusCode::CREATED,
+				Json(ApiResponse::new(RegisterResponse { id_tag: id_tag_lower })),
+			))
 		}
 		Err(e) => Err(e),
 	}

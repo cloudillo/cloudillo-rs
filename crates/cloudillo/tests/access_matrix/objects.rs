@@ -538,7 +538,7 @@ pub async fn seed_pim(api: &axum::Router, subjects: &[crate::subjects::Subject])
 	] {
 		let b =
 			send(Method::POST, owner, "/api/address-books".into(), json!({ "name": name })).await;
-		assert_eq!(b["data"]["abId"], ab_id, "address book {name} on {}", owner.host);
+		assert_eq!(b["data"]["id"], ab_id.to_string(), "address book {name} on {}", owner.host);
 		if let Some(uid) = uid {
 			let uri = format!("/api/address-books/{ab_id}/contacts");
 			send(Method::POST, owner, uri, json!({ "uid": uid, "fn": "Zqm" })).await;
@@ -554,7 +554,7 @@ pub async fn seed_pim(api: &axum::Router, subjects: &[crate::subjects::Subject])
 		(alice, "zqm-cal2", 3, None),
 	] {
 		let b = send(Method::POST, owner, "/api/calendars".into(), json!({ "name": name })).await;
-		assert_eq!(b["data"]["calId"], cal_id, "calendar {name} on {}", owner.host);
+		assert_eq!(b["data"]["id"], cal_id.to_string(), "calendar {name} on {}", owner.host);
 		if let Some(uid) = uid {
 			let uri = format!("/api/calendars/{cal_id}/objects");
 			let body = json!({ "uid": uid, "event": event(Some("FREQ=DAILY;COUNT=5")) });

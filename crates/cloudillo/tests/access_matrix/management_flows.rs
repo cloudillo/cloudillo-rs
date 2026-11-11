@@ -17,7 +17,8 @@ use cloudillo::settings::SettingValue;
 use cloudillo::types::Patch;
 
 use crate::fixture::{
-	ADMIN, ALICE, CLUB, Fixture, PASSWORD, PEER_HAT_ROLES, TRASH, call, find_str, prof, req, sign,
+	ADMIN, ALICE, CLUB, Fixture, PASSWORD, PEER_HAT_ROLES, TRASH, call, find_str, post_q, prof,
+	req, sign,
 };
 use crate::ops::{Actual, bearer, status_class};
 use crate::subjects::Subject;
@@ -55,7 +56,7 @@ async fn admin_profile_roles() {
 		("m-moderator@club.test", uri.as_str(), r#"{"roles":["moderator"]}"#),
 		("m-moderator@club.test", own, supporter),
 		("m-moderator@club.test", uri.as_str(), r#"{"name":"x"}"#),
-		("m-moderator@club.test", uri.as_str(), r#"{"status":"B"}"#),
+		("m-moderator@club.test", uri.as_str(), r#"{"status":"blocked"}"#),
 		("m-contributor@club.test", uri.as_str(), supporter),
 		("m-contributor@club.test", uri.as_str(), r#"{"roles":null}"#),
 		("sharelink-w@club", uri.as_str(), supporter),
@@ -255,7 +256,7 @@ async fn idp_management() {
 	let writes = [
 		(Method::PATCH, mine.clone(), "{}".to_owned()),
 		(Method::DELETE, mine.clone(), String::new()),
-		(Method::PUT, format!("{mine}/address"), r#"{"address":"192.0.2.1"}"#.into()),
+		(Method::PATCH, format!("{mine}/address"), r#"{"address":"192.0.2.1"}"#.into()),
 		(Method::POST, format!("{mine}/resend"), String::new()),
 		(Method::POST, "/api/idp/api-keys".into(), key_body),
 		(
@@ -287,10 +288,10 @@ async fn idp_management() {
 	let addr = r#"{"address":"192.0.2.1"}"#;
 	let cells = [
 		("idp-ident@alice", Method::PATCH, mine.clone(), "{}", "Allow*"),
-		("idp-ident@alice", Method::PUT, format!("{mine}/address"), addr, "Allow*"),
+		("idp-ident@alice", Method::PATCH, format!("{mine}/address"), addr, "Allow*"),
 		("idp-ident@alice", Method::GET, format!("{other}/status"), "", "Deny"),
 		("idp-ident@alice", Method::POST, format!("{other}/resend"), "", "Deny"),
-		("idp-ident@alice", Method::PUT, format!("{other}/address"), addr, "Deny"),
+		("idp-ident@alice", Method::PATCH, format!("{other}/address"), addr, "Deny"),
 		("idp-ident@alice", Method::PATCH, other.clone(), "{}", "Deny"),
 		("idp-ident@alice", Method::DELETE, other.clone(), "", "Deny"),
 		("idp-ident@alice", Method::GET, own_key.clone(), "", "Allow"),
@@ -315,7 +316,7 @@ async fn idp_management() {
 	assert!(fails.is_empty(), "{}", fails.join("\n"));
 }
 
-/// `GET /api/auth/hat-endorse` on club (the hat): only a short-lived, unexpired PROXY addressed
+/// `POST /api/auth/hat-endorse` on club (the hat): only a short-lived, unexpired PROXY addressed
 /// to club, from an active (not Blocked) member, toward a connected community.
 #[tokio::test]
 async fn hat_endorse() {
@@ -362,7 +363,7 @@ async fn hat_endorse() {
 	};
 	let endorse = |token: String, peer: &str| {
 		let uri = format!("/api/auth/hat-endorse?peer={peer}&token={token}");
-		call(&fx.api, req(CLUB, Method::GET, &uri, None, Body::empty()))
+		call(&fx.api, post_q(CLUB, &uri, None))
 	};
 	let peer = fx.peer.id_tag.as_str();
 	let cases = [
@@ -396,22 +397,31 @@ async fn hat_endorse() {
 /// Public auth flows refuse a wrong password and a QR status poll without the session's secret.
 #[tokio::test]
 async fn public_auth_refusals() {
+	use cloudillo::error::codes;
 	let _g = FIXTURE_LOCK.read().await;
 	let fx = setup().await;
 	let login = format!(r#"{{"idTag":"{ALICE}","password":"zqm-wrong-0000"}}"#);
 	let r = req(ALICE, Method::POST, "/api/auth/login", None, Body::from(login));
 	let (st, b) = call(&fx.api, r).await;
-	assert_eq!(status_class(st), Actual::Deny, "wrong password: {st} {b}");
+	assert_eq!(st, StatusCode::FORBIDDEN, "wrong password: {b}");
+	assert_eq!(b["error"]["code"], codes::AUTH_BADPASSWORD, "wrong password: {b}");
+	// An unknown idTag answers exactly as a wrong password: no account enumeration.
+	let login = r#"{"idTag":"zqm-nobody.test","password":"zqm-wrong-0000"}"#;
+	let r = req(ALICE, Method::POST, "/api/auth/login", None, Body::from(login));
+	let (st, b) = call(&fx.api, r).await;
+	assert_eq!(st, StatusCode::FORBIDDEN, "unknown idTag: {b}");
+	assert_eq!(b["error"]["code"], codes::AUTH_BADPASSWORD, "unknown idTag: {b}");
 
-	let init = req(ALICE, Method::POST, "/api/auth/qr-login/init", None, Body::empty());
+	let init = req(ALICE, Method::POST, "/api/auth/login/qr", None, Body::empty());
 	let (st, body) = call(&fx.api, init).await;
 	assert!(st.is_success(), "qr init: {st} {body}");
 	let id = find_str(&body, "sessionId").expect("sessionId");
-	let uri = format!("/api/auth/qr-login/{id}/status?timeout=1");
+	let uri = format!("/api/auth/login/qr/{id}?timeout=1");
 	for secret in [None, Some("zqm-wrong")] {
 		let mut r = req(ALICE, Method::GET, &uri, None, Body::empty());
 		if let Some(v) = secret {
-			r.headers_mut().insert("x-qr-secret", axum::http::HeaderValue::from_static(v));
+			r.headers_mut()
+				.insert("cloudillo-qr-secret", axum::http::HeaderValue::from_static(v));
 		}
 		let (st, b) = call(&fx.api, r).await;
 		assert_eq!(status_class(st), Actual::Deny, "QR status, secret {secret:?}: {st} {b}");
@@ -426,10 +436,10 @@ async fn public_auth_refusals() {
 	assert_eq!(status_class(st), Actual::Deny, "anonymous logout: {st} {b}");
 	// Always 2xx, whatever the address: no account enumeration.
 	let (st, b) =
-		anon(Method::POST, "/api/auth/forgot-password", r#"{"email":"zqm@nobody.test"}"#).await;
-	assert!(st.is_success(), "forgot-password: {st} {b}");
+		anon(Method::POST, "/api/auth/password/reset", r#"{"email":"zqm@nobody.test"}"#).await;
+	assert!(st.is_success(), "password reset: {st} {b}");
 	let (st, b) =
-		anon(Method::POST, "/api/auth/wa/login", r#"{"token":"zqm","response":{}}"#).await;
+		anon(Method::POST, "/api/auth/login/passkey", r#"{"token":"zqm","response":{}}"#).await;
 	assert!(st.is_client_error(), "a forged WebAuthn login: {st} {b}");
 	// The public card and app domain are public; the full record is not (MG-352 / ME_FULL).
 	for uri in ["/api/me", "/api/me/app-domain"] {
@@ -438,16 +448,16 @@ async fn public_auth_refusals() {
 		assert!(find_str(&b, "email").is_none(), "{uri} leaks an email: {b}");
 	}
 	// IdP discovery is shut while `idp.enabled` is off.
-	for uri in ["/api/idp/info", "/api/idp/check-availability?idTag=zqm.alice.test"] {
+	for uri in ["/api/idp/info", "/api/idp/availability?idTag=zqm.alice.test"] {
 		let (st, b) = anon(Method::GET, uri, "").await;
 		assert_eq!(st, StatusCode::NOT_FOUND, "{uri} with the IdP off: {b}");
 	}
 	let reg =
 		r#"{"type":"domain","idTag":"zqm-reg.test","email":"zqm@zqm.test","token":"zqm-bad"}"#;
-	let (st, b) = anon(Method::POST, "/api/profiles/register", reg).await;
+	let (st, b) = anon(Method::POST, "/api/registrations", reg).await;
 	assert!(st.is_client_error(), "register with a bad token: {st} {b}");
 	let verify = r#"{"type":"domain","idTag":"zqm-reg.test","token":"zqm-bad"}"#;
-	let (st, b) = anon(Method::POST, "/api/profiles/verify", verify).await;
+	let (st, b) = anon(Method::POST, "/api/registrations/verify", verify).await;
 	assert!(st.is_client_error(), "verify with a bad token: {st} {b}");
 }
 
@@ -482,8 +492,7 @@ async fn session_refresh_revocation() {
 		},
 	);
 	let mint = |host: &'static str, uri: String, bearer: Option<String>| async move {
-		let (st, b) =
-			call(&fx.api, req(host, Method::GET, &uri, bearer.as_deref(), Body::empty())).await;
+		let (st, b) = call(&fx.api, post_q(host, &uri, bearer.as_deref())).await;
 		(st, find_str(&b, "token"))
 	};
 	let roles = |tok: String| async move {
@@ -565,13 +574,14 @@ mod sx {
 		}
 	}
 
-	pub async fn get(fx: &Fixture, uri: &str) -> (StatusCode, Option<String>) {
-		let (st, b) = call(&fx.api, req(CLUB, Method::GET, uri, None, Body::empty())).await;
+	/// POST to a token endpoint on club, `uri`'s query pairs as the body ([`post_q`]).
+	pub async fn post_token(fx: &Fixture, uri: &str) -> (StatusCode, Option<String>) {
+		let (st, b) = call(&fx.api, post_q(CLUB, uri, None)).await;
 		(st, find_str(&b, "token"))
 	}
 
 	pub async fn exchange(fx: &Fixture, token: &str, hat: &str) -> (StatusCode, Option<String>) {
-		get(fx, &format!("/api/auth/access-token?token={token}{hat}")).await
+		post_token(fx, &format!("/api/auth/access-token?token={token}{hat}")).await
 	}
 }
 
@@ -674,7 +684,7 @@ async fn suspended_lift_on_hat_exchange() {
 async fn suspended_lift_on_hat_endorse() {
 	use cloudillo::auth_adapter::ActionToken;
 	use cloudillo::meta_adapter::ProfileStatus::{Active, Suspended};
-	use sx::{claims, get, seed, set_status, status};
+	use sx::{claims, post_token, seed, set_status, status};
 	let _g = FIXTURE_LOCK.write().await;
 	let fx = setup().await;
 	let peer = fx.peer.id_tag.clone();
@@ -684,7 +694,7 @@ async fn suspended_lift_on_hat_endorse() {
 	post.t = "POST".into();
 	let endorse = |c: &ActionToken| {
 		let uri = format!("/api/auth/hat-endorse?peer={peer}&token={}", sign(&endorsed, c));
-		async move { get(fx, &uri).await }
+		async move { post_token(fx, &uri).await }
 	};
 	let (st, _) = endorse(&post).await;
 	assert_eq!(st, StatusCode::FORBIDDEN, "hat-endorse with a non-PROXY");
@@ -697,7 +707,7 @@ async fn suspended_lift_on_hat_endorse() {
 	set_status(fx, id, Some(Suspended)).await;
 	let leader = fx.subject("m-leader@club.test");
 	let admin = format!("/api/admin/profiles/{id}");
-	let (st, b) = send(fx, leader, Method::PATCH, &admin, r#"{"status":"A"}"#).await;
+	let (st, b) = send(fx, leader, Method::PATCH, &admin, r#"{"status":"active"}"#).await;
 	assert!(st.is_success(), "leader lifts S: {st} {b}");
 	assert_eq!(status(fx, id).await, Some(Active), "admin lift");
 }
@@ -713,15 +723,15 @@ async fn me_patch_edits_the_tenant_record() {
 	assert_eq!(find_str(&b, "idTag").as_deref(), Some(CLUB), "edited record: {b}");
 }
 
-/// `GET /api/auth/login-token`: only the account itself trades its session for a login. An
+/// `POST /api/auth/session/renew`: only the account itself trades its session for a login. An
 /// `idp_` key naming the host is an invalid credential (401); another identity is refused
-/// (403); no credential, or a scoped one (dropped to anonymous on this path), gets `null`.
+/// (403); no credential, or a scoped one (dropped to anonymous on this path), is 401.
 #[tokio::test]
 async fn login_token() {
 	let _g = FIXTURE_LOCK.read().await;
 	let fx = setup().await;
-	let uri = "/api/auth/login-token";
-	let (st, b) = send(fx, fx.subject("owner@alice"), Method::GET, uri, "").await;
+	let uri = "/api/auth/session/renew";
+	let (st, b) = send(fx, fx.subject("owner@alice"), Method::POST, uri, "").await;
 	assert_eq!(st, StatusCode::OK, "owner: {b}");
 	assert!(find_str(&b, "token").is_some(), "owner gets a login: {b}");
 	for (n, want) in [
@@ -729,27 +739,35 @@ async fn login_token() {
 		("stranger@alice.test", StatusCode::FORBIDDEN),
 		("m-leader@club.test", StatusCode::FORBIDDEN),
 	] {
-		let (st, b) = send(fx, fx.subject(n), Method::GET, uri, "").await;
+		let (st, b) = send(fx, fx.subject(n), Method::POST, uri, "").await;
 		assert_eq!(st, want, "{n}: {b}");
 	}
 	for n in ["anon@alice.test", "sharelink-r@alice", "owner-scoped-r@alice"] {
-		let (st, b) = send(fx, fx.subject(n), Method::GET, uri, "").await;
-		assert_eq!(st, StatusCode::OK, "{n}: {b}");
-		assert!(b["data"].is_null(), "{n} gets a login: {b}");
+		let (st, b) = send(fx, fx.subject(n), Method::POST, uri, "").await;
+		assert_eq!(st, StatusCode::UNAUTHORIZED, "{n}: {b}");
 	}
 }
 
-/// `POST /api/auth/login-init`: the same up-front account check as `login_token`.
+/// `POST /api/auth/login/init` is the unauthenticated bootstrap only: any session, the
+/// account's own or another identity's, is 400 (renewal is `session_renew`). An `idp_` key is
+/// an invalid credential here (401). A share link or scoped token drops to anonymous and gets
+/// the same bootstrap as anon: no session, no token for alice.
 #[tokio::test]
 async fn login_init() {
 	let _g = FIXTURE_LOCK.read().await;
 	let fx = setup().await;
-	let uri = "/api/auth/login-init";
-	let (st, b) = send(fx, fx.subject("owner@alice"), Method::POST, uri, "").await;
-	assert!(st.is_success(), "owner: {st} {b}");
-	for n in ["stranger@alice.test", "m-leader@club.test"] {
+	let uri = "/api/auth/login/init";
+	let (st, b) = send(fx, fx.subject("anon@alice.test"), Method::POST, uri, "").await;
+	assert!(st.is_success(), "anon: {st} {b}");
+	for n in ["owner@alice", "stranger@alice.test", "m-leader@club.test"] {
 		let (st, b) = send(fx, fx.subject(n), Method::POST, uri, "").await;
-		assert_eq!(st, StatusCode::FORBIDDEN, "{n}: {b}");
+		assert_eq!(st, StatusCode::BAD_REQUEST, "{n}: {b}");
+	}
+	let (st, b) = send(fx, fx.subject("idp-mgmt@alice"), Method::POST, uri, "").await;
+	assert_eq!(st, StatusCode::UNAUTHORIZED, "idp-mgmt: {b}");
+	for n in ["sharelink-r@alice", "owner-scoped-r@alice"] {
+		let (st, b) = send(fx, fx.subject(n), Method::POST, uri, "").await;
+		assert!(st.is_success(), "{n}: {st} {b}");
 	}
 }
 
@@ -800,12 +818,12 @@ async fn app_uninstall() {
 async fn qr_login_respond() {
 	let _g = FIXTURE_LOCK.read().await;
 	let fx = setup().await;
-	let init = req(ALICE, Method::POST, "/api/auth/qr-login/init", None, Body::empty());
+	let init = req(ALICE, Method::POST, "/api/auth/login/qr", None, Body::empty());
 	let (st, body) = call(&fx.api, init).await;
 	assert!(st.is_success(), "qr init: {st} {body}");
 	let id = find_str(&body, "sessionId").expect("sessionId");
-	let details = format!("/api/auth/qr-login/{id}/details");
-	let respond = format!("/api/auth/qr-login/{id}/respond");
+	let details = format!("/api/auth/login/qr/{id}/details");
+	let respond = format!("/api/auth/login/qr/{id}/respond");
 	let no = r#"{"approved":false}"#;
 
 	let n = "stranger@alice.test";
@@ -830,15 +848,15 @@ async fn qr_login_respond() {
 	assert_eq!(st, StatusCode::OK, "owner answers a QR login: {b}");
 
 	// On a community, a leader is not the account: club's QR login is club's alone.
-	let init = req(CLUB, Method::POST, "/api/auth/qr-login/init", None, Body::empty());
+	let init = req(CLUB, Method::POST, "/api/auth/login/qr", None, Body::empty());
 	let (st, body) = call(&fx.api, init).await;
 	assert!(st.is_success(), "club qr init: {st} {body}");
 	let id = find_str(&body, "sessionId").expect("sessionId");
 	let leader = fx.subject("m-leader@club.test");
 	let (st, b) =
-		send(fx, leader, Method::GET, &format!("/api/auth/qr-login/{id}/details"), "").await;
+		send(fx, leader, Method::GET, &format!("/api/auth/login/qr/{id}/details"), "").await;
 	assert_eq!(st, StatusCode::FORBIDDEN, "leader reads club's QR details: {b}");
-	let uri = format!("/api/auth/qr-login/{id}/respond");
+	let uri = format!("/api/auth/login/qr/{id}/respond");
 	let (st, b) = send(fx, leader, Method::POST, &uri, no).await;
 	assert_eq!(st, StatusCode::FORBIDDEN, "leader answers club's QR login: {b}");
 }
@@ -852,7 +870,7 @@ async fn owner_api_key_crud() {
 	let body = format!(r#"{{"name":"zqm-crud","reauth":{{"password":"{PASSWORD}"}}}}"#);
 	let (st, b) = send(fx, owner, Method::POST, "/api/auth/api-keys", &body).await;
 	assert!(st.is_success(), "create: {st} {b}");
-	let id = b["data"]["keyId"].as_i64().expect("keyId");
+	let id = b["data"]["id"].as_str().and_then(|s| s.parse::<i64>().ok()).expect("id");
 	let uri = format!("/api/auth/api-keys/{id}");
 	let (st, b) = send(fx, fx.subject("stranger@alice.test"), Method::DELETE, &uri, "").await;
 	assert_eq!(status_class(st), Actual::Deny, "stranger deletes the key: {st} {b}");
@@ -871,7 +889,7 @@ async fn admin_proxy_site_crud() {
 	let body = r#"{"domain":"zqm-proxy2.test","backendUrl":"http://127.0.0.1:9"}"#;
 	let (st, b) = send(fx, sadm, Method::POST, "/api/admin/proxy-sites", body).await;
 	assert!(st.is_success(), "create: {st} {b}");
-	let id = b["data"]["siteId"].as_i64().expect("siteId");
+	let id = b["data"]["id"].as_str().and_then(|s| s.parse::<i64>().ok()).expect("id");
 	assert_ne!(id, 1, "a new site");
 	let uri = format!("/api/admin/proxy-sites/{id}");
 	let (st, b) = send(fx, fx.subject("owner@alice"), Method::DELETE, &uri, "").await;
@@ -923,7 +941,9 @@ async fn admin_backup_run() {
 /// consumes the tenant's own welcome ref, never another tenant's.
 #[tokio::test]
 async fn password_and_onboarding() {
+	use cloudillo::error::{Error, codes};
 	use cloudillo::meta_adapter::{CreateRefOptions, WELCOME_REF_TYPE};
+	use cloudillo::types::Timestamp;
 	let _g = FIXTURE_LOCK.write().await;
 	let fx = setup().await;
 	let owner = fx.subject("owner@trash");
@@ -961,7 +981,25 @@ async fn password_and_onboarding() {
 	let (st, b) = send(fx, owner, Method::POST, done, r#"{"refId":"zqref-trash-welcome"}"#).await;
 	assert!(st.is_success(), "owner completes onboarding: {st} {b}");
 	let gone = meta.validate_ref("zqref-trash-welcome", &[WELCOME_REF_TYPE]).await;
-	assert!(gone.is_err(), "the welcome ref survived onboarding");
+	assert!(matches!(gone, Err(Error::RefUsed)), "the welcome ref survived onboarding");
+	// A used and an expired ref are told apart: 410 with `E-REF-USED` / `E-REF-EXPIRED`.
+	// Re-completing onboarding is idempotent (204), so the codes are probed on password set.
+	let expired = CreateRefOptions { expires_at: Some(Timestamp(1)), ..welcome() };
+	meta.create_ref(fx.tenants.trash.tn_id, "zqref-trash-expired", &expired)
+		.await
+		.unwrap();
+	let stale = meta.validate_ref("zqref-trash-expired", &[WELCOME_REF_TYPE]).await;
+	assert!(matches!(stale, Err(Error::RefExpired)), "expired ref: {stale:?}");
+	for (ref_id, code) in [
+		("zqref-trash-welcome", codes::REF_USED),
+		("zqref-trash-expired", codes::REF_EXPIRED),
+	] {
+		let body = format!(r#"{{"refId":"{ref_id}","newPassword":"zqm-pass-9999"}}"#);
+		let r = req(TRASH, Method::POST, "/api/auth/password/set", None, Body::from(body));
+		let (st, b) = call(&fx.api, r).await;
+		assert_eq!(st, StatusCode::GONE, "{ref_id}: {b}");
+		assert_eq!(b["error"]["code"], code, "{ref_id}: {b}");
+	}
 
 	// MG-458..460, MG-496..499: the tenant's own welcome ref is the account's to retire, not a
 	// visitor's, a link's, an `idp_` key's or a narrowed session's that names the tenant.
@@ -987,7 +1025,7 @@ async fn password_and_onboarding() {
 	let (st, b) = send(fx, fx.subject("owner@alice"), Method::POST, done, body).await;
 	assert!(st.is_success(), "alice completes onboarding: {st} {b}");
 	let gone = meta.validate_ref("zqref-alice-onboard", &[WELCOME_REF_TYPE]).await;
-	assert!(gone.is_err(), "alice's welcome ref survived onboarding");
+	assert!(matches!(gone, Err(Error::RefUsed)), "alice's welcome ref survived onboarding");
 }
 
 /// The account's address book, calendar and push subscription: created, edited and removed by
@@ -998,10 +1036,13 @@ async fn pim_edits() {
 	let fx = setup().await;
 	let owner = fx.subject("owner@alice");
 	let stranger = fx.subject("stranger@alice.test");
-	for (base, id_key) in [("/api/address-books", "abId"), ("/api/calendars", "calId")] {
+	for base in ["/api/address-books", "/api/calendars"] {
 		let (st, b) = send(fx, owner, Method::POST, base, r#"{"name":"zqm-pim"}"#).await;
 		assert!(st.is_success(), "create {base}: {st} {b}");
-		let id = b["data"][id_key].as_u64().unwrap_or_else(|| panic!("{id_key}: {b}"));
+		let id = b["data"]["id"]
+			.as_str()
+			.and_then(|s| s.parse::<u64>().ok())
+			.unwrap_or_else(|| panic!("id: {b}"));
 		let uri = format!("{base}/{id}");
 		for m in [Method::PATCH, Method::DELETE] {
 			let body = if m == Method::PATCH { r#"{"name":"zqm-x"}"# } else { "" };
@@ -1017,13 +1058,10 @@ async fn pim_edits() {
 		r#"{"subscription":{"endpoint":"https://push.zqm.test/1","#,
 		r#""keys":{"p256dh":"zqm","auth":"zqm"}}}"#,
 	);
-	let (st, b) = send(fx, owner, Method::POST, "/api/notifications/subscription", sub).await;
+	let (st, b) = send(fx, owner, Method::POST, "/api/notifications/subscriptions", sub).await;
 	assert!(st.is_success(), "push subscribe: {st} {b}");
-	let id = b["id"]
-		.as_u64()
-		.or_else(|| b["data"]["id"].as_u64())
-		.unwrap_or_else(|| panic!("id: {b}"));
-	let uri = format!("/api/notifications/subscription/{id}");
+	let id = b["data"]["id"].as_str().unwrap_or_else(|| panic!("id: {b}")).to_owned();
+	let uri = format!("/api/notifications/subscriptions/{id}");
 	let (st, b) = send(fx, stranger, Method::DELETE, &uri, "").await;
 	assert_eq!(status_class(st), Actual::Deny, "stranger drops the subscription: {st} {b}");
 	let (st, b) = send(fx, owner, Method::DELETE, &uri, "").await;
@@ -1033,21 +1071,19 @@ async fn pim_edits() {
 	// any leader removes one the owner made; a contributor none.
 	let sub = sub.replace("/1", "/2");
 	let club_owner = fx.subject("owner@club");
-	let (st, b) = send(fx, club_owner, Method::POST, "/api/notifications/subscription", &sub).await;
+	let (st, b) =
+		send(fx, club_owner, Method::POST, "/api/notifications/subscriptions", &sub).await;
 	assert!(st.is_success(), "club push subscribe: {st} {b}");
-	let id = b["id"]
-		.as_u64()
-		.or_else(|| b["data"]["id"].as_u64())
-		.unwrap_or_else(|| panic!("id: {b}"));
-	let uri = format!("/api/notifications/subscription/{id}");
+	let id = b["data"]["id"].as_str().unwrap_or_else(|| panic!("id: {b}")).to_owned();
+	let uri = format!("/api/notifications/subscriptions/{id}");
 	let (st, b) = send(fx, fx.subject("m-contributor@club.test"), Method::DELETE, &uri, "").await;
 	assert_eq!(status_class(st), Actual::Deny, "a contributor drops club's subscription: {b}");
 	let (st, b) = send(fx, fx.subject("m-leader@club.test"), Method::DELETE, &uri, "").await;
 	assert!(st.is_success(), "a leader drops club's subscription: {st} {b}");
 }
 
-/// `idp/activate` validates and binds its ref to the host before consuming it: an unknown ref
-/// is refused, and another tenant's ref is refused without being burned.
+/// `POST /api/idp/activations` validates and binds its ref to the host before consuming it: an
+/// unknown ref is refused, and another tenant's ref is refused without being burned.
 #[tokio::test]
 async fn idp_activate_never_burns_a_foreign_ref() {
 	use cloudillo::meta_adapter::{CreateRefOptions, IDP_ACTIVATION_REF_TYPE};
@@ -1071,7 +1107,7 @@ async fn idp_activate_never_burns_a_foreign_ref() {
 		.unwrap();
 	let activate = |ref_id: &str| {
 		let body = Body::from(format!(r#"{{"refId":"{ref_id}"}}"#));
-		call(&fx.api, req(ALICE, Method::POST, "/api/idp/activate", None, body))
+		call(&fx.api, req(ALICE, Method::POST, "/api/idp/activations", None, body))
 	};
 	let (st, b) = activate("zqref-unknown").await;
 	let unknown = !st.is_success();
@@ -1083,18 +1119,18 @@ async fn idp_activate_never_burns_a_foreign_ref() {
 	assert!(kept.is_ok(), "the foreign activation ref was consumed");
 }
 
-/// `GET /api/actions?status=C`: pending moderation is listed to a moderator, and filtered to
-/// nothing for a contributor or a share link.
+/// `GET /api/actions?status=confirmation`: pending moderation is listed to a moderator, and
+/// filtered to nothing for a contributor or a share link.
 #[tokio::test]
 async fn pending_actions_listed_to_moderators() {
 	let _g = FIXTURE_LOCK.read().await;
 	let fx = setup().await;
-	let uri = "/api/actions?status=C";
+	let uri = "/api/actions?status=confirmation";
 	let (st, b) = send(fx, fx.subject("m-moderator@club.test"), Method::GET, uri, "").await;
 	assert!(st.is_success(), "moderator {uri}: {st} {b}");
 	let data = b["data"].as_array().cloned().unwrap_or_default();
 	assert!(!data.is_empty(), "moderator sees no pending action: {b}");
-	assert!(data.iter().all(|a| a["status"] == "C"), "moderator {uri}: {b}");
+	assert!(data.iter().all(|a| a["status"] == "confirmation"), "moderator {uri}: {b}");
 	for n in ["m-contributor@club.test", "sharelink-r@alice"] {
 		let (st, b) = send(fx, fx.subject(n), Method::GET, uri, "").await;
 		assert!(st.is_success(), "{n} {uri}: {st} {b}");
@@ -1175,8 +1211,8 @@ async fn suspension_expiry_and_mfa() {
 	let (st, b) = admin(Method::POST, "/resume", "").await;
 	assert!(st.is_success(), "resume: {st} {b}");
 	open("resumed").await;
-	let past = Timestamp::from_now(-60).0;
-	let (st, b) = admin(Method::PATCH, "", &format!(r#"{{"expiresAt":{past}}}"#)).await;
+	let past = Timestamp::from_now(-60).to_iso_string();
+	let (st, b) = admin(Method::PATCH, "", &format!(r#"{{"expiresAt":"{past}"}}"#)).await;
 	assert!(st.is_success(), "expire: {st} {b}");
 	shut("expired").await;
 	let (st, b) = admin(Method::PATCH, "", r#"{"expiresAt":null}"#).await;
@@ -1266,7 +1302,7 @@ async fn suspension_expiry_and_mfa() {
 		let code = code.map(|c| format!(r#","code":"{c}""#)).unwrap_or_default();
 		let body =
 			format!(r#"{{"refId":"zqref-susp-welcome","newPassword":"zqm-new-0000"{code}}}"#);
-		post("/api/auth/set-password", body)
+		post("/api/auth/password/set", body)
 	};
 	let new_login =
 		|| post("/api/auth/login", format!(r#"{{"idTag":"{susp}","password":"zqm-new-0000"}}"#));
@@ -1308,8 +1344,8 @@ async fn suspension_expiry_and_mfa() {
 	assert!(find_str(&b, "token").is_some(), "correct code after a spent token: {st} {b}");
 
 	// SADM reset: the new password alone logs in again.
-	let (st, b) = admin(Method::POST, "/mfa-reset", "").await;
-	assert!(st.is_success(), "mfa-reset: {st} {b}");
+	let (st, b) = admin(Method::POST, "/mfa/reset", "").await;
+	assert!(st.is_success(), "mfa/reset: {st} {b}");
 	let body = format!(r#"{{"idTag":"{susp}","password":"zqm-new-0000"}}"#);
 	let (st, b) = post("/api/auth/login", body).await;
 	assert!(find_str(&b, "token").is_some(), "login after reset: {st} {b}");
@@ -1421,15 +1457,15 @@ async fn link_share_audit_omits_secret() {
 
 	let body = r#"{"fileTp":"CRDT","contentType":"cloudillo/quillo","fileName":"zqm-link"}"#;
 	let (st, b) = send(fx, owner, Method::POST, "/api/files", body).await;
-	let file_id = find_str(&b, "fileId").unwrap_or_else(|| panic!("create file: {st} {b}"));
+	let file_id = find_str(&b, "id").unwrap_or_else(|| panic!("create file: {st} {b}"));
 	let link = "zqm-link-secret-0001";
 	let uri = format!("/api/files/{file_id}/shares");
-	let body = format!(r#"{{"subjectType":"L","subjectId":"{link}","permission":"R"}}"#);
+	let body = format!(r#"{{"subjectType":"link","subjectId":"{link}","permission":"read"}}"#);
 	let (st, b) = send(fx, owner, Method::POST, &uri, &body).await;
 	assert!(st.is_success(), "create link share: {st} {b}");
-	let share = &b["data"]["id"];
+	let share = b["data"]["id"].as_str().unwrap_or_default().to_owned();
 	let uri = format!("/api/files/{file_id}/shares/{share}");
-	let (st, b) = send(fx, owner, Method::PATCH, &uri, r#"{"permission":"W"}"#).await;
+	let (st, b) = send(fx, owner, Method::PATCH, &uri, r#"{"permission":"write"}"#).await;
 	assert!(st.is_success(), "update link share: {st} {b}");
 	let (st, b) = send(fx, owner, Method::DELETE, &uri, "").await;
 	assert!(st.is_success(), "delete link share: {st} {b}");
@@ -1443,7 +1479,12 @@ async fn link_share_audit_omits_secret() {
 	let rows = fx.app.auth_adapter.list_audit_events(&q).await.unwrap();
 	let ours: Vec<_> = rows
 		.iter()
-		.filter(|r| r.event.details.as_ref().is_some_and(|d| d["shareId"] == *share))
+		.filter(|r| {
+			r.event
+				.details
+				.as_ref()
+				.is_some_and(|d| d["shareId"] == share.parse::<i64>().unwrap_or_default())
+		})
 		.collect();
 	assert_eq!(ours.len(), 3, "create, update and delete rows: {rows:?}");
 	for r in ours {
@@ -1452,7 +1493,7 @@ async fn link_share_audit_omits_secret() {
 	}
 }
 
-/// `auth.session_timeout` bounds a session's absolute lifetime: the renewals `login-token` and
+/// `auth.session_timeout` bounds a session's absolute lifetime: the renewals `session/renew` and
 /// `proxy-token` refuse an owner token whose `auth_time` is past the tenant's timeout, and
 /// renew the same token with a fresh `auth_time`.
 #[tokio::test]
@@ -1482,14 +1523,14 @@ async fn renewal_refused_past_session_timeout() {
 	};
 	let stale = mint(Timestamp(Timestamp::now().0 - timeout - 60)).await;
 	let fresh = mint(Timestamp::now()).await;
+	// `login/init` is not here: it refuses any session (400) before the timeout matters.
 	for (m, uri) in [
-		(Method::GET, "/api/auth/login-token"),
-		(Method::GET, "/api/auth/proxy-token"),
-		(Method::GET, "/api/auth/access-token"),
-		(Method::POST, "/api/auth/login-init"),
+		(Method::POST, "/api/auth/session/renew"),
+		(Method::POST, "/api/auth/proxy-token"),
+		(Method::POST, "/api/auth/access-token"),
 	] {
 		for (tok, want) in [(&stale, StatusCode::FORBIDDEN), (&fresh, StatusCode::OK)] {
-			let r = req(ALICE, m.clone(), uri, Some(tok.as_str()), Body::empty());
+			let r = req(ALICE, m.clone(), uri, Some(tok.as_str()), Body::from("{}"));
 			let (st, b) = call(&fx.api, r).await;
 			assert_eq!(st, want, "{m} {uri} (stale = {}): {b}", want == StatusCode::FORBIDDEN);
 		}
@@ -1497,14 +1538,14 @@ async fn renewal_refused_past_session_timeout() {
 	// Federated proxy token: the fixture has no remote peer, so only the stale refusal is
 	// reachable (a fresh session would go on to dial the peer).
 	let uri = "/api/auth/proxy-token?idTag=zqm-peer.example.test";
-	let (st, b) = call(&fx.api, req(ALICE, Method::GET, uri, Some(&stale), Body::empty())).await;
+	let (st, b) = call(&fx.api, post_q(ALICE, uri, Some(&stale))).await;
 	assert_eq!(st, StatusCode::FORBIDDEN, "stale federated proxy-token: {b}");
 	// QR approval: stale only, since a fresh approval would consume the session.
-	let init = req(ALICE, Method::POST, "/api/auth/qr-login/init", None, Body::empty());
+	let init = req(ALICE, Method::POST, "/api/auth/login/qr", None, Body::empty());
 	let (st, body) = call(&fx.api, init).await;
 	assert!(st.is_success(), "qr init: {st} {body}");
 	let id = find_str(&body, "sessionId").expect("sessionId");
-	let uri = format!("/api/auth/qr-login/{id}/respond");
+	let uri = format!("/api/auth/login/qr/{id}/respond");
 	let yes = Body::from(r#"{"approved":true}"#);
 	let (st, b) = call(&fx.api, req(ALICE, Method::POST, &uri, Some(&stale), yes)).await;
 	assert_eq!(st, StatusCode::FORBIDDEN, "stale QR approval: {b}");
@@ -1525,7 +1566,7 @@ async fn api_key_unscoped_lifetime() {
 	let alice = fx.tenants.alice.tn_id;
 	let owner = fx.subject("owner@alice");
 	let keys = "/api/auth/api-keys";
-	let far = Timestamp::from_now(400 * 86400).0;
+	let far = Timestamp::from_now(400 * 86400).to_iso_string();
 	let mut created = Vec::new();
 
 	// remember_days = 0: no unscoped key, however "unscoped" is spelled.
@@ -1550,23 +1591,29 @@ async fn api_key_unscoped_lifetime() {
 		.set(alice, "auth.remember_days", days(1), &["SADM"])
 		.await
 		.unwrap();
-	let max = Timestamp::now().0 + 86400 + 60;
-	let body = format!(r#"{{"name":"zqm-unscoped","expiresAt":{far},{REAUTH}}}"#);
+	// ISO strings of one format and zone order like the instants.
+	let max = Timestamp(Timestamp::now().0 + 86400 + 60).to_iso_string();
+	let body = format!(r#"{{"name":"zqm-unscoped","expiresAt":"{far}",{REAUTH}}}"#);
 	let (st, b) = send(fx, owner, Method::POST, keys, &body).await;
 	assert!(st.is_success(), "unscoped create: {st} {b}");
-	let id = b["data"]["keyId"].as_i64().expect("keyId");
+	let id = b["data"]["id"].as_str().and_then(|s| s.parse::<i64>().ok()).expect("id");
 	created.push(id);
-	assert!(b["data"]["expiresAt"].as_i64().is_some_and(|e| e <= max), "not clamped: {b}");
+	assert!(b["data"]["expiresAt"].as_str().is_some_and(|e| e <= max.as_str()), "not clamped: {b}");
 	let uri = format!("{keys}/{id}");
-	let (st, b) = send(fx, owner, Method::PATCH, &uri, &format!(r#"{{"expiresAt":{far}}}"#)).await;
+	let (st, b) =
+		send(fx, owner, Method::PATCH, &uri, &format!(r#"{{"expiresAt":"{far}"}}"#)).await;
 	assert!(st.is_success(), "unscoped patch: {st} {b}");
-	assert!(b["data"]["expiresAt"].as_i64().is_some_and(|e| e <= max), "patch not clamped: {b}");
+	assert!(
+		b["data"]["expiresAt"].as_str().is_some_and(|e| e <= max.as_str()),
+		"patch not clamped: {b}"
+	);
 
 	// A rename keeps the scopes (and expiry) it does not mention.
-	let body = r#"{"name":"zqm-scoped","scopes":"carddav:read","expiresAt":1999999999}"#;
+	let body =
+		r#"{"name":"zqm-scoped","scopes":"carddav:read","expiresAt":"2033-05-18T03:33:19Z"}"#;
 	let (st, b) = send(fx, owner, Method::POST, keys, body).await;
 	assert!(st.is_success(), "scoped create: {st} {b}");
-	let id = b["data"]["keyId"].as_i64().expect("keyId");
+	let id = b["data"]["id"].as_str().and_then(|s| s.parse::<i64>().ok()).expect("id");
 	created.push(id);
 	let uri = format!("{keys}/{id}");
 	let (st, b) = send(fx, owner, Method::PATCH, &uri, r#"{"name":"renamed"}"#).await;
@@ -1574,7 +1621,7 @@ async fn api_key_unscoped_lifetime() {
 	let (st, b) = send(fx, owner, Method::GET, &uri, "").await;
 	assert!(st.is_success(), "read: {st} {b}");
 	assert_eq!(b["data"]["scopes"], "carddav:read", "rename wiped the scopes: {b}");
-	assert_eq!(b["data"]["expiresAt"], 1_999_999_999, "rename wiped the expiry: {b}");
+	assert_eq!(b["data"]["expiresAt"], "2033-05-18T03:33:19Z", "rename wiped the expiry: {b}");
 	assert_eq!(b["data"]["name"], "renamed", "{b}");
 
 	// Re-authentication: an unscoped key (or dropping a key's scopes) needs the password.
@@ -1610,7 +1657,7 @@ async fn api_key_unscoped_lifetime() {
 		send(fx, owner, Method::POST, keys, &format!(r#"{{"name":"zqm-sess",{REAUTH}}}"#)).await;
 	assert_eq!(status_class(st), Actual::Allow, "unscoped create with the password: {st} {b}");
 	let sess_key = b["data"]["plaintextKey"].as_str().expect("plaintextKey").to_owned();
-	created.push(b["data"]["keyId"].as_i64().expect("keyId"));
+	created.push(b["data"]["id"].as_str().and_then(|s| s.parse::<i64>().ok()).expect("id"));
 	let body = format!(r#"{{"scopes":null,{REAUTH}}}"#);
 	let (st, b) = send(fx, owner, Method::PATCH, &unscope_uri, &body).await;
 	assert_eq!(status_class(st), Actual::Allow, "unscope with the password: {st} {b}");
@@ -1618,7 +1665,7 @@ async fn api_key_unscoped_lifetime() {
 	// The unscoped key cannot mint its successor: neither as bearer nor through the session
 	// it exchanges for (that one has `exp`, but no proof). Scoped keys stay mintable.
 	let uri = format!("/api/auth/access-token?apiKey={sess_key}");
-	let (st, b) = call(&fx.api, req(ALICE, Method::GET, &uri, None, Body::empty())).await;
+	let (st, b) = call(&fx.api, post_q(ALICE, &uri, None)).await;
 	let xchg = find_str(&b, "token").unwrap_or_else(|| panic!("key exchange: {st} {b}"));
 	for (what, tok) in [("key", sess_key.as_str()), ("exchanged session", xchg.as_str())] {
 		let body = Body::from(r#"{"name":"zqm-chain"}"#);
@@ -1627,7 +1674,7 @@ async fn api_key_unscoped_lifetime() {
 		let body = Body::from(r#"{"name":"zqm-chain","scopes":"carddav:read"}"#);
 		let (st, b) = call(&fx.api, req(ALICE, Method::POST, keys, Some(tok), body)).await;
 		assert_eq!(status_class(st), Actual::Allow, "{what} mints a scoped key: {st} {b}");
-		created.push(b["data"]["keyId"].as_i64().expect("keyId"));
+		created.push(b["data"]["id"].as_str().and_then(|s| s.parse::<i64>().ok()).expect("id"));
 	}
 	let timeout = fx.app.settings.get_int(alice, "auth.session_timeout").await.unwrap();
 	let stale_at = Timestamp(Timestamp::now().0 - timeout - 60);
@@ -1650,9 +1697,9 @@ async fn api_key_unscoped_lifetime() {
 	let key = fx.app.auth_adapter.create_api_key(alice, mk(None, stale_at)).await.unwrap();
 	created.push(key.info.key_id);
 	let uri = format!("/api/auth/access-token?apiKey={}", key.plaintext_key);
-	let (st, b) = call(&fx.api, req(ALICE, Method::GET, &uri, None, Body::empty())).await;
+	let (st, b) = call(&fx.api, post_q(ALICE, &uri, None)).await;
 	let tok = find_str(&b, "token").unwrap_or_else(|| panic!("unscoped key exchange: {st} {b}"));
-	let r = req(ALICE, Method::GET, "/api/auth/login-token", Some(&tok), Body::empty());
+	let r = req(ALICE, Method::POST, "/api/auth/session/renew", Some(&tok), Body::empty());
 	let (st, b) = call(&fx.api, r).await;
 	assert_eq!(status_class(st), Actual::Allow, "stale unscoped key session renews: {st} {b}");
 
@@ -1694,7 +1741,7 @@ async fn remember_me_login_mints_the_device_key() {
 		.into_iter()
 		.flatten()
 		.filter(|k| k["name"] == "zqm-dev")
-		.filter_map(|k| k["keyId"].as_i64())
+		.filter_map(|k| k["id"].as_str().and_then(|s| s.parse::<i64>().ok()))
 		.collect();
 	assert_eq!(minted.len(), 1, "named after the device: {b}");
 
@@ -1724,13 +1771,13 @@ async fn push_subscription_refused_when_disallowed() {
 		.unwrap();
 	let body = r#"{"subscription":{"endpoint":"https://push.zqm.test/1",
 		"keys":{"p256dh":"zqm","auth":"zqm"}}}"#;
-	let uri = "/api/notifications/subscription";
+	let uri = "/api/notifications/subscriptions";
 	let (st, b) = send(fx, fx.subject("owner@alice"), Method::POST, uri, body).await;
 	fx.app.settings.delete(shared, "notify.push_allowed").await.unwrap();
 	assert_eq!(st, StatusCode::FORBIDDEN, "subscribe with push disallowed: {b}");
 }
 
-/// `limits.max_storage_gb = 0`: a blob upload with a body is refused with 507 before anything
+/// `limits.max_storage_gb = 0`: a blob upload with a body is refused with 413 before anything
 /// is stored, and so is one without a Content-Length (chunked), whose pre-check sees 0 bytes
 /// and whose post-read check refuses. The chunked case runs on admin, which stores nothing
 /// (on a tenant with stored blobs the pre-check refuses on its own). The federated attachment
@@ -1741,7 +1788,7 @@ async fn upload_refused_over_quota() {
 	use axum::http::{HeaderValue, header};
 	let _g = FIXTURE_LOCK.write().await;
 	let fx = setup().await;
-	let uri = "/api/files/file/zqm-quota.txt";
+	let uri = "/api/uploads/file?name=zqm-quota.txt";
 	for (tn, host, owner, chunked) in [
 		(fx.tenants.alice.tn_id, ALICE, "owner@alice", false),
 		(fx.tenants.admin.tn_id, ADMIN, "owner-sadm@admin", true),
@@ -1755,7 +1802,7 @@ async fn upload_refused_over_quota() {
 		}
 		let (st, b) = call(&fx.api, r).await;
 		fx.app.settings.delete(tn, "limits.max_storage_gb").await.unwrap();
-		assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE, "{owner} (chunked = {chunked}): {b}");
+		assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE, "{owner} (chunked = {chunked}): {b}");
 		assert!(!chunked || used == 0, "{host} stores {used} bytes; the chunked case needs none");
 	}
 }
@@ -1777,7 +1824,7 @@ async fn upload_dedup_over_quota() {
 		let r = req(
 			host,
 			Method::POST,
-			"/api/files/file/zqm-dedup.txt",
+			"/api/uploads/file?name=zqm-dedup.txt",
 			Some(tok.as_str()),
 			bytes.into(),
 		);
@@ -1790,7 +1837,7 @@ async fn upload_dedup_over_quota() {
 	let (st, b) = upload("zqm-dedup").await;
 	assert!(st.is_success(), "re-upload of stored bytes over quota: {st} {b}");
 	let (st, b) = upload("zqm-new").await;
-	assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE, "new bytes over quota: {b}");
+	assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE, "new bytes over quota: {b}");
 }
 
 /// `GET /.well-known/cloudillo/tenant?domain=` (the reverse proxy's on-demand TLS `ask` hook):
@@ -1837,9 +1884,9 @@ async fn tenant_ask_route() {
 	}
 }
 
-/// `keys` of `GET /api/auth/keys` as `(keyId, status)`.
+/// `keys` of `GET /api/auth/signing-keys` as `(keyId, status)`.
 async fn keys(fx: &Fixture, s: &Subject) -> Vec<(String, String)> {
-	let (st, b) = send(fx, s, Method::GET, "/api/auth/keys", "").await;
+	let (st, b) = send(fx, s, Method::GET, "/api/auth/signing-keys", "").await;
 	assert_eq!(st, StatusCode::OK, "list keys: {b}");
 	let rows = b["data"].as_array().cloned().unwrap_or_default();
 	rows.iter()
@@ -1863,34 +1910,34 @@ async fn signing_key_rotation() {
 	let sadm = fx.subject("owner-sadm@admin");
 	let member = fx.subject("m-moderator@trash.test");
 	for (m, uri) in [
-		(Method::GET, "/api/auth/keys"),
-		(Method::POST, "/api/auth/keys/rotate"),
-		(Method::POST, "/api/auth/keys/zqm/revoke"),
+		(Method::GET, "/api/auth/signing-keys"),
+		(Method::POST, "/api/auth/signing-keys/rotations"),
+		(Method::POST, "/api/auth/signing-keys/zqm/revoke"),
 	] {
 		let (st, b) = send(fx, member, m.clone(), uri, "").await;
 		assert_eq!(status_class(st), Actual::Deny, "member {m} {uri}: {st} {b}");
 	}
 
 	let before = keys(fx, owner).await;
-	assert!(before.iter().any(|(_, s)| s == "A"), "no active key: {before:?}");
+	assert!(before.iter().any(|(_, s)| s == "active"), "no active key: {before:?}");
 	tokio::time::sleep(Duration::from_millis(1100)).await;
-	let (st, b) = send(fx, owner, Method::POST, "/api/auth/keys/rotate", "").await;
+	let (st, b) = send(fx, owner, Method::POST, "/api/auth/signing-keys/rotations", "").await;
 	assert_eq!(st, StatusCode::CREATED, "rotate: {b}");
 	let new = b["data"]["keyId"].as_str().unwrap_or_default().to_owned();
 	let after = keys(fx, owner).await;
 	for (id, status) in &after {
 		let want = if *id == new {
-			"A"
+			"active"
 		} else if before.iter().any(|(k, _)| k == id) {
-			"V"
+			"verifyOnly"
 		} else {
 			""
 		};
 		assert!(want.is_empty() || status == want, "{id} after rotate: {after:?}");
 	}
-	assert!(after.iter().any(|(k, s)| *k == new && s == "A"), "new key not active: {after:?}");
+	assert!(after.iter().any(|(k, s)| *k == new && s == "active"), "new key not active: {after:?}");
 
-	let rev = |id: &str| format!("/api/auth/keys/{id}/revoke");
+	let rev = |id: &str| format!("/api/auth/signing-keys/{id}/revoke");
 	let (st, b) = send(fx, owner, Method::POST, &rev(&new), "").await;
 	assert_eq!(st, StatusCode::CONFLICT, "revoke the only active key: {b}");
 	let (st, b) = send(fx, owner, Method::POST, &rev("zqm-none"), "").await;
@@ -1902,23 +1949,26 @@ async fn signing_key_rotation() {
 	meta.add_profile_public_key("trash.test", old, "zqm-pk", None).await.unwrap();
 	assert!(cached(old).await, "seeding the key cache failed");
 	let (st, b) = send(fx, owner, Method::POST, &rev(old), "").await;
-	assert_eq!(st, StatusCode::OK, "revoke verify-only {old}: {b}");
+	assert_eq!(st, StatusCode::NO_CONTENT, "revoke verify-only {old}: {b}");
 	assert!(!cached(old).await, "revoked {old} still in the key cache");
-	assert!(keys(fx, owner).await.iter().any(|(k, s)| k == old && s == "R"), "{old} not revoked");
+	assert!(
+		keys(fx, owner).await.iter().any(|(k, s)| k == old && s == "revoked"),
+		"{old} not revoked"
+	);
 	let (st, b) = send(fx, owner, Method::GET, "/api/me", "").await;
 	assert!(st.is_success(), "GET /api/me: {st} {b}");
 	assert!(!b.to_string().contains(old.as_str()), "revoked {old} still published: {b}");
 
 	// SADM: rotate, then revoke the demoted key; the new active one alone is refused.
 	tokio::time::sleep(Duration::from_millis(1100)).await;
-	let admin = |rest: &str| format!("/api/admin/tenants/trash.test/keys/{rest}");
-	let (st, b) = send(fx, sadm, Method::POST, &admin("rotate"), "").await;
+	let admin = |rest: &str| format!("/api/admin/tenants/trash.test/signing-keys/{rest}");
+	let (st, b) = send(fx, sadm, Method::POST, &admin("rotations"), "").await;
 	assert_eq!(st, StatusCode::NO_CONTENT, "SADM rotate: {b}");
 	meta.add_profile_public_key("trash.test", &new, "zqm-pk", None).await.unwrap();
 	let (st, b) = send(fx, sadm, Method::POST, &admin(&format!("{new}/revoke")), "").await;
 	assert_eq!(st, StatusCode::NO_CONTENT, "SADM revoke {new}: {b}");
 	assert!(!cached(&new).await, "SADM-revoked {new} still in the key cache");
-	let active: Vec<_> = keys(fx, owner).await.into_iter().filter(|(_, s)| s == "A").collect();
+	let active: Vec<_> = keys(fx, owner).await.into_iter().filter(|(_, s)| s == "active").collect();
 	assert_eq!(active.len(), 1, "one active key after SADM rotate: {active:?}");
 	let (st, b) =
 		send(fx, sadm, Method::POST, &admin(&format!("{}/revoke", active[0].0)), "").await;
@@ -1926,7 +1976,7 @@ async fn signing_key_rotation() {
 }
 
 /// On trash: the owner requests an export (202; a second request while it is pending is
-/// 409), reads its status, downloads the ZIP once (a second download is 404). SADM requests one
+/// 409), reads its status, downloads the ZIP (a repeat download still succeeds). SADM requests one
 /// through the admin twin. A community member is refused every owner route. The fixture runs no
 /// scheduler, so the queued `ExportTask` is run here, as it would be.
 #[tokio::test]
@@ -1979,7 +2029,7 @@ async fn data_export_flow() {
 	let zip = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 	assert!(zip.starts_with(b"PK"), "not a ZIP: {} bytes", zip.len());
 	let (st, b) = send(fx, owner, Method::GET, "/api/export/download", "").await;
-	assert_eq!(st, StatusCode::NOT_FOUND, "second download: {b}");
+	assert_eq!(st, StatusCode::OK, "repeat download: {b}");
 
 	let (st, b) = send(fx, sadm, Method::POST, "/api/admin/tenants/trash.test/export", "").await;
 	assert_eq!(st, StatusCode::ACCEPTED, "SADM export: {b}");

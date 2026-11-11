@@ -72,7 +72,7 @@ async fn newer_upd_exists(
 		issuer: Some(issuer.into()),
 		audience: Some(local.into()),
 		status: Some(vec!["A".into(), "D".into()]),
-		created_after: Some(Timestamp(created_at)),
+		created_after: Some(cloudillo_types::types::ApiTime(created_at)),
 		// Only UPD remains besides the bare CONN, which is filtered below.
 		exclude_sub_typ: Some(Box::new(["ACC".into(), "DEL".into()])),
 		..Default::default()
@@ -262,7 +262,7 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 				retire_community_invitations(&app, tn_id, context.tenant_tag.as_str(), audience)
 					.await;
 			}
-			connection_ended(&app, tn_id, &context.tenant_type, audience).await;
+			connection_ended(&app, tn_id, &context.tenant_type, audience, context.effects).await;
 		}
 		Some("UPD") => {
 			// Map publication only; the local map was already written by the caller
@@ -330,9 +330,11 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				}
 
 				cloudillo_core::schedule_badge_resync(&app, tn_id, &context.issuer).await;
-				schedule_history_sync(&app, tn_id, &context.issuer).await;
-				announce_partnership(&app, &context).await;
-				publish_hat_map(&app, tn_id, &context.tenant_tag, &context.issuer).await;
+				if context.effects.propagate {
+					schedule_history_sync(&app, tn_id, &context.issuer).await;
+					announce_partnership(&app, &context).await;
+					publish_hat_map(&app, tn_id, &context.tenant_tag, &context.issuer).await;
+				}
 
 				// Mutual connection auto-accepted — rests at 'A' (default) so the
 				// status=['A'] fan-out/broadcast/filter queries include it.
@@ -390,8 +392,9 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					content: acc_content(&app, tn_id, &context.issuer).await,
 					..Default::default()
 				};
-				if let Err(e) =
-					create_action(&app, tn_id, &context.tenant_tag, response_action).await
+				if context.effects.propagate
+					&& let Err(e) =
+						create_action(&app, tn_id, &context.tenant_tag, response_action).await
 				{
 					warn!("CONN: Failed to create invitation-accept response: {}", e);
 				}
@@ -414,8 +417,10 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 				}
 
 				cloudillo_core::schedule_badge_resync(&app, tn_id, &context.issuer).await;
-				schedule_history_sync(&app, tn_id, &context.issuer).await;
-				announce_partnership(&app, &context).await;
+				if context.effects.propagate {
+					schedule_history_sync(&app, tn_id, &context.issuer).await;
+					announce_partnership(&app, &context).await;
+				}
 
 				// The invitation has now been consumed (membership established); retire it so
 				// it doesn't linger at 'A' and reappear as "pending" if this member later leaves.
@@ -456,8 +461,9 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 						..Default::default()
 					};
 
-					if let Err(e) =
-						create_action(&app, tn_id, &context.tenant_tag, response_action).await
+					if context.effects.propagate
+						&& let Err(e) =
+							create_action(&app, tn_id, &context.tenant_tag, response_action).await
 					{
 						warn!("CONN: Failed to create auto-accept response: {}", e);
 					}
@@ -482,8 +488,10 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 					}
 
 					cloudillo_core::schedule_badge_resync(&app, tn_id, &context.issuer).await;
-					schedule_history_sync(&app, tn_id, &context.issuer).await;
-					announce_partnership(&app, &context).await;
+					if context.effects.propagate {
+						schedule_history_sync(&app, tn_id, &context.issuer).await;
+						announce_partnership(&app, &context).await;
+					}
 
 					// Auto-accepted (connection_mode=A) — rests at 'A' (default) so
 					// fan-out/broadcast/filter (status=['A']) include it.
@@ -575,9 +583,11 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			}
 
 			cloudillo_core::schedule_badge_resync(&app, tn_id, &context.issuer).await;
-			schedule_history_sync(&app, tn_id, &context.issuer).await;
-			announce_partnership(&app, &context).await;
-			publish_hat_map(&app, tn_id, &context.tenant_tag, &context.issuer).await;
+			if context.effects.propagate {
+				schedule_history_sync(&app, tn_id, &context.issuer).await;
+				announce_partnership(&app, &context).await;
+				publish_hat_map(&app, tn_id, &context.tenant_tag, &context.issuer).await;
+			}
 
 			// Connection accepted — rests at 'A' (default) so fan-out/broadcast/
 			// filter (status=['A']) include the established relationship.
@@ -602,7 +612,8 @@ pub async fn on_receive(app: App, context: HookContext) -> ClResult<HookResult> 
 			if context.tenant_type == "community" {
 				retire_community_invitations(&app, tn_id, local_tag, &context.issuer).await;
 			}
-			connection_ended(&app, tn_id, &context.tenant_type, &context.issuer).await;
+			connection_ended(&app, tn_id, &context.tenant_type, &context.issuer, context.effects)
+				.await;
 
 			// Disconnect notification — rest at 'N' (informational). The
 			// relationship is severed, so it must NOT be 'A' (which would keep
@@ -675,15 +686,16 @@ pub async fn on_accept(app: App, context: HookContext) -> ClResult<HookResult> {
 		..Default::default()
 	};
 
-	if let Err(e) = create_action(&app, tn_id, &context.tenant_tag, response_action).await {
-		warn!("CONN: Failed to create response CONN:ACC action: {}", e);
-		// Don't fail the accept if response creation fails
-	} else {
-		info!("CONN:ACC: Response action created for {}", context.issuer);
+	if context.effects.propagate {
+		if let Err(e) = create_action(&app, tn_id, &context.tenant_tag, response_action).await {
+			warn!("CONN: Failed to create response CONN:ACC action: {}", e);
+			// Don't fail the accept if response creation fails
+		} else {
+			info!("CONN:ACC: Response action created for {}", context.issuer);
+		}
+		schedule_history_sync(&app, tn_id, &context.issuer).await;
+		announce_partnership(&app, &context).await;
 	}
-
-	schedule_history_sync(&app, tn_id, &context.issuer).await;
-	announce_partnership(&app, &context).await;
 
 	Ok(HookResult::default())
 }

@@ -50,7 +50,7 @@ pub const ALICE: &str = "alice.test";
 pub const CLUB: &str = "club.test";
 /// Personal tenant whose owner also holds `SADM` (kept apart so `alice` stays a plain owner).
 pub const ADMIN: &str = "admin.test";
-/// Disposable community whose trash the `DELETE /api/trash` cells may purge.
+/// Disposable community whose trash the `POST /api/trash/empty` cells may purge.
 pub const TRASH: &str = "trash.test";
 /// Password of every tenant owner.
 pub const PASSWORD: &str = "matrix-pass-0";
@@ -590,8 +590,8 @@ async fn seed_channels(app: &App, t: &Tenants, r: &Remotes) {
 			visibility,
 			min_role: min_role.map(Into::into),
 			closed,
-			created_at: Timestamp::now(),
-			updated_at: Timestamp::now(),
+			created_at: Timestamp::now().into(),
+			updated_at: Timestamp::now().into(),
 		};
 		meta.create_channel(tn_id, &ch).await.unwrap();
 	}
@@ -635,6 +635,32 @@ pub fn req(
 	r.extensions_mut().insert(IdTag(tenant.into()));
 	r.extensions_mut().insert(ConnectInfo(SocketAddr::new(IpAddr::V6(ip), 443)));
 	r
+}
+
+/// Split `path?k=v&…` into the path and a JSON object body of the query pairs (`true`/`false`
+/// become booleans): the token endpoints (`/api/auth/access-token`, `proxy-token`) take a POST
+/// body now. No query gives `{}`, which those handlers treat like no body at all.
+pub fn query_body(uri: &str) -> (&str, String) {
+	let (path, q) = uri.split_once('?').unwrap_or((uri, ""));
+	let m: serde_json::Map<String, Value> = q
+		.split('&')
+		.filter_map(|kv| kv.split_once('='))
+		.map(|(k, v)| {
+			let v = match v {
+				"true" => Value::Bool(true),
+				"false" => Value::Bool(false),
+				_ => Value::from(v),
+			};
+			(k.to_owned(), v)
+		})
+		.collect();
+	(path, Value::Object(m).to_string())
+}
+
+/// `POST` to a token endpoint with `uri`'s query pairs as the JSON body ([`query_body`]).
+pub fn post_q(tenant: &str, uri: &str, bearer: Option<&str>) -> Request<Body> {
+	let (path, body) = query_body(uri);
+	req(tenant, Method::POST, path, bearer, Body::from(body))
 }
 
 /// Send one request; body parsed as JSON (`Null` if empty, `String` if not JSON).

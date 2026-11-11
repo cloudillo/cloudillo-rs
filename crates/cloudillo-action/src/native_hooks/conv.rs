@@ -39,6 +39,11 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 		return Ok(HookResult::default());
 	}
 
+	// The admin SUBS is an emitted action.
+	if !context.effects.propagate {
+		return Ok(HookResult::default());
+	}
+
 	let subs_action = CreateAction {
 		typ: "SUBS".into(),
 		audience_tag: Some(context.issuer.clone().into_boxed_str()),

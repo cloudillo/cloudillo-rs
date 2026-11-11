@@ -4,7 +4,7 @@
 //! Presence rooms for RTDB connections.
 //!
 //! RTDB's counterpart to the CRDT awareness relay. A connection opts in at connect
-//! time (`?presence=1`), publishes an ephemeral free-form `state`, and receives the
+//! time (`?presence=true`), publishes an ephemeral free-form `state`, and receives the
 //! full roster plus live join/update/leave events for everyone else on the same
 //! document.
 //!
@@ -60,10 +60,10 @@ pub const PRESENCE_QUEUE_DEPTH: usize = 64;
 /// known flaw and is not reproduced here.
 pub type PresenceKey = (TnId, Box<str>);
 
-/// Why a presence frame was refused, in the shape the wire `error` frame takes.
+/// Why a presence frame was refused. The wire `error` frame carries it as a 400
+/// `E-CORE-INVALID` with this message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PresenceRejection {
-	pub code: u16,
 	pub message: &'static str,
 }
 
@@ -158,7 +158,7 @@ pub fn check_presence_limits(state: &Value) -> Option<PresenceRejection> {
 	// A `Value` cannot fail to serialise; the fallback only has to be over the cap.
 	let size = serde_json::to_string(state).map_or(usize::MAX, |s| s.len());
 	(size > MAX_PRESENCE_STATE_BYTES)
-		.then_some(PresenceRejection { code: 413, message: "Presence state too large" })
+		.then_some(PresenceRejection { message: "Presence state too large" })
 }
 
 /// What a `presence` frame resolves to once identity, size and rate budget have
@@ -201,10 +201,7 @@ pub fn presence_frame(
 	let mut state = state.clone();
 
 	if !stamp_presence_identity(&mut state, id_tag) {
-		return Err(PresenceRejection {
-			code: 400,
-			message: "Presence state `user` must be an object",
-		});
+		return Err(PresenceRejection { message: "Presence state `user` must be an object" });
 	}
 	if let Some(rejection) = check_presence_limits(&state) {
 		return Err(rejection);
@@ -524,13 +521,13 @@ mod tests {
 		assert_eq!(check_presence_limits(&state_of_len(MAX_PRESENCE_STATE_BYTES)), None);
 		assert_eq!(
 			check_presence_limits(&state_of_len(MAX_PRESENCE_STATE_BYTES + 1)),
-			Some(PresenceRejection { code: 413, message: "Presence state too large" })
+			Some(PresenceRejection { message: "Presence state too large" })
 		);
 
 		let big = json!({ "user": { "name": "A".repeat(MAX_PRESENCE_STATE_BYTES) } });
 		assert_eq!(
 			check_presence_limits(&big),
-			Some(PresenceRejection { code: 413, message: "Presence state too large" })
+			Some(PresenceRejection { message: "Presence state too large" })
 		);
 	}
 
@@ -605,10 +602,7 @@ mod tests {
 	fn a_user_that_is_not_an_object_is_refused() {
 		assert_eq!(
 			frame(Some(&json!({ "user": "alice" }))),
-			Err(PresenceRejection {
-				code: 400,
-				message: "Presence state `user` must be an object"
-			})
+			Err(PresenceRejection { message: "Presence state `user` must be an object" })
 		);
 	}
 
@@ -621,7 +615,7 @@ mod tests {
 		assert_eq!(check_presence_limits(&state), None, "the unstamped state is within the cap");
 		assert_eq!(
 			frame(Some(&state)),
-			Err(PresenceRejection { code: 413, message: "Presence state too large" })
+			Err(PresenceRejection { message: "Presence state too large" })
 		);
 	}
 
@@ -636,7 +630,7 @@ mod tests {
 		for _ in 0..PRESENCE_RATE_CAPACITY {
 			assert_eq!(
 				presence_frame(Some(&big), Some("@alice.example.com"), &mut bucket, now),
-				Err(PresenceRejection { code: 413, message: "Presence state too large" })
+				Err(PresenceRejection { message: "Presence state too large" })
 			);
 		}
 		// Untouched: the whole burst allowance is still available to good frames.

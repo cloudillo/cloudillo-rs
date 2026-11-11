@@ -13,9 +13,9 @@ use cloudillo_types::meta_adapter::{
 	ProfileRelation, ProfileStatus, ProfileTrust, ProfileType, PublicProfileRow,
 	UpsertProfileFields, UpsertResult,
 };
-use cloudillo_types::prelude::*;
 use cloudillo_types::types::{BadgeView, PublicProfile};
 use cloudillo_types::utils::{normalize_id_tag, parse_roles};
+use cloudillo_types::{prelude::*, types::ApiTime};
 
 /// Parse the `status` CHAR(1) column into a `ProfileStatus` value.
 fn parse_status(row: &sqlx::sqlite::SqliteRow) -> Result<Option<ProfileStatus>, sqlx::Error> {
@@ -549,7 +549,7 @@ pub(crate) async fn list_badges_for(
 				community,
 				slot: row.try_get("slot").db()?,
 				level: row.try_get("level").db()?,
-				exp: Timestamp(row.try_get("exp").db()?),
+				exp: ApiTime(row.try_get("exp").db()?),
 			});
 		}
 	}
@@ -954,7 +954,7 @@ pub(crate) async fn get_info(db: &SqlitePool, tn_id: TnId, id_tag: &str) -> ClRe
 		r#type: typ.into(),
 		profile_pic: row.get("profile_pic"),
 		status,
-		created_at: Timestamp(created_at),
+		created_at: ApiTime(created_at),
 	})
 }
 

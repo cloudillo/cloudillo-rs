@@ -28,7 +28,7 @@ pub struct CertStatusResponse {
 	pub tenant_status: Option<String>,
 }
 
-/// GET /api/admin/cert-status — current ACME renewal state for the caller's tenant
+/// GET /api/admin/certificates — current ACME renewal state for the caller's tenant
 #[axum::debug_handler]
 pub async fn get_cert_status(
 	State(app): State<App>,
@@ -39,7 +39,7 @@ pub async fn get_cert_status(
 	let tenant_status = match app.auth_adapter.read_tenant(cert.id_tag.as_ref()).await {
 		Ok(profile) => profile.status.map(|s| s.to_string()),
 		Err(e) => {
-			warn!(error = %e, tn_id = ?tn_id, "Failed to read tenant status for cert-status");
+			warn!(error = %e, tn_id = ?tn_id, "Failed to read tenant status for the certificates view");
 			None
 		}
 	};

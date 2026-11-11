@@ -379,6 +379,15 @@ impl MetaAdapter for MetaAdapterSqlite {
 		action::delete_token(&self.db, tn_id, action_id).await
 	}
 
+	async fn set_action_delivery_error(
+		&self,
+		tn_id: TnId,
+		action_id: &str,
+		error: &str,
+	) -> ClResult<()> {
+		action::set_delivery_error(&self.db, tn_id, action_id, error).await
+	}
+
 	async fn get_action_token(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<Box<str>>> {
 		action::get_token(&self.dbr, tn_id, action_id).await
 	}
@@ -883,8 +892,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 		tn_id: TnId,
 		resource_type: char,
 		resource_id: &str,
+		limit: Option<u32>,
+		after_id: Option<i64>,
 	) -> ClResult<Vec<ShareEntry>> {
-		share::list_by_resource(&self.dbr, tn_id, resource_type, resource_id).await
+		share::list_by_resource(&self.dbr, tn_id, resource_type, resource_id, limit, after_id).await
 	}
 
 	async fn list_share_entries_by_subject(
@@ -892,8 +903,10 @@ impl MetaAdapter for MetaAdapterSqlite {
 		tn_id: TnId,
 		subject_type: Option<char>,
 		subject_id: &str,
+		limit: Option<u32>,
+		after_id: Option<i64>,
 	) -> ClResult<Vec<ShareEntry>> {
-		share::list_by_subject(&self.dbr, tn_id, subject_type, subject_id).await
+		share::list_by_subject(&self.dbr, tn_id, subject_type, subject_id, limit, after_id).await
 	}
 
 	async fn check_share_access(

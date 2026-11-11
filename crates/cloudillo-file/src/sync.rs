@@ -24,7 +24,7 @@ use cloudillo_types::types::SHARED_TN;
 struct RemoteFileMetadata {
 	content_type: Option<String>,
 	file_name: String,
-	x: Option<serde_json::Value>,
+	extra: Option<serde_json::Value>,
 }
 
 /// Result of a file sync operation
@@ -383,7 +383,7 @@ pub async fn sync_file_variants(
 			remote_file.content_type.as_deref().unwrap_or("application/octet-stream");
 		let f_id = app
 			.meta_adapter
-			.create_sync_content(tn_id, file_id, root_id, content_type, remote_file.x)
+			.create_sync_content(tn_id, file_id, root_id, content_type, remote_file.extra)
 			.await
 			.inspect_err(|e| warn!("Failed to create file content for {}: {}", file_id, e))?;
 		(f_id, true, true, Some::<Box<str>>(remote_file.file_name.into()))
@@ -554,7 +554,7 @@ async fn fetch_and_store_blob(
 	auth: bool,
 	timeout: Duration,
 ) -> ClResult<u64> {
-	let variant_path = with_action(format!("/files/variant/{}", variant_id), via_action);
+	let variant_path = with_action(format!("/variants/{}", variant_id), via_action);
 	// The HTTP request itself uses the requesting tenant's identity (so we
 	// authenticate as the tenant the sync is happening for); the blob is
 	// stored under `store_tn` which may be `SHARED_TN` for the shared store.

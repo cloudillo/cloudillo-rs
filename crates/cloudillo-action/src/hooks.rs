@@ -13,6 +13,7 @@ use std::sync::Arc;
 use super::dsl::types::Operation;
 use crate::dsl::DslEngine;
 use crate::helpers;
+use crate::post_store::Effects;
 use crate::task::CreateAction;
 use cloudillo_types::auth_adapter::ActionToken;
 
@@ -189,6 +190,9 @@ pub struct HookContext {
 	/// an owner-vouched APRV). A gating `on_receive` hook may read this to accept
 	/// a relayed copy it would otherwise reject.
 	pub pre_approved: bool,
+	/// Which side-effect classes this run may trigger. A hook keeps its state writes, but
+	/// emits actions, relays, stat updates or history syncs only when `propagate` is set.
+	pub effects: Effects,
 
 	// Client information
 	/// Client IP address (available for inbound actions)
@@ -224,6 +228,7 @@ pub struct HookContextBuilder {
 	is_inbound: bool,
 	is_outbound: bool,
 	pre_approved: bool,
+	effects: Effects,
 	client_address: Option<String>,
 	vars: HashMap<String, serde_json::Value>,
 }
@@ -248,6 +253,7 @@ impl Default for HookContextBuilder {
 			is_inbound: false,
 			is_outbound: false,
 			pre_approved: false,
+			effects: Effects::ALL,
 			client_address: None,
 			vars: HashMap::new(),
 		}
@@ -355,6 +361,12 @@ impl HookContextBuilder {
 		self
 	}
 
+	/// Set the side-effect classes this run may trigger (default: all)
+	pub fn effects(mut self, effects: Effects) -> Self {
+		self.effects = effects;
+		self
+	}
+
 	/// Set variables
 	pub fn vars(mut self, vars: HashMap<String, serde_json::Value>) -> Self {
 		self.vars = vars;
@@ -381,6 +393,7 @@ impl HookContextBuilder {
 			is_inbound: self.is_inbound,
 			is_outbound: self.is_outbound,
 			pre_approved: self.pre_approved,
+			effects: self.effects,
 			client_address: self.client_address,
 			vars: self.vars,
 		}
@@ -417,6 +430,8 @@ pub struct BeforeReceive {
 	pub relayed: bool,
 	/// `(type, issuer)` of the primary it was bundled with.
 	pub primary: Option<(Box<str>, Box<str>)>,
+	/// Side-effect classes allowed for this arrival (Backfill = state only).
+	pub effects: Effects,
 }
 
 pub type BeforeReceiveFn =
@@ -596,6 +611,7 @@ mod tests {
 			is_inbound: false,
 			is_outbound: true,
 			pre_approved: false,
+			effects: Effects::ALL,
 			client_address: None,
 			vars: HashMap::new(),
 		};

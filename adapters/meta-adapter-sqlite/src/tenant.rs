@@ -15,7 +15,7 @@ use crate::utils::{Db, push_patch};
 use cloudillo_types::meta_adapter::{
 	ListTenantsMetaOptions, ProfileType, Tenant, TenantListMeta, UpdateTenantData,
 };
-use cloudillo_types::prelude::*;
+use cloudillo_types::{prelude::*, types::ApiTime};
 
 /// Read a single tenant by ID
 pub(crate) async fn read(dbr: &SqlitePool, tn_id: TnId) -> ClResult<Tenant<Box<str>>> {
@@ -46,7 +46,7 @@ pub(crate) async fn read(dbr: &SqlitePool, tn_id: TnId) -> ClResult<Tenant<Box<s
 				},
 				profile_pic: row.try_get("profile_pic").db()?,
 				cover_pic: row.try_get("cover_pic").db()?,
-				created_at: row.try_get("created_at").map(Timestamp).db()?,
+				created_at: row.try_get("created_at").map(ApiTime).db()?,
 				last_seen_at: row.try_get::<Option<i64>, _>("last_seen_at").db()?.map(Timestamp),
 				notify_email_direct_at: row
 					.try_get::<Option<i64>, _>("notify_email_direct_at")
@@ -340,7 +340,7 @@ pub(crate) async fn list(
 				name: row.try_get::<Option<Box<str>>, _>("name").ok().flatten()?,
 				typ,
 				profile_pic: row.try_get("profile_pic").ok().flatten(),
-				created_at: Timestamp(row.try_get("created_at").ok()?),
+				created_at: ApiTime(row.try_get("created_at").ok()?),
 			})
 		})
 		.collect();

@@ -8,8 +8,8 @@
 use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 
 use cloudillo_types::meta_adapter::{CreateShareEntry, ShareEntry, UpdateShareEntryOptions};
-use cloudillo_types::prelude::*;
 use cloudillo_types::utils::normalize_id_tag;
+use cloudillo_types::{prelude::*, types::ApiTime};
 
 use crate::utils::{Db, push_patch};
 
@@ -59,9 +59,9 @@ fn row_to_share_entry(row: &SqliteRow) -> ShareEntry {
 		subject_type: subject_type_val.chars().next().unwrap_or('?'),
 		subject_id: row.get("subject_id"),
 		permission,
-		expires_at: expires_at.map(Timestamp),
+		expires_at: expires_at.map(ApiTime),
 		created_by: row.get("created_by"),
-		created_at: Timestamp(created_at),
+		created_at: ApiTime(created_at),
 		subject_file_name: row.try_get("subject_file_name").ok().flatten(),
 		subject_content_type: row.try_get("subject_content_type").ok().flatten(),
 		subject_file_tp: row.try_get("subject_file_tp").ok().flatten(),
@@ -122,9 +122,9 @@ pub(crate) async fn create(
 		// Report what was actually stored, not the raw input.
 		subject_id: subject_id.as_ref().into(),
 		permission: entry.permission,
-		expires_at: entry.expires_at,
+		expires_at: entry.expires_at.map(Into::into),
 		created_by: created_by_norm.as_ref().into(),
-		created_at: Timestamp(created_at),
+		created_at: ApiTime(created_at),
 		subject_file_name: None,
 		subject_content_type: None,
 		subject_file_tp: None,
@@ -216,12 +216,20 @@ macro_rules! share_select {
 	};
 }
 
-/// List share entries for a resource, excluding expired entries
+/// SQLite `LIMIT` value: `-1` is unbounded.
+fn sql_limit(limit: Option<u32>) -> i64 {
+	limit.map_or(-1, i64::from)
+}
+
+/// List share entries for a resource, excluding expired entries.
+/// Newest first by `id` (the upsert keeps `id` and `created_at`, so this is creation order).
 pub(crate) async fn list_by_resource(
 	db: &SqlitePool,
 	tn_id: TnId,
 	resource_type: char,
 	resource_id: &str,
+	limit: Option<u32>,
+	after_id: Option<i64>,
 ) -> ClResult<Vec<ShareEntry>> {
 	let resource_type_str = resource_type.to_string();
 
@@ -229,11 +237,15 @@ pub(crate) async fn list_by_resource(
 		share_select!(),
 		"WHERE se.tn_id = ? AND se.resource_type = ? AND se.resource_id = ? \
 			AND (se.expires_at IS NULL OR se.expires_at > unixepoch()) \
-			ORDER BY se.created_at DESC"
+			AND (? IS NULL OR se.id < ?) \
+			ORDER BY se.id DESC LIMIT ?"
 	))
 	.bind(tn_id.0)
 	.bind(&resource_type_str)
 	.bind(resource_id)
+	.bind(after_id)
+	.bind(after_id)
+	.bind(sql_limit(limit))
 	.fetch_all(db)
 	.await
 	.db()?;
@@ -248,6 +260,8 @@ pub(crate) async fn list_by_subject(
 	tn_id: TnId,
 	subject_type: Option<char>,
 	subject_id: &str,
+	limit: Option<u32>,
+	after_id: Option<i64>,
 ) -> ClResult<Vec<ShareEntry>> {
 	let subject_type_str = subject_type.map(|c| c.to_string());
 	// Only a `'U'` subject is an id_tag — see `subject_id_needle`.
@@ -258,12 +272,16 @@ pub(crate) async fn list_by_subject(
 		share_select!(),
 		"WHERE se.tn_id = ? AND (? IS NULL OR se.subject_type = ?) AND se.subject_id = ? \
 			AND (se.expires_at IS NULL OR se.expires_at > unixepoch()) \
-			ORDER BY se.created_at DESC"
+			AND (? IS NULL OR se.id < ?) \
+			ORDER BY se.id DESC LIMIT ?"
 	))
 	.bind(tn_id.0)
 	.bind(&subject_type_str)
 	.bind(&subject_type_str)
 	.bind(subject_id.as_ref())
+	.bind(after_id)
+	.bind(after_id)
+	.bind(sql_limit(limit))
 	.fetch_all(db)
 	.await
 	.db()?;

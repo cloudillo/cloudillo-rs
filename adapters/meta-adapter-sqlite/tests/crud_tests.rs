@@ -12,7 +12,7 @@ use cloudillo_types::meta_adapter::{
 	MetaAdapter, PatchReaderState, ProfileConnectionStatus, ProfileRelation, ProfileStatus,
 	ProfileType, UpdateActionDataOptions, UpdateTenantData, UpsertProfileFields,
 };
-use cloudillo_types::types::{Patch, Timestamp, TnId};
+use cloudillo_types::types::{ApiTime, Patch, Timestamp, TnId};
 use cloudillo_types::worker::WorkerPool;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -670,7 +670,9 @@ async fn test_create_action_redelivered_soft_deleted_is_idempotent() {
 		ActionId::ActionId(id) => {
 			assert_eq!(id.as_ref(), "a1~stat-old", "must return the existing action_id");
 		}
-		ActionId::AId(_) => panic!("re-delivery must not insert a new row"),
+		ActionId::AId(_) | ActionId::SupersededOnArrival => {
+			panic!("re-delivery must not insert a new row")
+		}
 	}
 
 	// And it must not have revived the superseded row: no active STAT for the
@@ -1570,8 +1572,8 @@ async fn test_partner_edges() {
 }
 
 /// `CONN:UPD` keys apart from the relationship row (`CONN:<iss>:<aud>`), so storing a UPD
-/// never retires the CONN. A retried older UPD retires the newer one under their shared key,
-/// and the `conn` hook's ordering lookup must still find the newer, retired row.
+/// never retires the CONN. A retried older UPD arrives retired (newer-wins: a later same-key
+/// row is live), and the `conn` hook's ordering lookup must still find the newer row.
 #[tokio::test]
 async fn test_conn_upd_keeps_the_conn_row_and_orders_by_created_at() {
 	let (adapter, _temp) = create_test_adapter().await;
@@ -1606,7 +1608,8 @@ async fn test_conn_upd_keeps_the_conn_row_and_orders_by_created_at() {
 	let newer = conn("a1~upd-new", Some("UPD"), t0 + 10);
 	adapter.create_action(tn_id, &newer, Some(upd_key)).await.expect("newer upd");
 	let older = conn("a1~upd-old", Some("UPD"), t0 + 5);
-	adapter.create_action(tn_id, &older, Some(upd_key)).await.expect("older upd");
+	let res = adapter.create_action(tn_id, &older, Some(upd_key)).await.expect("older upd");
+	assert!(matches!(res, ActionId::SupersededOnArrival), "older UPD arrives retired");
 
 	let live = adapter.get_action_by_key(tn_id, conn_key).await.expect("by key");
 	assert_eq!(live.map(|a| a.action_id), Some("a1~conn".into()), "the CONN row stays live");
@@ -1615,14 +1618,59 @@ async fn test_conn_upd_keeps_the_conn_row_and_orders_by_created_at() {
 		typ: Some(vec!["CONN".into()]),
 		issuer: Some("alice".into()),
 		audience: Some("owner".into()),
-		status: Some(vec!["A".into(), "D".into()]),
-		created_after: Some(Timestamp(t0 + 5)),
+		// 'P': `create` stores pending; this test never finalizes the newer UPD.
+		status: Some(vec!["P".into(), "A".into(), "D".into()]),
+		created_after: Some(cloudillo_types::types::ApiTime(t0 + 5)),
 		exclude_sub_typ: Some(Box::new(["ACC".into(), "DEL".into()])),
 		..Default::default()
 	};
 	let rows = adapter.list_actions(tn_id, &opts).await.expect("list");
 	let ids: Vec<&str> = rows.iter().map(|a| a.action_id.as_ref()).collect();
-	assert_eq!(ids, ["a1~upd-new"], "the retired newer UPD is found, the older is not");
+	assert_eq!(ids, ["a1~upd-new"], "the newer UPD is found, the older is not");
+}
+
+/// A failed ('F') newer row with the same key must not retire a valid older inbound action.
+#[tokio::test]
+async fn test_failed_newer_row_does_not_retire_older_inbound() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "owner").await.expect("Should create tenant");
+
+	let t0 = Timestamp::now().0;
+	let upd = |action_id: &'static str, at: i64| Action {
+		action_id,
+		typ: "CONN",
+		sub_typ: Some("UPD"),
+		issuer_tag: "alice",
+		parent_id: None,
+		root_id: None,
+		audience_tag: Some("owner"),
+		content: None,
+		attachments: None,
+		subject: None,
+		created_at: Timestamp(at),
+		expires_at: None,
+		visibility: None,
+		flags: None,
+		x: None,
+		hat_tag: None,
+		channel: None,
+	};
+	let key = "CONN:UPD:alice:owner";
+	adapter
+		.create_action(tn_id, &upd("a1~upd-new", t0 + 10), Some(key))
+		.await
+		.expect("newer");
+	let failed = UpdateActionDataOptions { status: Patch::Value('F'), ..Default::default() };
+	adapter
+		.update_action_data(tn_id, "a1~upd-new", &failed)
+		.await
+		.expect("mark failed");
+	let res = adapter.create_action(tn_id, &upd("a1~upd-old", t0 + 5), Some(key)).await;
+	assert!(
+		!matches!(res.expect("older"), ActionId::SupersededOnArrival),
+		"a failed newer row must not retire the older action"
+	);
 }
 
 /// `snapshot()` writes a `meta.db` with the live rows and every live table.
@@ -1710,7 +1758,7 @@ async fn test_reader_state() {
 		.await
 		.unwrap();
 	let rs = adapter.get_reader_state(tn_id, "P:MSG", "bob").await.unwrap().unwrap();
-	assert_eq!((rs.last_id.as_deref(), rs.last_at), (Some("m1"), Some(Timestamp(10))));
+	assert_eq!((rs.last_id.as_deref(), rs.last_at), (Some("m1"), Some(ApiTime(10))));
 	// last_at is forward-only too.
 	adapter
 		.stamp_reader_activity(tn_id, "P:MSG", "bob", "m0", Timestamp(5), true)
@@ -1741,7 +1789,7 @@ async fn test_reader_state() {
 			.unwrap() == Some(Timestamp(10))
 	);
 	let rs = adapter.get_reader_state(tn_id, "P:MSG", "bob").await.unwrap().unwrap();
-	assert_eq!((rs.read_at, rs.unread), (Some(Timestamp(10)), Some(1)));
+	assert_eq!((rs.read_at, rs.unread), (Some(ApiTime(10)), Some(1)));
 	assert!(
 		adapter
 			.patch_reader_state(tn_id, "P:MSG", "bob", &read_at(5), true)
@@ -1750,7 +1798,7 @@ async fn test_reader_state() {
 			.is_none()
 	);
 	let rs = adapter.get_reader_state(tn_id, "P:MSG", "bob").await.unwrap().unwrap();
-	assert_eq!(rs.read_at, Some(Timestamp(10)));
+	assert_eq!(rs.read_at, Some(ApiTime(10)));
 
 	// Patch upserts (insert = true) but not when update-only.
 	let pin = PatchReaderState { pinned: Patch::Value(true), ..Default::default() };
@@ -2096,7 +2144,7 @@ async fn test_reader_state_patch() {
 	// The watermark never moves backwards.
 	assert_eq!(apply("P:MSG", "carol", read(now - 10)).await.unwrap(), Some(Timestamp(now - 10)));
 	assert!(apply("P:MSG", "carol", read(now - 100)).await.unwrap().is_none());
-	assert_eq!(get("P:MSG", "carol").await.unwrap().read_at, Some(Timestamp(now - 10)));
+	assert_eq!(get("P:MSG", "carol").await.unwrap().read_at, Some(Timestamp(now - 10).into()));
 
 	// ignoreAll / pinned round-trip; a letter this module does not own is kept.
 	let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -2154,7 +2202,7 @@ async fn test_reader_state_patch() {
 		.stamp_reader_mention(tn_id, "A:CONV", "c1", Timestamp(40))
 		.await
 		.unwrap();
-	assert_eq!(get("A:CONV", "c1").await.unwrap().mentioned_at, Some(Timestamp(50)));
+	assert_eq!(get("A:CONV", "c1").await.unwrap().mentioned_at, Some(Timestamp(50).into()));
 	// Reading up to the mention's creation time clears the badge (mentioned_at > read_at).
 	apply("A:CONV", "c1", read(50)).await.unwrap();
 	let rs = get("A:CONV", "c1").await.unwrap();
@@ -2235,7 +2283,7 @@ async fn test_reader_state_patch() {
 	let refs: Vec<&str> = first.iter().map(|r| r.ref_.as_ref()).collect();
 	assert_eq!(refs, ["p-a", "p-b"]);
 	let last = &first[1];
-	let cursor = Some((last.last_at.unwrap(), last.kind.clone(), last.ref_.clone()));
+	let cursor = Some((last.last_at.unwrap().into(), last.kind.clone(), last.ref_.clone()));
 	let second = page(cursor).await;
 	let refs: Vec<&str> = second.iter().map(|r| r.ref_.as_ref()).collect();
 	assert_eq!(refs, ["p-c"]);

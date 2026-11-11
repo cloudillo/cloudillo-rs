@@ -36,7 +36,7 @@ use crate::settings::{
 	PermissionLevel, SettingDefinition, SettingScope, SettingValue, SettingsRegistry,
 };
 use cloudillo_types::auth_adapter::{AuditCategory, AuditEvent};
-use cloudillo_types::types::SHARED_TN;
+use cloudillo_types::types::{ApiTime, SHARED_TN};
 
 const MANIFEST: &str = "manifest.json";
 const PARTIAL_SUFFIX: &str = ".partial";
@@ -77,8 +77,8 @@ pub struct BackupResult {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LastRun {
-	/// Unix seconds the run started.
-	pub at: i64,
+	/// When the run started.
+	pub at: ApiTime,
 	pub ok: bool,
 	pub bytes: u64,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -89,7 +89,7 @@ pub struct LastRun {
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotInfo {
 	pub name: String,
-	pub created_at: i64,
+	pub created_at: ApiTime,
 	pub bytes: u64,
 }
 
@@ -164,7 +164,7 @@ async fn run_acquired(
 	ip: Option<&str>,
 ) -> ClResult<BackupResult> {
 	let state = app.ext::<BackupState>()?;
-	let at = Timestamp::now().0;
+	let at = ApiTime::now();
 	let res = snapshot_all(app, &state.dir).await;
 
 	let (last, details) = match &res {
@@ -436,7 +436,7 @@ pub async fn list_snapshots(app: &App) -> ClResult<Vec<SnapshotInfo>> {
 	for name in complete_snapshots(dir).await?.into_iter().rev() {
 		match read_manifest(&dir.join(&name)).await {
 			Ok(m) => out.push(SnapshotInfo {
-				created_at: m.created_at,
+				created_at: ApiTime(m.created_at),
 				bytes: m.files.iter().map(|f| f.size).sum(),
 				name,
 			}),

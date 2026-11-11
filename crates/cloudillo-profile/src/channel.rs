@@ -15,13 +15,13 @@ use crate::prelude::*;
 use cloudillo_core::IdTag;
 use cloudillo_core::abac::{self, VisibilityLevel, relationship_level};
 use cloudillo_core::channels::{absolute_channel, can_enter, reader_roster};
-use cloudillo_core::extract::{Auth, OptionalAuth, OptionalRequestId};
+use cloudillo_core::extract::{Auth, OptionalAuth};
 use cloudillo_core::roles::{
 	FOLLOWER_LEVEL, MODERATOR_LEVEL, highest_role_level, is_moderator, role_level,
 };
 use cloudillo_types::auth_adapter::AuthCtx;
 use cloudillo_types::meta_adapter::{Channel, UpdateChannelData};
-use cloudillo_types::types::{ApiResponse, ErrorResponse};
+use cloudillo_types::types::ApiResponse;
 use cloudillo_types::validation::validate_channel_name;
 
 /// One room on the porch. `status` is `in`, `needs:<role>` or `invitation-only`.
@@ -160,7 +160,6 @@ pub async fn list_channels(
 	tn_id: TnId,
 	IdTag(tenant_id_tag): IdTag,
 	OptionalAuth(maybe_auth): OptionalAuth,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<PorchEntry>>>)> {
 	let (reader, roles, hatted): (&str, &[Box<str>], bool) = match &maybe_auth {
 		Some(auth) => (auth.id_tag.as_ref(), &auth.roles[..], auth.hat.is_some()),
@@ -213,14 +212,13 @@ pub async fn list_channels(
 		});
 	}
 
-	Ok((StatusCode::OK, Json(ApiResponse::new(entries).with_req_id(req_id.unwrap_or_default()))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(entries))))
 }
 
 /// POST /api/channels — create a room (moderator+, or down to `room.create_role`).
 pub async fn post_channel(
 	State(app): State<App>,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<CreateChannelRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Channel>>)> {
 	require_room_creator(&app, &auth).await?;
@@ -242,16 +240,13 @@ pub async fn post_channel(
 		visibility: req.visibility,
 		min_role: req.min_role.map(Into::into),
 		closed: req.closed,
-		created_at: now,
-		updated_at: now,
+		created_at: now.into(),
+		updated_at: now.into(),
 	};
 	app.meta_adapter.create_channel(auth.tn_id, &channel).await?;
 	let channel = app.meta_adapter.read_channel(auth.tn_id, &channel.name).await?;
 
-	Ok((
-		StatusCode::CREATED,
-		Json(ApiResponse::new(channel).with_req_id(req_id.unwrap_or_default())),
-	))
+	Ok((StatusCode::CREATED, Json(ApiResponse::new(channel))))
 }
 
 /// PATCH /api/channels/{name} — edit a room (moderator+). The name never changes.
@@ -259,7 +254,6 @@ pub async fn patch_channel(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Path(name): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<PatchChannelRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Channel>>)> {
 	require_moderator(&auth)?;
@@ -280,7 +274,7 @@ pub async fn patch_channel(
 	app.meta_adapter.update_channel(auth.tn_id, &name, &data).await?;
 	let channel = app.meta_adapter.read_channel(auth.tn_id, &name).await?;
 
-	Ok((StatusCode::OK, Json(ApiResponse::new(channel).with_req_id(req_id.unwrap_or_default()))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(channel))))
 }
 
 /// DELETE /api/channels/{name} — delete a room and its roster (moderator+). Refused with 409
@@ -298,12 +292,7 @@ pub async fn delete_channel(
 	let channel = absolute_channel(&tenant_id_tag, &name);
 	let file_count = app.meta_adapter.count_channel_entries(auth.tn_id, &channel).await?;
 	if file_count > 0 {
-		let body = ErrorResponse::new(
-			"E-CORE-CONFLICT".into(),
-			format!("Resource conflict: room {name} still holds {file_count} files"),
-		)
-		.with_details(serde_json::json!({ "fileCount": file_count }));
-		return Ok((StatusCode::CONFLICT, Json(body)).into_response());
+		return Err(Error::ChannelNotEmpty { file_count });
 	}
 	app.meta_adapter.delete_channel(auth.tn_id, &name).await?;
 	Ok(StatusCode::NO_CONTENT.into_response())
@@ -314,7 +303,6 @@ pub async fn list_channel_members(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Path(name): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<Box<str>>>>)> {
 	reject_scoped(&auth, "member list")?;
 	let members = if is_moderator(&auth.roles) {
@@ -330,7 +318,7 @@ pub async fn list_channel_members(
 		}
 		members
 	};
-	Ok((StatusCode::OK, Json(ApiResponse::new(members).with_req_id(req_id.unwrap_or_default()))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(members))))
 }
 
 #[cfg(test)]
@@ -345,8 +333,8 @@ mod tests {
 			visibility: Some('P'),
 			min_role: min_role.map(Into::into),
 			closed,
-			created_at: Timestamp(0),
-			updated_at: Timestamp(0),
+			created_at: Timestamp(0).into(),
+			updated_at: Timestamp(0).into(),
 		}
 	}
 

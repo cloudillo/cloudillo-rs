@@ -30,7 +30,7 @@ use crate::{
 };
 use cloudillo_core::abac::{self, relationship_level};
 use cloudillo_core::dir_cache::{DirCache, DirEntry};
-use cloudillo_core::extract::{Auth, IdTag, OptionalAuth, OptionalRequestId};
+use cloudillo_core::extract::{Auth, IdTag, OptionalAuth};
 use cloudillo_core::file_access;
 use cloudillo_types::auth_adapter::{AuditCategory, AuthCtx};
 use cloudillo_types::blob_adapter;
@@ -231,9 +231,9 @@ fn serve_file<S: AsRef<str> + Debug>(
 			.header(axum::http::header::CACHE_CONTROL, "public, max-age=31536000, immutable");
 	}
 
-	response = response.header("X-Cloudillo-Variant", variant.variant_id.as_ref());
+	response = response.header("Cloudillo-Variant-Id", variant.variant_id.as_ref());
 	if let Some(descriptor) = descriptor {
-		response = response.header("X-Cloudillo-Variants", descriptor);
+		response = response.header("Cloudillo-Descriptor", descriptor);
 	}
 
 	// CSP for SVG files: no scripts, and `sandbox` gives an SVG opened top-level an opaque
@@ -389,17 +389,20 @@ pub async fn get_file_list(
 	IdTag(tenant_id_tag): IdTag,
 	OptionalAuth(maybe_auth): OptionalAuth,
 	Query(mut opts): Query<meta_adapter::ListFileOptions>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<meta_adapter::FileView>>>)> {
 	// Guard: with_path is intended for single-file fetches. Reject misuse on
 	// wide listings to keep iterative walks bounded.
 	const MAX_BULK_WITHPATH_LIMIT: usize = 5;
+
+	// Default 30, hard max 200; the adapter reads `opts.limit` and fetches one extra row.
+	opts.limit = Some(opts.limit.unwrap_or(30).clamp(1, 200));
+	opts.apply_include();
 	if opts.with_path
 		&& opts.file_id.is_none()
 		&& opts.limit.unwrap_or(30) as usize > MAX_BULK_WITHPATH_LIMIT
 	{
 		return Err(Error::ValidationError(format!(
-			"withPath requires fileId or limit<={}",
+			"include=path requires contentId or limit<={}",
 			MAX_BULK_WITHPATH_LIMIT
 		)));
 	}
@@ -476,8 +479,7 @@ pub async fn get_file_list(
 					folder_scope_level = Some(scope_access);
 				} else {
 					// parentId outside the shared subtree — deny enumeration.
-					let response = ApiResponse::with_cursor_pagination(Vec::new(), None, false)
-						.with_req_id(req_id.unwrap_or_default());
+					let response = ApiResponse::with_next(Vec::new(), None);
 					return Ok((StatusCode::OK, Json(response)));
 				}
 			} else if let Some(ids) = opts.file_id.as_deref().filter(|ids| !ids.is_empty()) {
@@ -502,8 +504,7 @@ pub async fn get_file_list(
 				}
 				if in_subtree.is_empty() {
 					// No requested id falls within the shared subtree.
-					let response = ApiResponse::with_cursor_pagination(Vec::new(), None, false)
-						.with_req_id(req_id.unwrap_or_default());
+					let response = ApiResponse::with_next(Vec::new(), None);
 					return Ok((StatusCode::OK, Json(response)));
 				}
 				opts.file_id = Some(in_subtree);
@@ -542,10 +543,6 @@ pub async fn get_file_list(
 		opts.pending_viewer = Some(subject_id_tag.to_owned());
 	}
 
-	if !is_tenant {
-		opts.hidden = None;
-	}
-
 	// Exposure is the share set, which only writers may list (`share_access::is_share_reader`).
 	if opts.access.as_ref().is_some_and(|a| !a.is_empty())
 		&& !(scope.is_none()
@@ -572,7 +569,7 @@ pub async fn get_file_list(
 	)
 	.await?;
 	// Exposure is the share set: a non-tenant lists only rows whose set they may read, in SQL so
-	// the page, `hasMore` and the cursor never see the others.
+	// the page and the `next` cursor never see the others.
 	if !is_tenant && opts.access.as_ref().is_some_and(|a| !a.is_empty()) {
 		opts.share_set_reader = Some(ShareSetReader {
 			id_tag: subject_id_tag.into(),
@@ -628,7 +625,7 @@ pub async fn get_file_list(
 		opts.with_parent = true;
 	}
 
-	let limit = opts.limit.unwrap_or(30) as usize;
+	let limit = opts.limit.unwrap_or(30) as usize; // clamped to 1..=200 at the top
 	let sort_field = opts.sort.as_deref().unwrap_or("created");
 
 	let files = app.meta_adapter.list_files(tn_id, &opts).await?;
@@ -711,8 +708,8 @@ pub async fn get_file_list(
 	// Trashed rows, however reached (trash view or `?fileId`): only those the caller may
 	// manage (lifecycle ruling).
 	// ponytail: filtered after the SQL page, so a trash page can come back short or empty; the
-	// cursor above is built from the unfiltered page, so clients must page on `has_more`, not on
-	// an empty page. An owner filter in SQL would drop Admin-level grantees' rows.
+	// cursor above is built from the unfiltered page, so clients must page on the presence of
+	// `next`, not on an empty page. An owner filter in SQL would drop Admin-level grantees' rows.
 	// A recursive listing has no access floor, so a row below a subfolder whose own grant has
 	// lapsed can resolve to `None`; it is dropped here, same short-page caveat.
 	let mut kept = Vec::with_capacity(filtered.len());
@@ -735,8 +732,7 @@ pub async fn get_file_list(
 	}
 	let filtered = kept;
 
-	let response = ApiResponse::with_cursor_pagination(filtered, next_cursor, has_more)
-		.with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::with_next(filtered, next_cursor);
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -751,7 +747,7 @@ fn local_content(entry: &meta_adapter::FileView) -> ClResult<&str> {
 	entry.file_id.as_deref().ok_or(Error::NotFound)
 }
 
-/// GET /api/files/variant/{variant_id}
+/// GET /api/variants/{variantId}
 pub async fn get_file_variant(
 	State(app): State<App>,
 	tn_id: TnId,
@@ -794,6 +790,9 @@ pub struct GetFileVariantSelector {
 	pub min_x: Option<u32>,
 	pub min_y: Option<u32>,
 	pub min_res: Option<u32>, // min resolution in kpx
+	/// Comma list of extras; `descriptor` adds the `Cloudillo-Descriptor` header.
+	#[serde(default, deserialize_with = "meta_adapter::deserialize_split")]
+	pub include: Option<Vec<String>>,
 }
 
 pub async fn get_file_variant_file_id(
@@ -820,26 +819,21 @@ pub async fn get_file_variant_file_id(
 		.and_then(|v| v.to_str().ok())
 		.and_then(|v| parse_range(v, variant.size));
 
-	// Descriptor (X-Cloudillo-Variants) is delivered on the full fetch AND on the
-	// initial range request (`bytes=0-...`), which is what browser <video>/<audio>
-	// elements and download managers send first. Only seek requests that start past
-	// byte 0 skip it (and skip the extra read_file lookup) — by then the client
-	// already has the descriptor from its initial response, and can otherwise fetch
-	// it from GET /api/files/{file_id}/descriptor.
-	let needs_descriptor = match range {
+	// `Cloudillo-Descriptor` is opt-in (`?include=descriptor`), on 200 and 206 alike; the
+	// descriptor is also at GET /api/files/{id}/descriptor.
+	let wants_descriptor = meta_adapter::includes(selector.include.as_deref(), "descriptor");
+	let descriptor = wants_descriptor
+		.then(|| descriptor::get_file_descriptor(&variants, entry.root_id.as_deref()));
+
+	// One row per open, not per media seek: the full fetch and the initial `bytes=0-` range
+	// (what <video>/<audio> send first) are recorded; seeks past byte 0 and 416s are not. An
+	// anonymous share-link token carries the owner's id_tag, so it is recorded with no actor.
+	let is_open = match range {
 		None => true,
 		Some(Ok((start, _))) => start == 0,
-		Some(Err(())) => false, // unsatisfiable → 416, no body/descriptor
+		Some(Err(())) => false,
 	};
-	let descriptor = if needs_descriptor {
-		Some(descriptor::get_file_descriptor(&variants, entry.root_id.as_deref()))
-	} else {
-		None
-	};
-
-	// One row per open, not per media seek: seeks past byte 0 are not recorded. An anonymous
-	// share-link token carries the owner's id_tag, so it is recorded with no actor.
-	if needs_descriptor {
+	if is_open {
 		let actor = maybe_auth.as_ref().filter(|a| !a.anonymous).map(|a| &*a.id_tag);
 		crate::share::record_audit(
 			&app,
@@ -861,7 +855,6 @@ pub async fn get_file_descriptor(
 	State(app): State<App>,
 	tn_id: TnId,
 	Extension(ResolvedEntry(entry)): Extension<ResolvedEntry>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<String>>)> {
 	let file_id = local_content(&entry)?;
 	let mut variants = app
@@ -872,20 +865,21 @@ pub async fn get_file_descriptor(
 
 	let descriptor = descriptor::get_file_descriptor(&variants, entry.root_id.as_deref());
 
-	let response = ApiResponse::new(descriptor).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(descriptor);
 
 	Ok((StatusCode::OK, Json(response)))
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PostFileQuery {
-	#[serde(rename = "parentId")]
 	parent_id: Option<String>,
-	#[serde(rename = "rootId")]
 	root_id: Option<String>,
-	#[serde(rename = "createdAt")]
-	created_at: Option<Timestamp>,
-	tags: Option<String>,
+	created_at: Option<types::ApiTime>,
+	#[serde(default, deserialize_with = "meta_adapter::deserialize_split")]
+	tags: Option<Vec<String>>,
+	/// File name of an upload (`POST /api/uploads/{preset}?name=…`). Required there.
+	name: Option<String>,
 	/// Visibility level: P=Public, V=Verified, F=Follower, C=Connected, NULL=Direct
 	visibility: Option<char>,
 	/// Absolute channel (`@tenant~name`) the file is uploaded into.
@@ -943,7 +937,7 @@ pub struct PostFileRequest {
 	#[serde(rename = "rootId")]
 	root_id: Option<String>,
 	#[serde(rename = "createdAt")]
-	created_at: Option<Timestamp>,
+	created_at: Option<types::ApiTime>,
 	tags: Option<String>,
 	/// Visibility level: P=Public, V=Verified, F=Follower, C=Connected, NULL=Direct
 	visibility: Option<char>,
@@ -1666,9 +1660,8 @@ pub async fn post_file(
 	tn_id: TnId,
 	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	extract::Json(req): extract::Json<PostFileRequest>,
-) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
+) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::FileView>>)> {
 	info!("POST /api/files - Creating file with fileTp={}", req.file_tp);
 
 	// Scope check first: cross-context placements have no `root_id`, so a
@@ -1706,7 +1699,6 @@ pub async fn post_file(
 			app,
 			tn_id,
 			auth,
-			req_id,
 			&req,
 			source_file_id,
 			source_id_tag,
@@ -1748,7 +1740,7 @@ pub async fn post_file(
 				content_type: content_type.into(),
 				file_name: req.file_name.clone().unwrap_or_else(|| "file".into()).into(),
 				file_tp: Some(req.file_tp.clone().into()),
-				created_at: req.created_at,
+				created_at: req.created_at.map(Into::into),
 				tags: req.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
 				visibility,
 				channel,
@@ -1761,12 +1753,8 @@ pub async fn post_file(
 	info!("Created file metadata for fileTp={} by {}", req.file_tp, auth.id_tag);
 	cloudillo_core::search_index_file(&app, tn_id, &file_id);
 
-	let content_id = (req.file_tp != "FLDR").then_some(&*file_id);
-	let data = created_response(&created.entry_id, content_id);
-
-	let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
-
-	Ok((StatusCode::CREATED, Json(response)))
+	let view = read_created(&app, tn_id, &created.entry_id, &auth.id_tag).await?;
+	Ok((StatusCode::CREATED, Json(ApiResponse::new(view))))
 }
 
 /// Fetch a `FileView` for `source_file_id` from the peer that owns `source_id_tag`,
@@ -1859,13 +1847,12 @@ async fn post_file_cross_context(
 	app: App,
 	tn_id: types::TnId,
 	auth: cloudillo_types::auth_adapter::AuthCtx,
-	req_id: Option<String>,
 	req: &PostFileRequest,
 	source_file_id: &str,
 	source_id_tag: &str,
 	tenant_id_tag: &str,
 	channel: Option<Box<str>>,
-) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
+) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::FileView>>)> {
 	// The tenant's own content is never a reference: it would shadow local bytes.
 	if utils::normalize_id_tag(source_id_tag) == utils::normalize_id_tag(tenant_id_tag) {
 		return Err(Error::PermissionDenied);
@@ -1914,11 +1901,10 @@ async fn post_file_cross_context(
 		// Same upstream, different parent: already placed in this context. The frontend
 		// offers "go to existing location", so a 409 with the existing parent is sufficient.
 		if existing.parent_id.as_deref() != parent_id_resolved.as_deref() {
-			return Err(Error::Conflict(format!(
-				"file_id '{}' is already placed in this context (parent: {})",
-				source_file_id,
-				existing.parent_id.as_deref().unwrap_or("<root>")
-			)));
+			info!(file_id = %source_file_id, parent = ?existing.parent_id, "already placed");
+			return Err(Error::FileAlreadyPlaced {
+				existing_parent_id: existing.parent_id.as_deref().map(str::to_owned),
+			});
 		}
 		info!("Idempotent cross-context create: returning existing row");
 		let view = app
@@ -1926,9 +1912,7 @@ async fn post_file_cross_context(
 			.read_file_with_user_data(tn_id, &existing.entry_id, &auth.id_tag)
 			.await?
 			.ok_or_else(|| Error::Internal("idempotent row vanished".into()))?;
-		let data = serde_json::to_value(&view)?;
-		let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
-		return Ok((StatusCode::OK, Json(response)));
+		return Ok((StatusCode::OK, Json(ApiResponse::new(view))));
 	}
 
 	let visibility = default_cross_context_visibility(&app, tn_id, req.visibility).await?;
@@ -1999,14 +1983,8 @@ async fn post_file_cross_context(
 		}
 	}
 
-	let view = app
-		.meta_adapter
-		.read_file_with_user_data(tn_id, &entry_id, &auth.id_tag)
-		.await?
-		.ok_or_else(|| Error::Internal("freshly created row missing".into()))?;
-	let data = serde_json::to_value(&view)?;
-	let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
-	Ok((StatusCode::CREATED, Json(response)))
+	let view = read_created(&app, tn_id, &entry_id, &auth.id_tag).await?;
+	Ok((StatusCode::CREATED, Json(ApiResponse::new(view))))
 }
 
 /// Wrapper around `FileView` that adds a non-sticky `refreshStatus` hint for
@@ -2022,7 +2000,7 @@ pub struct RefreshResponse {
 	refresh_status: Option<&'static str>,
 }
 
-/// POST /api/files/{file_id}/refresh
+/// POST /api/files/{id}/refresh
 ///
 /// Reconciles a cross-context file row with its source. Frontend calls this
 /// when it detects an inconsistency (broken thumbnail, 404 on blob, stale
@@ -2058,7 +2036,6 @@ pub async fn refresh_file(
 	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
 	extract::Path(file_id): extract::Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<RefreshResponse>>)> {
 	// Anonymous callers (guest, or a delegated / share-link token) never refresh, whatever
 	// their read level: it triggers an upstream fetch and writes per-user state.
@@ -2239,7 +2216,21 @@ pub async fn refresh_file(
 	// immediate response matches what subsequent list calls will return.
 	view.access_level = view.user_data.as_ref().and_then(|u| u.access_level);
 	let body = RefreshResponse { view, refresh_status };
-	Ok((StatusCode::OK, Json(ApiResponse::new(body).with_req_id(req_id.unwrap_or_default()))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(body))))
+}
+
+/// Blob upload response: the entry's `FileView` (its `fileId` is the pending `@<f_id>` until
+/// the content id is computed; image dimensions are in `x.dim`) plus the upload-only
+/// `thumbnailVariantId`. `existed` marks a dedup hit (200, no new entry).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadResponse {
+	#[serde(flatten)]
+	pub file: meta_adapter::FileView,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub thumbnail_variant_id: Option<String>,
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	pub existed: bool,
 }
 
 async fn build_dedup_response(
@@ -2247,31 +2238,27 @@ async fn build_dedup_response(
 	tn_id: types::TnId,
 	id_tag: &str,
 	entry_id: &str,
-	req_id: Option<String>,
-) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
+) -> ClResult<(StatusCode, Json<ApiResponse<UploadResponse>>)> {
 	info!("Dedup hit: entry_id={}", entry_id);
 	app.meta_adapter.record_file_access(tn_id, id_tag, entry_id).await?;
 
-	let view = app.meta_adapter.read_file(tn_id, entry_id).await?.ok_or(Error::NotFound)?;
-
-	let mut data = serde_json::to_value(&view).unwrap_or_else(|_| json!({"entryId": entry_id}));
-	if let Some(obj) = data.as_object_mut() {
-		obj.insert("existed".into(), serde_json::Value::Bool(true));
-	}
-	let response = ApiResponse::new(data).with_req_id(req_id.unwrap_or_default());
-	Ok((StatusCode::OK, Json(response)))
+	let file = app.meta_adapter.read_file(tn_id, entry_id).await?.ok_or(Error::NotFound)?;
+	let response = UploadResponse { file, thumbnail_variant_id: None, existed: true };
+	Ok((StatusCode::OK, Json(ApiResponse::new(response))))
 }
 
-/// Add the new entry's id to an upload response (`{"fileId": "@<f_id>", ...}`).
-fn with_entry_id(mut data: serde_json::Value, entry_id: &str) -> serde_json::Value {
-	data["entryId"] = entry_id.into();
-	data
-}
-
-/// The body of a `201 Created` for a new entry: its placement id and its content id (null on a
-/// folder, which has no content row).
-pub(crate) fn created_response(entry_id: &str, file_id: Option<&str>) -> serde_json::Value {
-	json!({"entryId": entry_id, "fileId": file_id})
+/// The body of a `201 Created` for a new entry: the freshly written row, re-read with the
+/// caller's user data.
+pub(crate) async fn read_created(
+	app: &App,
+	tn_id: TnId,
+	entry_id: &str,
+	id_tag: &str,
+) -> ClResult<meta_adapter::FileView> {
+	app.meta_adapter
+		.read_file_with_user_data(tn_id, entry_id, id_tag)
+		.await?
+		.ok_or_else(|| Error::Internal("freshly created row missing".into()))
 }
 
 /// Create an upload's entry: `(entry_id, Some(f_id))` for new content, `None` on a dedup hit.
@@ -2294,16 +2281,25 @@ pub async fn post_file_blob(
 	tn_id: TnId,
 	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
-	extract::Path((preset_name, file_name)): extract::Path<(String, String)>,
+	extract::Path(preset_name): extract::Path<String>,
 	query: Query<PostFileQuery>,
 	header: axum::http::HeaderMap,
-	OptionalRequestId(req_id): OptionalRequestId,
 	body: Body,
-) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
+) -> ClResult<(StatusCode, Json<ApiResponse<UploadResponse>>)> {
 	// Max file size constants (in MiB, using binary units)
 	const BYTES_PER_MIB: usize = 1_048_576; // 1024 * 1024
 	const DEFAULT_MAX_SIZE_MIB: i64 = 50;
 	const DEFAULT_MAX_STREAMING_SIZE_MIB: i64 = 100;
+
+	let file_name = match query.name.as_deref().map(str::trim) {
+		Some(name) if !name.is_empty() => name.to_owned(),
+		_ => {
+			return Err(Error::InvalidField {
+				field: "name",
+				message: "name query parameter is required".into(),
+			});
+		}
+	};
 
 	// Scope check: scoped tokens can only create children under the scoped root,
 	// or — for folder share links — anywhere within the scoped folder's subtree.
@@ -2411,8 +2407,8 @@ pub async fn post_file_blob(
 		content_type: content_type.into(),
 		file_name: file_name.into(),
 		file_tp: Some("BLOB".into()),
-		created_at: query.created_at,
-		tags: query.tags.as_ref().map(|s| s.split(',').map(Into::into).collect()),
+		created_at: query.created_at.map(Into::into),
+		tags: query.tags.as_ref().map(|t| t.iter().map(|s| s.as_str().into()).collect()),
 		root_id: query.root_id.clone().map(Into::into),
 		parent_id: query.effective_parent_id()?.map(Into::into),
 		visibility,
@@ -2452,7 +2448,7 @@ pub async fn post_file_blob(
 			};
 			let (entry_id, f_id) = create_upload(&app, tn_id, opts).await?;
 			let Some(f_id) = f_id else {
-				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id, req_id).await;
+				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id).await;
 			};
 			// Route to SVG or raster image handler
 			let data = if is_svg {
@@ -2474,7 +2470,7 @@ pub async fn post_file_blob(
 			let opts = meta_adapter::CreateFile { orig_variant_id: Some(orig_variant_id), ..base };
 			let (entry_id, f_id) = create_upload(&app, tn_id, opts).await?;
 			let Some(f_id) = f_id else {
-				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id, req_id).await;
+				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id).await;
 			};
 			(handle_post_pdf(&app, tn_id, f_id, &bytes).await?, entry_id)
 		}
@@ -2517,7 +2513,7 @@ pub async fn post_file_blob(
 				meta_adapter::CreateFile { orig_variant_id: Some(orig_blob_id.clone()), ..base };
 			let (entry_id, f_id) = create_upload(&app, tn_id, opts).await?;
 			let Some(f_id) = f_id else {
-				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id, req_id).await;
+				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id).await;
 			};
 			// Renamed so an operator reading `ls` sees which file this is.
 			let final_temp_path =
@@ -2577,7 +2573,7 @@ pub async fn post_file_blob(
 				meta_adapter::CreateFile { orig_variant_id: Some(orig_blob_id.clone()), ..base };
 			let (entry_id, f_id) = create_upload(&app, tn_id, opts).await?;
 			let Some(f_id) = f_id else {
-				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id, req_id).await;
+				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id).await;
 			};
 			// Renamed so an operator reading `ls` sees which file this is.
 			let final_temp_path =
@@ -2652,7 +2648,7 @@ pub async fn post_file_blob(
 				meta_adapter::CreateFile { orig_variant_id: Some(orig_blob_id.clone()), ..base };
 			let (entry_id, f_id) = create_upload(&app, tn_id, opts).await?;
 			let Some(f_id) = f_id else {
-				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id, req_id).await;
+				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id).await;
 			};
 			// Renamed so an operator reading `ls` sees which file this is.
 			let final_temp_path =
@@ -2674,17 +2670,18 @@ pub async fn post_file_blob(
 			(data, entry_id)
 		}
 	};
-	let response =
-		ApiResponse::new(with_entry_id(data, &entry_id)).with_req_id(req_id.unwrap_or_default());
-	Ok((StatusCode::CREATED, Json(response)))
+	let thumbnail_variant_id =
+		data.get("thumbnailVariantId").and_then(|v| v.as_str()).map(Into::into);
+	let file = read_created(&app, tn_id, &entry_id, &auth.id_tag).await?;
+	let response = UploadResponse { file, thumbnail_variant_id, existed: false };
+	Ok((StatusCode::CREATED, Json(ApiResponse::new(response))))
 }
 
-/// GET /api/files/{file_id}/metadata
+/// GET /api/files/{id}/metadata
 pub async fn get_file_metadata(
 	OptionalAuth(maybe_auth): OptionalAuth,
 	Extension(ResolvedEntry(mut file)): Extension<ResolvedEntry>,
 	Extension(ResolvedLevel(level)): Extension<ResolvedLevel>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::FileView>>)> {
 	// Always report the caller's effective level: clients read it for the eye badge, and a peer's
 	// `POST /files/{id}/refresh` caches it. The guard resolved both, `?action=` grant included.
@@ -2699,7 +2696,7 @@ pub async fn get_file_metadata(
 		AccessLevel::None => None,
 		other => Some(other),
 	};
-	Ok((StatusCode::OK, Json(ApiResponse::new(file).with_req_id(req_id.unwrap_or_default()))))
+	Ok((StatusCode::OK, Json(ApiResponse::new(file))))
 }
 
 // vim: ts=4

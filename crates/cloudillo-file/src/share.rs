@@ -27,7 +27,7 @@ use crate::prelude::*;
 use cloudillo_core::CreateActionFn;
 use cloudillo_core::abac;
 use cloudillo_core::audit;
-use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
+use cloudillo_core::extract::{Auth, IdTag};
 use cloudillo_core::file_access::{self, FileAccessCtx};
 use cloudillo_core::share_access::{
 	ensure_grant_within, require_share_manager, require_share_reader, require_unscoped_file_access,
@@ -35,7 +35,7 @@ use cloudillo_core::share_access::{
 use cloudillo_types::action_types::CreateAction;
 use cloudillo_types::auth_adapter::AuditCategory;
 use cloudillo_types::meta_adapter::{self, CreateShareEntry, ShareEntry, UpdateShareEntryOptions};
-use cloudillo_types::types::{AccessLevel, ApiResponse};
+use cloudillo_types::types::{AccessLevel, ApiResponse, ApiTime, CursorData};
 
 /// Validate the share-permission vocabulary. The 4 valid values match the
 /// `permission CHAR(1)` column in `share_entries`.
@@ -43,9 +43,7 @@ fn validate_share_permission(c: char) -> ClResult<()> {
 	if matches!(c, 'R' | 'C' | 'W' | 'A') {
 		Ok(())
 	} else {
-		Err(Error::ValidationError(
-			"permission must be 'R' (read), 'C' (comment), 'W' (write), or 'A' (admin)".into(),
-		))
+		Err(Error::ValidationError("permission must be read, comment, write or admin".into()))
 	}
 }
 
@@ -57,8 +55,8 @@ fn validate_share_permission(c: char) -> ClResult<()> {
 fn validate_admin_subject(permission: char, subject_type: char) -> ClResult<()> {
 	if permission == 'A' && subject_type != 'U' {
 		return Err(Error::ValidationError(
-			"permission 'A' (admin) is only valid for subjectType 'U' (user); share links and \
-			 file embeds cannot manage a share set"
+			"permission admin is only valid for subjectType user; share links and file embeds \
+			 cannot manage a share set"
 				.into(),
 		));
 	}
@@ -91,6 +89,30 @@ fn fshr_subject(file_view: &meta_adapter::FileView) -> Box<str> {
 	file_view.file_id.as_deref().unwrap_or(&file_view.entry_id).into()
 }
 
+/// `?cursor=&limit=` for the share listings (default 100, max 500)
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharePageQuery {
+	pub cursor: Option<String>,
+	pub limit: Option<u32>,
+}
+
+/// `(limit, after_id)` from the query; a cursor that is not a share cursor is a 400.
+/// Not a `#[serde(flatten)]` struct: flatten breaks numeric fields under urlencoded queries.
+fn resolve_page(cursor: Option<&str>, limit: Option<u32>) -> ClResult<(u32, Option<i64>)> {
+	let after = CursorData::parse_int(cursor, "share")?;
+	Ok((limit.unwrap_or(100).clamp(1, 500), after))
+}
+
+/// Truncate a `limit + 1` fetch to `limit` and return the next-page cursor, if any
+fn share_page(entries: &mut Vec<ShareEntry>, limit: u32) -> Option<String> {
+	if entries.len() <= limit as usize {
+		return None;
+	}
+	entries.truncate(limit as usize);
+	entries.last().map(|e| CursorData::int("share", e.id))
+}
+
 /// GET /api/files/{file_id}/shares — List share entries for a file
 pub async fn list_shares(
 	State(app): State<App>,
@@ -98,20 +120,25 @@ pub async fn list_shares(
 	IdTag(tenant_id_tag): IdTag,
 	tn_id: TnId,
 	Path(file_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
+	Query(page): Query<SharePageQuery>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ShareEntry>>>)> {
+	let (limit, after_id) = resolve_page(page.cursor.as_deref(), page.limit)?;
 	let authority = require_share_reader(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
+	file_access::require_entry_or_content_id(&authority.access.file_view, &file_id)?;
 	// Share entries are keyed by the placement (`entry_id`), not the id the path named.
 	let entry_id = &authority.access.file_view.entry_id;
 
-	let entries = app.meta_adapter.list_share_entries(tn_id, 'F', entry_id).await?;
+	let mut entries = app
+		.meta_adapter
+		.list_share_entries(tn_id, 'F', entry_id, Some(limit + 1), after_id)
+		.await?;
+	let next = share_page(&mut entries, limit);
 
-	let response = ApiResponse::new(entries).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::with_next(entries, next);
 	Ok((StatusCode::OK, Json(response)))
 }
 
 /// POST /api/files/{file_id}/shares — Create a share entry
-#[expect(clippy::too_many_arguments, reason = "axum extractors")]
 pub async fn create_share(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -119,18 +146,16 @@ pub async fn create_share(
 	IdTag(tenant_id_tag): IdTag,
 	tn_id: TnId,
 	Path(file_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(mut input): Json<CreateShareEntry>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ShareEntry>>)> {
 	// Authorization before body validation, per the ordering convention in
 	// `cloudillo_core::share_access`.
 	let authority = require_share_manager(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
+	file_access::require_entry_or_content_id(&authority.access.file_view, &file_id)?;
 
 	// Validate input
 	if !matches!(input.subject_type, 'U' | 'L' | 'F') {
-		return Err(Error::ValidationError(
-			"subjectType must be 'U' (user), 'L' (link), or 'F' (file)".into(),
-		));
+		return Err(Error::ValidationError("subjectType must be user, link or file".into()));
 	}
 	validate_share_permission(input.permission)?;
 	validate_admin_subject(input.permission, input.subject_type)?;
@@ -236,7 +261,7 @@ pub async fn create_share(
 		}
 	}
 
-	let response = ApiResponse::new(entry).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(entry);
 	Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -248,9 +273,9 @@ pub async fn delete_share(
 	IdTag(tenant_id_tag): IdTag,
 	tn_id: TnId,
 	Path((file_id, share_id)): Path<(String, i64)>,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	let authority = require_share_manager(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
+	file_access::require_entry_or_content_id(&authority.access.file_view, &file_id)?;
 	let file_view = &authority.access.file_view;
 
 	// Load share entry before deleting (need subject info for FSHR revocation)
@@ -319,8 +344,7 @@ pub async fn delete_share(
 		}
 	}
 
-	let response = ApiResponse::new(()).with_req_id(req_id.unwrap_or_default());
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
 /// Request body for PATCH /api/files/{file_id}/shares/{share_id}.
@@ -328,20 +352,23 @@ pub async fn delete_share(
 /// Each field uses `Patch<T>` semantics: omitted = leave unchanged,
 /// explicit `null` = clear, value = set.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateShareRequest {
-	/// 'R' (read) | 'C' (comment) | 'W' (write) | 'A' (admin).
+	/// `read` | `comment` | `write` | `admin` → stored `R` | `C` | `W` | `A`.
 	/// `null` is rejected — to revoke, DELETE the share entry.
-	#[serde(default)]
+	#[serde(
+		default,
+		deserialize_with = "cloudillo_types::api_enums::share_permission::patch::deserialize"
+	)]
 	pub permission: Patch<char>,
 	/// ISO 8601 timestamp string. `null` clears expiration.
 	#[serde(rename = "expiresAt", default)]
-	pub expires_at: Patch<Timestamp>,
+	pub expires_at: Patch<ApiTime>,
 }
 
 /// PATCH /api/files/{file_id}/shares/{share_id} — Update a share entry's
 /// permission level and/or expiration. Does not emit any FSHR action; the
 /// share entry is the source of truth, the FSHR is a one-shot notification.
-#[expect(clippy::too_many_arguments, reason = "axum extractors")]
 pub async fn update_share(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -349,10 +376,10 @@ pub async fn update_share(
 	IdTag(tenant_id_tag): IdTag,
 	tn_id: TnId,
 	Path((file_id, share_id)): Path<(String, i64)>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(req): Json<UpdateShareRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ShareEntry>>)> {
 	let authority = require_share_manager(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
+	file_access::require_entry_or_content_id(&authority.access.file_view, &file_id)?;
 
 	// Reject empty PATCH at the handler boundary.
 	if req.permission.is_undefined() && req.expires_at.is_undefined() {
@@ -401,7 +428,10 @@ pub async fn update_share(
 		return Err(Error::ValidationError("Expiration time must be in the future".into()));
 	}
 
-	let opts = UpdateShareEntryOptions { permission: permission_patch, expires_at: req.expires_at };
+	let opts = UpdateShareEntryOptions {
+		permission: permission_patch,
+		expires_at: req.expires_at.map(Into::into),
+	};
 
 	let updated = app
 		.meta_adapter
@@ -428,7 +458,7 @@ pub async fn update_share(
 	// No FSHR emission on PATCH: the action is a one-shot notification, not the
 	// source of truth. Re-emitting would re-introduce duplicate-FSHR rows.
 
-	let response = ApiResponse::new(updated).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::new(updated);
 	Ok((StatusCode::OK, Json(response)))
 }
 
@@ -437,20 +467,25 @@ pub async fn update_share(
 // ========================================================================
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListSharesBySubjectQuery {
-	#[serde(rename = "subjectType")]
+	/// `user` | `link` | `file`, converted to the stored char.
+	#[serde(default, with = "cloudillo_types::api_enums::share_subject::opt")]
 	pub subject_type: Option<char>,
-	#[serde(rename = "subjectId")]
 	pub subject_id: String,
+	/// Opaque cursor from a previous page's `next`
+	pub cursor: Option<String>,
+	/// Page size (default 100, max 500)
+	pub limit: Option<u32>,
 }
 
-/// GET /api/shares?subject_id={id}[&subject_type=F] — List share entries by subject
+/// GET /api/shares?subjectId={id}[&subjectType=file] — List share entries by subject
 ///
 /// Scoped credentials never reach this route (`scope_permits`). Callers are gated per
 /// `subjectType`, since each answers a different question:
-/// - `F` (or absent) — plain access to the subject file, not share standing
-/// - `U` — the subject themselves, the tenant account, or a leader
-/// - `L` — the tenant account alone
+/// - `file` (or absent) — plain access to the subject file, not share standing
+/// - `user` — the subject themselves, the tenant account, or a leader
+/// - `link` — the tenant account alone
 /// - anything else — a validation error rather than an ungated fall-through
 ///
 /// `subjectId` accepts an optional `@` prefix, matching what `create_share` strips before storing.
@@ -460,8 +495,8 @@ pub async fn list_shares_by_subject(
 	IdTag(tenant_id_tag): IdTag,
 	tn_id: TnId,
 	Query(query): Query<ListSharesBySubjectQuery>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ShareEntry>>>)> {
+	let (limit, after_id) = resolve_page(query.cursor.as_deref(), query.limit)?;
 	// `create_share` strips the `@` before storing, so normalize once here — for the gate AND the
 	// query. Normalizing only for the gate let `@alice.example.com` clear it and then match nothing.
 	// The file-access check below keeps the raw value: `@{f_id}` is a live file address form.
@@ -508,16 +543,19 @@ pub async fn list_shares_by_subject(
 		}
 	}
 
-	let entries = app
+	let mut entries = app
 		.meta_adapter
 		.list_share_entries_by_subject(
 			tn_id,
 			query.subject_type,
 			file_entry_id.as_deref().unwrap_or(subject_id),
+			Some(limit + 1),
+			after_id,
 		)
 		.await?;
+	let next = share_page(&mut entries, limit);
 
-	let response = ApiResponse::new(entries).with_req_id(req_id.unwrap_or_default());
+	let response = ApiResponse::with_next(entries, next);
 	Ok((StatusCode::OK, Json(response)))
 }
 

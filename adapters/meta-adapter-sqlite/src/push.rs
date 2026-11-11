@@ -7,6 +7,7 @@ use crate::utils::Db;
 use cloudillo_types::{
 	meta_adapter::{PushSubscription, PushSubscriptionData},
 	prelude::*,
+	types::ApiTime,
 };
 use sqlx::{Row, SqlitePool};
 
@@ -31,7 +32,7 @@ pub async fn list(db: &SqlitePool, tn_id: TnId) -> ClResult<Vec<PushSubscription
 		subscriptions.push(PushSubscription {
 			id: u64::try_from(row.get::<i64, _>("subs_id")).unwrap_or_default(),
 			subscription: subscription_data,
-			created_at: Timestamp(row.get::<i64, _>("created_at")),
+			created_at: ApiTime(row.get::<i64, _>("created_at")),
 		});
 	}
 

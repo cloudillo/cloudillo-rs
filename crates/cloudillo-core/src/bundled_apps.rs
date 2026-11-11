@@ -132,7 +132,7 @@ impl BundledAppRegistry {
 					nav_param: ct.nav_param.as_deref().map(Into::into),
 					search: ct.search.clone(),
 					x: None,
-					updated_at: *updated_at,
+					updated_at: (*updated_at).into(),
 				};
 				formats.insert(ct.mime_type.as_str().into(), (format, primary));
 				contributed = true;
@@ -526,7 +526,7 @@ mod tests {
 			nav_param: Some(nav.into()),
 			search: Some(search),
 			x: None,
-			updated_at: Timestamp(0),
+			updated_at: Timestamp(0).into(),
 		};
 		a.insert("x/one".into(), fmt("x/one", "nav", rules("ti")));
 		a.insert("x/two".into(), fmt("x/two", "nav", rules("tj")));

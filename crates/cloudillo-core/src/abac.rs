@@ -310,7 +310,7 @@ pub fn require_tenant_self(auth: &AuthCtx, tenant_id_tag: &str, what: &str) -> C
 }
 
 /// Require the tenant account itself, SADM excluded: for routes acting on the account's own
-/// credentials (signing keys, TOTP, export). SADM has its `/api/admin/tenants/{id_tag}/*` twins.
+/// credentials (signing keys, TOTP, export). SADM has its `/api/admin/tenants/{idTag}/*` twins.
 pub fn require_tenant_account(auth: &AuthCtx, id_tag: &str) -> ClResult<()> {
 	if is_tenant_account(auth, id_tag) { Ok(()) } else { Err(Error::PermissionDenied) }
 }
@@ -1159,7 +1159,7 @@ mod tests {
 
 	/// Defence in depth: a role-less, unscoped credential naming the tenant matches its id_tag.
 	/// Without the role test it would reach `POST /api/auth/api-keys` and
-	/// `POST /api/auth/wa/reg` and mint itself a full owner.
+	/// `POST /api/auth/passkeys` and mint itself a full owner.
 	#[test]
 	fn require_tenant_self_denies_role_less_principal() {
 		let roleless = plain_subject(); // roles: []

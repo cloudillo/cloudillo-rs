@@ -17,7 +17,7 @@
 //! reachable only from the weekly recurring task, never from a request.
 //!
 //! The 202 only says the sweep was scheduled. The outcome arrives separately, as
-//! a `SEARCH_REINDEX_DONE` message broadcast to the tenant's WebSocket bus
+//! a `searchReindexDone` message broadcast to the tenant's WebSocket bus
 //! connections when the sweep ends — see [`crate::reindex`].
 
 use axum::{Json, extract::State, http::StatusCode};
@@ -47,7 +47,7 @@ pub struct ReindexResponse {
 /// this is not the startup path, so the stored `search.index_rev` does not gate
 /// it — and logs what it touched at `info` when it finishes.
 ///
-/// The same counts also go to the caller: the task pushes `SEARCH_REINDEX_DONE`
+/// The same counts also go to the caller: the task pushes `searchReindexDone`
 /// to this tenant's bus connections when it finishes, so the client need not poll
 /// a `taskId` that has no endpoint behind it. A failure sends one message too, on
 /// the first failed attempt, and then stays silent for the nine retries.

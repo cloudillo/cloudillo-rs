@@ -445,6 +445,7 @@ pub(crate) async fn create_action_token(
 		nonce: None, // PoW nonce is added by clients, not server
 		h: action.hat,
 		ch: action.channel,
+		crit: None,
 	};
 	let token = crypto::generate_action_token(worker, action_data, private_key).await?;
 

@@ -50,7 +50,9 @@ pub async fn on_create(app: App, context: HookContext) -> ClResult<HookResult> {
 			}
 			cloudillo_core::schedule_badge_resync(&app, tn_id, audience).await;
 
-			schedule_history_sync(&app, tn_id, audience).await;
+			if context.effects.propagate {
+				schedule_history_sync(&app, tn_id, audience).await;
+			}
 		}
 		Some("DEL") => {
 			// Unfollow: remove follow status

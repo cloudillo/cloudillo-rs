@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! File lifecycle paths the matrix objects do not reach: rows created through the API (the
-//! matrix seeds rows directly), trash reached through an ancestor, per-row `DELETE /api/trash`
+//! matrix seeds rows directly), trash reached through an ancestor, per-row `POST /api/trash/empty`
 //! authority, and a reply to a parent this node never saw.
 
 use axum::body::Body;
@@ -35,7 +35,7 @@ async fn send(
 async fn post_file(fx: &Fixture, who: &str, body: &Value) -> String {
 	let (status, res) = send(fx, CLUB, who, Method::POST, "/api/files", body).await;
 	assert!(status.is_success(), "POST /api/files {body}: {status} {res}");
-	find_str(&res, "entryId").expect("created entryId")
+	find_str(&res, "id").expect("created id")
 }
 
 /// Seed one row with content id `id`: its entry id.
@@ -79,7 +79,7 @@ async fn api_created_files_are_active() {
 	let list = format!("/api/files?parentId={folder}");
 	let (status, res) = send(fx, CLUB, reader, Method::GET, &list, &Value::Null).await;
 	assert_eq!(status, StatusCode::OK, "{res}");
-	assert_eq!(find_str(&res, "entryId").as_deref(), Some(doc.as_str()), "browsed: {res}");
+	assert_eq!(find_str(&res, "id").as_deref(), Some(doc.as_str()), "browsed: {res}");
 }
 
 /// A hatted visitor whose hat maps to contributor creates a document the way the Files sidebar
@@ -139,7 +139,7 @@ async fn trash_reaches_descendants_on_the_shared_access_path() {
 	assert_eq!(status, StatusCode::FORBIDDEN, "no child below a trashed folder: {res}");
 }
 
-/// `DELETE /api/trash` purges only the rows the caller may manage: a moderator's purge leaves
+/// `POST /api/trash/empty` purges only the rows the caller may manage: a moderator's purge leaves
 /// a mirrored row, whose lifecycle belongs to its placer alone.
 #[tokio::test]
 async fn empty_trash_leaves_rows_the_caller_may_not_manage() {
@@ -162,7 +162,7 @@ async fn empty_trash_leaves_rows_the_caller_may_not_manage() {
 	let mirror = fx.app.meta_adapter.create_file(tn_id, opts).await.unwrap().entry_id;
 
 	let who = "m-moderator@trash.test";
-	let (status, res) = send(fx, TRASH, who, Method::DELETE, "/api/trash", &Value::Null).await;
+	let (status, res) = send(fx, TRASH, who, Method::POST, "/api/trash/empty", &Value::Null).await;
 	assert!(status.is_success(), "moderator empties the trash: {status} {res}");
 	let row = fx.app.meta_adapter.read_file(tn_id, &mirror).await.unwrap();
 	let row = row.expect("the mirrored row survives");

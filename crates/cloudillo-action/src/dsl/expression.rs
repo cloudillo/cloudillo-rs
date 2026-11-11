@@ -486,6 +486,7 @@ mod tests {
 			is_inbound: false,
 			is_outbound: true,
 			pre_approved: false,
+			effects: crate::post_store::Effects::ALL,
 			client_address: None,
 			vars: HashMap::new(),
 		}

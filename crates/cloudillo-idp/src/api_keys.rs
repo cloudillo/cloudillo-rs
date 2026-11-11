@@ -12,12 +12,12 @@ use serde::{Deserialize, Serialize};
 
 use std::sync::Arc;
 
-use cloudillo_core::extract::{Auth, OptionalRequestId};
+use cloudillo_core::extract::Auth;
 use cloudillo_types::auth_adapter::AuthCtx;
 use cloudillo_types::identity_provider_adapter::{
 	ApiKey, CreateApiKeyOptions, Identity, IdentityProviderAdapter, ListApiKeyOptions,
 };
-use cloudillo_types::types::{ApiResponse, serialize_timestamp_iso, serialize_timestamp_iso_opt};
+use cloudillo_types::types::{ApiResponse, ApiTime, CursorData};
 
 use crate::handler::{can_access_identity, check_idp_enabled, is_idp_admin};
 use crate::prelude::*;
@@ -93,23 +93,16 @@ fn split_id_tag_with_tenant(id_tag: &str, tenant_domain: &str) -> ClResult<(Stri
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiKeyResponse {
-	pub id: i32,
+	pub id: String,
 	pub id_tag: String,
 	pub key_prefix: String,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub name: Option<String>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	#[serde(
-		skip_serializing_if = "Option::is_none",
-		serialize_with = "serialize_timestamp_iso_opt"
-	)]
-	pub last_used_at: Option<Timestamp>,
-	#[serde(
-		skip_serializing_if = "Option::is_none",
-		serialize_with = "serialize_timestamp_iso_opt"
-	)]
-	pub expires_at: Option<Timestamp>,
+	pub created_at: ApiTime,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub last_used_at: Option<ApiTime>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub expires_at: Option<ApiTime>,
 }
 
 impl From<ApiKey> for ApiKeyResponse {
@@ -117,13 +110,13 @@ impl From<ApiKey> for ApiKeyResponse {
 		// Reconstruct id_tag from prefix and domain
 		let id_tag = format!("{}.{}", key.id_tag_prefix, key.id_tag_domain);
 		Self {
-			id: key.id,
+			id: key.id.to_string(),
 			id_tag,
 			key_prefix: key.key_prefix.clone(),
 			name: key.name.clone(),
-			created_at: key.created_at,
-			last_used_at: key.last_used_at,
-			expires_at: key.expires_at,
+			created_at: key.created_at.into(),
+			last_used_at: key.last_used_at.map(Into::into),
+			expires_at: key.expires_at.map(Into::into),
 		}
 	}
 }
@@ -145,7 +138,7 @@ pub struct CreateApiKeyRequest {
 	/// Human-readable name for the API key
 	pub name: Option<String>,
 	/// Expiration timestamp (optional, defaults to no expiration)
-	pub expires_at: Option<i64>,
+	pub expires_at: Option<ApiTime>,
 }
 
 /// Query parameters for listing API keys
@@ -154,10 +147,10 @@ pub struct CreateApiKeyRequest {
 pub struct ListApiKeysQuery {
 	/// The identity id_tag to list API keys for
 	pub id_tag: Option<String>,
-	/// Limit results
+	/// Page size: default 20, max 200
 	pub limit: Option<u32>,
-	/// Offset for pagination
-	pub offset: Option<u32>,
+	/// Opaque cursor: the previous page's `next`
+	pub cursor: Option<String>,
 }
 
 /// POST /api/api-keys - Create a new API key for a specified identity
@@ -166,7 +159,6 @@ pub async fn create_api_key(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(create_req): Json<CreateApiKeyRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CreatedApiKeyResponse>>)> {
 	check_idp_enabled(&app, tn_id).await?;
@@ -212,13 +204,10 @@ pub async fn create_api_key(
 	.await?;
 
 	// Validate expiration if provided
-	if let Some(expires_timestamp) = create_req.expires_at {
-		let expiration = Timestamp(expires_timestamp);
-		if expiration.0 <= Timestamp::now().0 {
-			return Err(Error::ValidationError(
-				"Expiration time must be in the future".to_string(),
-			));
-		}
+	if let Some(expiration) = create_req.expires_at
+		&& expiration.0 <= Timestamp::now().0
+	{
+		return Err(Error::ValidationError("Expiration time must be in the future".to_string()));
 	}
 
 	// Create the API key with split id_tag components
@@ -226,7 +215,7 @@ pub async fn create_api_key(
 		id_tag_prefix: &id_tag_prefix,
 		id_tag_domain: &id_tag_domain,
 		name: create_req.name.as_deref(),
-		expires_at: create_req.expires_at.map(Timestamp),
+		expires_at: create_req.expires_at.map(Into::into),
 	};
 
 	let created = idp_adapter.create_api_key(opts).await.map_err(|e| {
@@ -239,10 +228,7 @@ pub async fn create_api_key(
 		plaintext_key: created.plaintext_key,
 	};
 
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(response_data);
 
 	Ok((StatusCode::CREATED, Json(response)))
 }
@@ -254,7 +240,6 @@ pub async fn list_api_keys(
 	tn_id: TnId,
 	Auth(auth): Auth,
 	Query(query_params): Query<ListApiKeysQuery>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<ApiKeyResponse>>>)> {
 	check_idp_enabled(&app, tn_id).await?;
 
@@ -283,24 +268,24 @@ pub async fn list_api_keys(
 
 	authorize_api_key_access(idp_adapter, &auth, id_tag, &id_tag_prefix, &id_tag_domain).await?;
 
+	let limit = query_params.limit.unwrap_or(20).clamp(1, 200);
+	let offset = CursorData::parse_offset(query_params.cursor.as_deref())?;
+	// One extra row tells whether another page exists.
 	let opts = ListApiKeyOptions {
 		id_tag_prefix: Some(id_tag_prefix),
 		id_tag_domain: Some(id_tag_domain),
-		limit: query_params.limit,
-		offset: query_params.offset,
+		limit: Some(limit + 1),
+		offset: Some(offset),
 	};
 
-	let keys = idp_adapter.list_api_keys(opts).await?;
+	let mut keys = idp_adapter.list_api_keys(opts).await?;
+	let has_more = keys.len() > limit as usize;
+	keys.truncate(limit as usize);
 
 	let response_data: Vec<ApiKeyResponse> = keys.into_iter().map(ApiKeyResponse::from).collect();
 
-	let total = response_data.len();
-	let offset = query_params.offset.unwrap_or(0) as usize;
-	let limit = query_params.limit.unwrap_or(20) as usize;
-	let mut response = ApiResponse::with_pagination(response_data, offset, limit, total);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let next = has_more.then(|| CursorData::offset(offset + limit));
+	let response = ApiResponse::with_next(response_data, next);
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -321,7 +306,6 @@ pub async fn get_api_key(
 	Auth(auth): Auth,
 	Path(api_key_id): Path<i32>,
 	Query(query): Query<ApiKeyIdTagQuery>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ApiKeyResponse>>)> {
 	check_idp_enabled(&app, tn_id).await?;
 
@@ -358,10 +342,7 @@ pub async fn get_api_key(
 	let key = keys.into_iter().find(|k| k.id == api_key_id).ok_or(Error::NotFound)?;
 
 	let response_data = ApiKeyResponse::from(key);
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(response_data);
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -374,8 +355,7 @@ pub async fn delete_api_key(
 	Auth(auth): Auth,
 	Path(api_key_id): Path<i32>,
 	Query(query): Query<ApiKeyIdTagQuery>,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	check_idp_enabled(&app, tn_id).await?;
 
 	// Get the tenant domain (IDP domain)
@@ -418,12 +398,7 @@ pub async fn delete_api_key(
 		return Err(Error::NotFound);
 	}
 
-	let mut response = ApiResponse::new(());
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
-
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

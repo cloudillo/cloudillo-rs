@@ -14,7 +14,7 @@ use axum::{
 use crate::prelude::*;
 use crate::settings::{BADGES_SETTING, MAX_SHOWN_BADGES};
 use cloudillo_core::IdTag;
-use cloudillo_core::extract::{OptionalAuth, OptionalRequestId};
+use cloudillo_core::extract::OptionalAuth;
 use cloudillo_core::profile_visibility::{RequesterTier, SectionVisibility};
 use cloudillo_types::badges::{badge_levels, read_badge_issuer};
 use cloudillo_types::meta_adapter::{self, ProfileType};
@@ -137,13 +137,11 @@ fn compute_etag(bytes: &[u8]) -> String {
 /// Serves a content-derived `ETag` from an in-memory `ProfileMeCache` so the
 /// frequent follower polls answer `304 Not Modified` without a meta-adapter
 /// read. The cache stores only the ETag; the `ProfileBase` body is rebuilt on
-/// every `200` and re-wrapped in a fresh `ApiResponse` carrying the current
-/// `reqId`. The ETag is computed over the serialized `ProfileBase`, so a `304`
+/// every `200` and re-wrapped in a fresh `ApiResponse`. The ETag is computed over the serialized `ProfileBase`, so a `304`
 /// is consistent with the body a `200` would have produced.
 pub async fn get_tenant_profile_base(
 	State(app): State<App>,
 	IdTag(id_tag): IdTag,
-	OptionalRequestId(req_id): OptionalRequestId,
 	headers: HeaderMap,
 ) -> ClResult<Response> {
 	// Read before any state the ETag is built from (keys included).
@@ -189,10 +187,7 @@ pub async fn get_tenant_profile_base(
 		return not_modified(&etag);
 	}
 
-	let mut response = ApiResponse::new(profile);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(profile);
 	let json = serde_json::to_vec(&response)?;
 	Response::builder()
 		.status(StatusCode::OK)
@@ -209,16 +204,12 @@ pub async fn get_tenant_profile_base(
 pub async fn get_tenant_app_domain(
 	State(app): State<App>,
 	IdTag(id_tag): IdTag,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<AppDomainRes>>)> {
 	let app_domain = match app.auth_adapter.read_cert_by_id_tag(&id_tag).await {
 		Ok(cert) => cert.domain.to_string(),
 		Err(_) => id_tag.to_string(),
 	};
-	let mut response = ApiResponse::new(AppDomainRes { app_domain });
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(AppDomainRes { app_domain });
 	Ok((StatusCode::OK, Json(response)))
 }
 
@@ -250,7 +241,8 @@ async fn active_badges(
 	let now = Timestamp::now();
 	let mut active: HashMap<String, meta_adapter::ActionView> = HashMap::new();
 	for a in app.meta_adapter.list_actions(tn_id, &opts).await? {
-		let (Some(slot), Some(exp)) = (a.sub_typ.as_deref(), a.expires_at) else {
+		let (Some(slot), Some(exp)) = (a.sub_typ.as_deref(), a.expires_at.map(Timestamp::from))
+		else {
 			continue;
 		};
 		if badge_levels(slot).is_none() || exp <= now {
@@ -281,7 +273,7 @@ async fn shown_badges(
 	let mut tokens = Vec::new();
 	let mut min_exp: Option<Timestamp> = None;
 	for a in pick_shown(&keys, active) {
-		let (Some(token), Some(exp)) = (a.token, a.expires_at) else {
+		let (Some(token), Some(exp)) = (a.token, a.expires_at.map(Timestamp::from)) else {
 			continue;
 		};
 		if read_badge_issuer(app.meta_adapter.as_ref(), tn_id, &a.issuer.id_tag)
@@ -407,7 +399,6 @@ pub async fn get_tenant_profile(
 	State(app): State<App>,
 	IdTag(id_tag): IdTag,
 	OptionalAuth(auth): OptionalAuth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	headers: HeaderMap,
 ) -> ClResult<Response> {
 	let auth_profile = app.auth_adapter.read_tenant(&id_tag).await?;
@@ -452,10 +443,7 @@ pub async fn get_tenant_profile(
 	let mut response = if if_none_match.map(unquote_etag) == Some(etag.as_str()) {
 		not_modified(&etag)?
 	} else {
-		let mut response = ApiResponse::new(profile);
-		if let Some(id) = req_id {
-			response = response.with_req_id(id);
-		}
+		let response = ApiResponse::new(profile);
 		let json = serde_json::to_vec(&response)?;
 		Response::builder()
 			.status(StatusCode::OK)

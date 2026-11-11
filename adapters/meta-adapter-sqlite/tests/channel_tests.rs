@@ -47,8 +47,8 @@ async fn setup() -> (MetaAdapterSqlite, TempDir) {
 				visibility: Some('P'),
 				min_role: Some("moderator".into()),
 				closed: false,
-				created_at: Timestamp::now(),
-				updated_at: Timestamp::now(),
+				created_at: Timestamp::now().into(),
+				updated_at: Timestamp::now().into(),
 			},
 		)
 		.await
@@ -222,8 +222,8 @@ fn ops_channel() -> Channel {
 		visibility: Some('P'),
 		min_role: Some("moderator".into()),
 		closed: false,
-		created_at: Timestamp::now(),
-		updated_at: Timestamp::now(),
+		created_at: Timestamp::now().into(),
+		updated_at: Timestamp::now().into(),
 	}
 }
 

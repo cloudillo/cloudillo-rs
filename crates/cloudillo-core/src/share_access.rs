@@ -126,7 +126,7 @@ fn grant_ceiling(access: AccessLevel, leader_over_local_row: bool) -> AccessLeve
 /// tenant's members' own content. Same boundary `file_access::get_access_level` draws for roles.
 fn leader_over_local_row(
 	roles: &[Box<str>],
-	upstream: Option<&cloudillo_types::meta_adapter::ProfileInfo>,
+	upstream: Option<&cloudillo_types::meta_adapter::ProfileRef>,
 ) -> bool {
 	crate::roles::is_leader(roles) && upstream.is_none()
 }
@@ -214,7 +214,8 @@ pub async fn share_standing_for_actor(
 	share_standing(app, tn_id, file_id, &auth, tenant_id_tag).await
 }
 
-/// A share manager may not hand out more access than [`ShareAuthority::grant_ceiling`] allows.
+/// A share manager may not hand out more access than [`ShareAuthority::grant_ceiling`] allows
+/// (403 `E-FILE-ACCESSLEVEL`).
 ///
 /// Manager standing is not Write-derived (a `Read`-level leader qualifies), and
 /// `file_access::get_access_level` returns a share-link scope's level uncapped by the
@@ -236,7 +237,7 @@ pub fn ensure_grant_within(
 		own = %own.as_str(),
 		"Share grant denied - a manager may not hand out more access than they hold"
 	);
-	Err(Error::PermissionDenied)
+	Err(Error::FileAccessLevel)
 }
 
 /// Enforce a minimum standing, with the denial log every call site wants.
@@ -382,7 +383,7 @@ mod tests {
 
 		assert!(matches!(
 			ensure_grant_within(W, AccessLevel::Read, MEMBER, "f1~test"),
-			Err(Error::PermissionDenied)
+			Err(Error::FileAccessLevel)
 		));
 	}
 
@@ -414,9 +415,9 @@ mod tests {
 	/// mirrored row, and the only one worth pinning here.
 	#[test]
 	fn leadership_extends_over_local_rows_only() {
-		use cloudillo_types::meta_adapter::{ProfileInfo, ProfileType};
+		use cloudillo_types::meta_adapter::{ProfileRef, ProfileType};
 
-		let upstream = ProfileInfo {
+		let upstream = ProfileRef {
 			id_tag: "bob.example.com".into(),
 			name: "Bob".into(),
 			typ: ProfileType::Person,

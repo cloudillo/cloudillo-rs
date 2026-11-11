@@ -5,14 +5,20 @@
 //!
 //! The bus protocol (`/ws/bus`) provides direct user-to-user messaging.
 //!
-//! Message Format:
+//! Frame format, shared with `/ws/rtdb`:
 //! ```json
-//! {
-//!   "id": "msg-123",
-//!   "cmd": "ACTION|presence|typing|...",
-//!   "data": { ... }
-//! }
+//! { "id": "msg-123", "type": "action", "data": { ... } }
 //! ```
+//!
+//! Server-pushed `type` values: `action`, `notification`, `fileIdGenerated`
+//! (`{contentId, tempId}`), `dbMaintenanceDone`, `searchReindexDone`, and `ack`
+//! (`{status}`) in answer to every client frame (`ping` answers `{status: "pong"}`).
+//!
+//! Close codes, sent by the upgrade handlers in `cloudillo::websocket` for every WS
+//! endpoint (`/ws/bus`, `/ws/rtdb`, `/ws/crdt`): 4401 unauthenticated, 4403 forbidden
+//! (no access, or write requested without write access), 4404 file not found. The file
+//! endpoints also use 4400 (invalid store id), 4409 (store type mismatch) and 4500
+//! (internal error).
 
 use crate::prelude::*;
 use axum::extract::ws::{Message, WebSocket};
@@ -29,7 +35,8 @@ pub struct BusMessage {
 	/// Unique message ID
 	pub id: String,
 
-	/// Command type (ACTION, presence, typing, etc.)
+	/// Frame type (camelCase: `action`, `notification`, `ack`, ...); `type` on the wire
+	#[serde(rename = "type")]
 	pub cmd: String,
 
 	/// Command data

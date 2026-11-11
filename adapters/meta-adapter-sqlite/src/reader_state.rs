@@ -11,8 +11,8 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, sqlite::SqliteRow};
 use crate::utils::Db;
 use crate::{action, profile};
 use cloudillo_types::meta_adapter::{ListReaderStateOptions, PatchReaderState, ReaderState};
-use cloudillo_types::prelude::*;
 use cloudillo_types::utils::normalize_id_tag;
+use cloudillo_types::{prelude::*, types::ApiTime};
 
 /// Columns of the `reader_state` table aliased `$t`, each selected as `<$t>_<col>`, as read
 /// by [`parse_row`] — safe next to other tables' `flags`/`created_at` in a LEFT JOIN. An
@@ -68,8 +68,8 @@ fn norm_ref<'a>(kind: &str, ref_: &'a str) -> Cow<'a, str> {
 /// (a LEFT JOIN miss: `<t>_kind` is NULL).
 pub(crate) fn parse_row(row: &SqliteRow, t: &str) -> Result<Option<ReaderState>, sqlx::Error> {
 	let col = |name: &str| format!("{t}_{name}");
-	let ts = |name: &str| -> Result<Option<Timestamp>, sqlx::Error> {
-		Ok(row.try_get::<Option<i64>, _>(col(name).as_str())?.map(Timestamp))
+	let ts = |name: &str| -> Result<Option<ApiTime>, sqlx::Error> {
+		Ok(row.try_get::<Option<i64>, _>(col(name).as_str())?.map(ApiTime))
 	};
 	let Some(kind) = row.try_get::<Option<String>, _>(col("kind").as_str())? else {
 		return Ok(None);
@@ -92,8 +92,8 @@ pub(crate) fn parse_row(row: &SqliteRow, t: &str) -> Result<Option<ReaderState>,
 		archived: flag('A'),
 		ignore_all: flag('I'),
 		unread_flag: flag('U'),
-		created_at: Timestamp(row.try_get(col("created_at").as_str())?),
-		updated_at: Timestamp(row.try_get(col("updated_at").as_str())?),
+		created_at: ApiTime(row.try_get(col("created_at").as_str())?),
+		updated_at: ApiTime(row.try_get(col("updated_at").as_str())?),
 		profile: None,
 		action: None,
 		last: None,

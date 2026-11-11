@@ -10,15 +10,15 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use cloudillo_core::extract::Auth;
+use cloudillo_core::settings::SettingValue;
 use cloudillo_email::{EmailModule, EmailTaskParams, get_tenant_lang};
 use cloudillo_ref::service::{CreateRefInternalParams, create_ref_internal};
 use cloudillo_types::auth_adapter::{AuthCtx, ListTenantsOptions};
-use cloudillo_types::meta_adapter::{ListTenantsMetaOptions, ProfileType};
-use cloudillo_types::types::ApiResponse;
+use cloudillo_types::meta_adapter::ProfileType;
+use cloudillo_types::types::{ApiResponse, ApiTime, CursorData};
 
 use crate::prelude::*;
 
@@ -33,32 +33,83 @@ pub struct TenantView {
 	#[serde(rename = "type")]
 	pub typ: ProfileType,
 	pub email: Option<String>,
+	/// `active` | `suspended` | `purging` (`api_enums::tenant_status`).
+	#[serde(with = "cloudillo_types::api_enums::tenant_status::opt_text")]
 	pub status: Option<String>,
 	pub roles: Option<Vec<String>>,
 	pub profile_pic: Option<String>,
-	/// Unix seconds; set while the tenant is suspended by an admin
-	pub suspended_at: Option<i64>,
-	/// Unix seconds; login is refused once reached
-	pub expires_at: Option<i64>,
-	pub created_at: i64,
+	/// Set while the tenant is suspended by an admin
+	pub suspended_at: Option<ApiTime>,
+	/// Login is refused once reached
+	pub expires_at: Option<ApiTime>,
+	pub created_at: ApiTime,
 	/// Bytes in the tenant's own blob store (`MetaAdapter::get_storage_usage`), the figure
 	/// `limits.max_storage_gb` is checked against.
 	pub storage_used: u64,
+	/// Effective storage quota in bytes: `limits.max_storage_gb` (tenant row, else the
+	/// global default) × 2^30.
+	pub storage_quota: u64,
+	/// The tenant's own `limits.max_storage_gb` row in bytes; absent when the tenant
+	/// resolves through the global default.
+	pub storage_quota_override: Option<u64>,
+}
+
+/// Setting the storage quota is stored in: whole GiB, `cloudillo-file/src/settings.rs`.
+const STORAGE_QUOTA_KEY: &str = "limits.max_storage_gb";
+const GIB: u64 = 1 << 30;
+
+/// `(effective, override)` storage quota of a tenant, in bytes.
+async fn storage_quota(app: &App, tn_id: TnId) -> ClResult<(u64, Option<u64>)> {
+	let gib_to_bytes = |gib: i64| u64::try_from(gib).unwrap_or(0).saturating_mul(GIB);
+	let effective = gib_to_bytes(app.settings.get_int(tn_id, STORAGE_QUOTA_KEY).await?);
+	let over = match app.settings.get_raw(tn_id, STORAGE_QUOTA_KEY).await? {
+		Some(SettingValue::Int(gib)) => Some(gib_to_bytes(gib)),
+		_ => None,
+	};
+	Ok((effective, over))
 }
 
 /// Query parameters for listing tenants
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListTenantsQuery {
+	/// Status word, converted to the stored char for the adapter.
+	#[serde(default, with = "cloudillo_types::api_enums::tenant_status::opt_text")]
 	pub status: Option<String>,
 	pub q: Option<String>,
+	/// Page size: default 50, max 200
 	pub limit: Option<u32>,
-	pub offset: Option<u32>,
+	/// Opaque cursor: the previous page's `next`
+	pub cursor: Option<String>,
 }
 
 /// Response for password reset
 #[derive(Debug, Serialize)]
 pub struct PasswordResetResponse {
 	pub message: String,
+}
+
+/// One tenant's [`TenantView`], the same merge of auth + meta data `list_tenants` does per row.
+async fn read_tenant_view(app: &App, id_tag: &str) -> ClResult<TenantView> {
+	let auth = app.auth_adapter.read_tenant(id_tag).await?;
+	let meta = app.meta_adapter.read_tenant(auth.tn_id).await?;
+	let (storage_quota, storage_quota_override) = storage_quota(app, auth.tn_id).await?;
+	Ok(TenantView {
+		tn_id: auth.tn_id.0,
+		id_tag: auth.id_tag.to_string(),
+		name: meta.name.to_string(),
+		typ: meta.typ,
+		email: auth.email.map(|e| e.to_string()),
+		status: auth.status.map(|s| s.to_string()),
+		roles: auth.roles.map(|r| r.iter().map(ToString::to_string).collect()),
+		profile_pic: meta.profile_pic.map(|p| p.to_string()),
+		suspended_at: auth.suspended_at.map(|t| ApiTime(t.0)),
+		expires_at: auth.expires_at.map(|t| ApiTime(t.0)),
+		created_at: ApiTime(meta.created_at.0),
+		storage_used: app.meta_adapter.get_storage_usage(auth.tn_id).await?,
+		storage_quota,
+		storage_quota_override,
+	})
 }
 
 /// GET /api/admin/tenants - List all tenants (combines auth + meta data)
@@ -71,65 +122,65 @@ pub async fn list_tenants(
 		status = ?query.status,
 		q = ?query.q,
 		limit = ?query.limit,
-		offset = ?query.offset,
 		"GET /api/admin/tenants - Listing tenants"
 	);
+	let limit = query.limit.unwrap_or(50).clamp(1, 200);
+	let offset = CursorData::parse_offset(query.cursor.as_deref())?;
 
-	// Get auth data (email, roles, status)
+	// Get auth data (email, roles, status); one extra row tells whether another page exists
 	let auth_opts = ListTenantsOptions {
 		status: query.status.as_deref(),
 		q: query.q.as_deref(),
-		limit: query.limit,
-		offset: query.offset,
+		limit: Some(limit + 1),
+		offset: Some(offset),
 	};
-	let auth_tenants = app.auth_adapter.list_tenants(&auth_opts).await?;
+	let mut auth_tenants = app.auth_adapter.list_tenants(&auth_opts).await?;
+	let has_more = auth_tenants.len() > limit as usize;
+	auth_tenants.truncate(limit as usize);
 
-	// Get meta data (name, profile_pic, type)
-	let meta_opts = ListTenantsMetaOptions { limit: query.limit, offset: query.offset };
-	let meta_tenants = app.meta_adapter.list_tenants(&meta_opts).await?;
-
-	// Create a map from tn_id to meta data for quick lookup
-	let meta_map: HashMap<u32, _> = meta_tenants.into_iter().map(|t| (t.tn_id.0, t)).collect();
-
-	// Combine auth and meta data
-	let mut tenants: Vec<TenantView> = auth_tenants
-		.into_iter()
-		.map(|auth| {
-			let meta = meta_map.get(&auth.tn_id.0);
-			// Prefer meta's created_at as it's more reliably populated
-			// Fall back to auth's created_at if meta is unavailable
-			let created_at =
-				meta.map(|m| m.created_at.0).filter(|&ts| ts > 0).unwrap_or(auth.created_at.0);
-			TenantView {
-				tn_id: auth.tn_id.0,
-				id_tag: auth.id_tag.to_string(),
-				name: meta.map_or_else(|| auth.id_tag.to_string(), |m| m.name.to_string()),
-				typ: meta.map_or(ProfileType::Person, |m| m.typ),
-				email: auth.email.map(|e| e.to_string()),
-				status: auth.status.map(|s| s.to_string()),
-				roles: auth.roles.map(|r| r.iter().map(ToString::to_string).collect()),
-				profile_pic: meta.and_then(|m| m.profile_pic.as_ref().map(ToString::to_string)),
-				suspended_at: auth.suspended_at.map(|t| t.0),
-				expires_at: auth.expires_at.map(|t| t.0),
-				created_at,
-				storage_used: 0,
-			}
-		})
-		.collect();
-	// One usage query per row; acceptable on a paginated admin list.
-	for t in &mut tenants {
-		t.storage_used = app.meta_adapter.get_storage_usage(TnId(t.tn_id)).await?;
+	// Meta data (name, profile_pic, type) read per row by tn_id, never paged separately: the
+	// two adapters order and filter their tenant lists differently. One meta, usage and quota
+	// lookup per row; acceptable on a paginated admin list.
+	let mut tenants = Vec::with_capacity(auth_tenants.len());
+	for auth in auth_tenants {
+		let tn_id = auth.tn_id;
+		let meta = match app.meta_adapter.read_tenant(tn_id).await {
+			Ok(m) => Some(m),
+			Err(Error::NotFound) => None,
+			Err(e) => return Err(e),
+		};
+		// Prefer meta's created_at (more reliably populated); else auth's.
+		let created_at = meta
+			.as_ref()
+			.map(|m| m.created_at.0)
+			.filter(|&ts| ts > 0)
+			.unwrap_or(auth.created_at.0);
+		let (storage_quota, storage_quota_override) = storage_quota(&app, tn_id).await?;
+		tenants.push(TenantView {
+			tn_id: tn_id.0,
+			name: meta.as_ref().map_or_else(|| auth.id_tag.to_string(), |m| m.name.to_string()),
+			typ: meta.as_ref().map_or(ProfileType::Person, |m| m.typ),
+			profile_pic: meta.and_then(|m| m.profile_pic.map(|p| p.to_string())),
+			id_tag: auth.id_tag.to_string(),
+			email: auth.email.map(|e| e.to_string()),
+			status: auth.status.map(|s| s.to_string()),
+			roles: auth.roles.map(|r| r.iter().map(ToString::to_string).collect()),
+			suspended_at: auth.suspended_at.map(|t| ApiTime(t.0)),
+			expires_at: auth.expires_at.map(|t| ApiTime(t.0)),
+			created_at: ApiTime(created_at),
+			storage_used: app.meta_adapter.get_storage_usage(tn_id).await?,
+			storage_quota,
+			storage_quota_override,
+		});
 	}
 
-	let total = app.auth_adapter.count_tenants(&auth_opts).await?;
-	let offset = query.offset.unwrap_or(0) as usize;
-	let limit = query.limit.map_or(total, |l| l as usize);
-	let response = ApiResponse::with_pagination(tenants, offset, limit, total);
+	let next = has_more.then(|| CursorData::offset(offset + limit));
+	let response = ApiResponse::with_next(tenants, next);
 
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// POST /api/admin/tenants/{id_tag}/mfa-reset - Remove the tenant's TOTP second factor
+/// POST /api/admin/tenants/{idTag}/mfa/reset - Remove the tenant's TOTP second factor
 /// (lost authenticator). The next password login re-enrolls if `auth.mfa = required`.
 #[axum::debug_handler]
 pub async fn reset_mfa(
@@ -154,7 +205,7 @@ pub async fn reset_mfa(
 	Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /api/admin/tenants/{id_tag}/keys/rotate - New active signing key for the tenant;
+/// POST /api/admin/tenants/{idTag}/signing-keys/rotations - New active signing key for the tenant;
 /// the previous active keys become verify-only.
 #[axum::debug_handler]
 pub async fn rotate_key(
@@ -179,7 +230,7 @@ pub async fn rotate_key(
 	Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /api/admin/tenants/{id_tag}/keys/{key_id}/revoke - Stop publishing a signing key
+/// POST /api/admin/tenants/{idTag}/signing-keys/{keyId}/revoke - Stop publishing a signing key
 /// (refused with 409 for the tenant's only active key).
 #[axum::debug_handler]
 pub async fn revoke_key(
@@ -204,7 +255,7 @@ pub async fn revoke_key(
 	Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /api/admin/tenants/{id_tag}/suspend - Refuse every new login / API-key exchange.
+/// POST /api/admin/tenants/{idTag}/suspend - Refuse every new login / API-key exchange.
 /// Already issued access tokens are not revoked; they run out within an hour.
 #[axum::debug_handler]
 pub async fn suspend_tenant(
@@ -216,7 +267,7 @@ pub async fn suspend_tenant(
 	set_suspended(&app, &addr, &auth_ctx, &id_tag, true).await
 }
 
-/// POST /api/admin/tenants/{id_tag}/resume - Lift a suspension and clear the expiry date.
+/// POST /api/admin/tenants/{idTag}/resume - Lift a suspension and clear the expiry date.
 #[axum::debug_handler]
 pub async fn resume_tenant(
 	State(app): State<App>,
@@ -259,13 +310,18 @@ async fn set_suspended(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PatchTenantBody {
-	/// Unix seconds or ISO 8601; `null` clears the expiry. Required: `{}` is refused, not
-	/// read as a clear.
+	/// RFC3339; `null` clears the expiry.
 	#[serde(default)]
-	pub expires_at: Patch<Timestamp>,
+	pub expires_at: Patch<ApiTime>,
+	/// Bytes, rounded **up** to whole GiB and stored as the tenant's
+	/// `limits.max_storage_gb` row; `null` clears the row (back to the global default).
+	#[serde(default)]
+	pub storage_quota_override: Patch<u64>,
 }
 
-/// PATCH /api/admin/tenants/{id_tag} - Set or clear the account expiry date
+/// PATCH /api/admin/tenants/{idTag} - Set or clear the account expiry date and/or the
+/// storage quota override; at least one field is required (`{}` is a 400). 200 + the
+/// updated [`TenantView`]
 #[axum::debug_handler]
 pub async fn patch_tenant(
 	State(app): State<App>,
@@ -273,33 +329,73 @@ pub async fn patch_tenant(
 	Auth(auth_ctx): Auth,
 	Path(id_tag): Path<String>,
 	Json(body): Json<PatchTenantBody>,
-) -> ClResult<StatusCode> {
-	let expires_at = match body.expires_at {
-		Patch::Undefined => return Err(Error::ValidationError("expiresAt is required".into())),
-		Patch::Null => None,
-		Patch::Value(t) => Some(t),
-	};
+) -> ClResult<(StatusCode, Json<ApiResponse<TenantView>>)> {
+	if body.expires_at.is_undefined() && body.storage_quota_override.is_undefined() {
+		return Err(Error::ValidationError("expiresAt or storageQuotaOverride is required".into()));
+	}
 	let tn_id = app.auth_adapter.read_tn_id(&id_tag).await?;
+
+	// Validate everything before the first write, so a 400 leaves the tenant unchanged.
+	let expires_at = match body.expires_at {
+		Patch::Undefined => None,
+		Patch::Null => Some(None),
+		Patch::Value(t) => Some(Some(Timestamp::from(t))),
+	};
 	// Clearing your own expiry stays allowed; setting one could lock you out
-	if expires_at.is_some() && tn_id == auth_ctx.tn_id {
+	if matches!(expires_at, Some(Some(_))) && tn_id == auth_ctx.tn_id {
 		return Err(Error::ValidationError("cannot set an expiry on your own account".into()));
 	}
-	app.auth_adapter.set_tenant_expiry(tn_id, expires_at).await?;
-	crate::audit::record_admin(
-		&app,
-		"admin.tenant.expiry",
-		"success",
-		Some(tn_id),
-		&auth_ctx.id_tag,
-		&addr,
-		serde_json::json!({ "idTag": id_tag, "expiresAt": expires_at.map(|t| t.0) }),
-	)
-	.await;
-	info!(tn_id = ?tn_id, id_tag = %id_tag, expires_at = ?expires_at, "tenant expiry set");
-	Ok(StatusCode::NO_CONTENT)
+	let gib = match body.storage_quota_override {
+		Patch::Undefined => None,
+		Patch::Null => Some(None),
+		Patch::Value(bytes) => Some(Some(
+			i64::try_from(bytes.div_ceil(GIB))
+				.map_err(|_| Error::ValidationError("storageQuotaOverride too large".into()))?,
+		)),
+	};
+
+	if let Some(expires_at) = expires_at {
+		app.auth_adapter.set_tenant_expiry(tn_id, expires_at).await?;
+		crate::audit::record_admin(
+			&app,
+			"admin.tenant.expiry",
+			"success",
+			Some(tn_id),
+			&auth_ctx.id_tag,
+			&addr,
+			serde_json::json!({ "idTag": id_tag, "expiresAt": expires_at.map(|t| t.0) }),
+		)
+		.await;
+		info!(tn_id = ?tn_id, id_tag = %id_tag, expires_at = ?expires_at, "tenant expiry set");
+	}
+
+	if let Some(gib) = gib {
+		match gib {
+			Some(gib) => {
+				app.settings
+					.set(tn_id, STORAGE_QUOTA_KEY, SettingValue::Int(gib), &auth_ctx.roles)
+					.await?;
+			}
+			None => app.settings.clear(tn_id, STORAGE_QUOTA_KEY, &auth_ctx.roles).await?,
+		}
+		crate::audit::record_admin(
+			&app,
+			"admin.tenant.quota",
+			"success",
+			Some(tn_id),
+			&auth_ctx.id_tag,
+			&addr,
+			serde_json::json!({ "idTag": id_tag, "maxStorageGb": gib }),
+		)
+		.await;
+		info!(tn_id = ?tn_id, id_tag = %id_tag, max_storage_gb = ?gib, "tenant storage quota set");
+	}
+
+	let view = read_tenant_view(&app, &id_tag).await?;
+	Ok((StatusCode::OK, Json(ApiResponse::new(view))))
 }
 
-/// POST /api/admin/tenants/{id_tag}/password-reset - Send password reset email
+/// POST /api/admin/tenants/{idTag}/password/reset - Send password reset email
 #[axum::debug_handler]
 pub async fn send_password_reset(
 	State(app): State<App>,
@@ -309,7 +405,7 @@ pub async fn send_password_reset(
 ) -> ClResult<(StatusCode, Json<ApiResponse<PasswordResetResponse>>)> {
 	info!(
 		id_tag = %id_tag,
-		"POST /api/admin/tenants/:id_tag/password-reset - Sending password reset email"
+		"POST /api/admin/tenants/{{idTag}}/password/reset - Sending password reset email"
 	);
 
 	// Get the tenant's tn_id
@@ -333,14 +429,14 @@ pub async fn send_password_reset(
 	let tenant = app.meta_adapter.read_tenant(tn_id).await?;
 	let user_name = tenant.name.to_string();
 
-	// Create password reset ref with type "password" (compatible with /auth/set-password)
+	// Create password reset ref with type "password" (compatible with /auth/password/set)
 	let expires_at = Some(Timestamp(Timestamp::now().0 + 86400)); // 24 hours
 	let (_ref_id, reset_url) = create_ref_internal(
 		&app,
 		tn_id,
 		CreateRefInternalParams {
 			id_tag: &id_tag,
-			typ: "password", // CRITICAL: must be "password" for /auth/set-password to accept it
+			typ: "password", // CRITICAL: must be "password" for /auth/password/set to accept it
 			description: Some("Admin-initiated password reset"),
 			expires_at,
 			path_prefix: "/reset-password", // Frontend route (must match AuthRoutes in shell)
@@ -417,7 +513,7 @@ pub struct PurgeReport {
 /// **Phase B (destructive cleanup):** blobs → CRDT docs → RTDB → meta DB
 /// cascade → auth DB cascade. Each step hard-fails on error, so a mid-purge
 /// failure leaves the tenant in the soft-deleted state. A subsequent
-/// `POST /api/admin/tenants/{id_tag}/purge` finds the soft-deleted row,
+/// `POST /api/admin/tenants/{idTag}/purge` finds the soft-deleted row,
 /// re-applies phase A (no-op) and re-runs phase B from the failed step.
 /// Steps 2–5 are idempotent against partially-purged state (blob/CRDT/RTDB
 /// return success on missing data; meta/auth cascade DELETEs ignore absent
@@ -494,7 +590,7 @@ pub struct PurgeTenantResponse {
 	pub id_tag: String,
 }
 
-/// POST /api/admin/tenants/{id_tag}/purge - Immediately and irreversibly delete a tenant.
+/// POST /api/admin/tenants/{idTag}/purge - Immediately and irreversibly delete a tenant.
 ///
 /// The endpoint is idempotent: if a previous call failed mid-cascade, the
 /// tenant is left in `status='X'` (purging) and a retry resumes destructive

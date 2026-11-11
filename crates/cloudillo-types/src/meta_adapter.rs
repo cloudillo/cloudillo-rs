@@ -29,10 +29,7 @@ use std::{
 	fmt::Debug,
 };
 
-use crate::{
-	prelude::*,
-	types::{serialize_timestamp_iso, serialize_timestamp_iso_opt},
-};
+use crate::{prelude::*, types::ApiTime};
 
 // Tenants, profiles
 //*******************
@@ -55,22 +52,33 @@ impl ProfileType {
 	}
 }
 
+/// Stored as one char (`profiles.status`, mapped by hand in the SQLite adapter); the serde
+/// form is the REST wire word, the same as [`ProfileStatus::as_str`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum ProfileStatus {
-	#[serde(rename = "A")]
 	Active,
-	#[serde(rename = "B")]
 	Blocked,
-	#[serde(rename = "M")]
 	Muted,
-	#[serde(rename = "S")]
 	Suspended,
-	#[serde(rename = "X")]
 	Banned,
 }
 
 impl ProfileStatus {
-	/// Lowercase string form for JSON DTO exposure to the frontend.
+	pub const ALL: [ProfileStatus; 5] = [
+		ProfileStatus::Active,
+		ProfileStatus::Blocked,
+		ProfileStatus::Muted,
+		ProfileStatus::Suspended,
+		ProfileStatus::Banned,
+	];
+
+	/// Inverse of [`Self::as_str`] (query filters).
+	pub fn from_word(w: &str) -> Option<Self> {
+		Self::ALL.into_iter().find(|s| s.as_str() == w)
+	}
+
+	/// Lowercase wire word (the serde form).
 	pub fn as_str(&self) -> &'static str {
 		match self {
 			ProfileStatus::Active => "active",
@@ -142,7 +150,7 @@ pub const REGISTER_REF_TYPE: &str = "register";
 pub const PROFILE_INVITE_REF_TYPE: &str = "profile.invite";
 /// Password-reset capability against one tenant *account*.
 pub const PASSWORD_REF_TYPE: &str = "password";
-/// First-login capability; `POST /api/auth/set-password` accepts it exactly like `password`.
+/// First-login capability; `POST /api/auth/password/set` accepts it exactly like `password`.
 pub const WELCOME_REF_TYPE: &str = "welcome";
 /// Activates an identity at the IdP — power over the tenant account, not over its membership.
 pub const IDP_ACTIVATION_REF_TYPE: &str = "idp.activation";
@@ -154,10 +162,8 @@ pub struct RefData {
 	pub ref_id: Box<str>,
 	pub r#type: Box<str>,
 	pub description: Option<Box<str>>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
-	pub expires_at: Option<Timestamp>,
+	pub created_at: ApiTime,
+	pub expires_at: Option<ApiTime>,
 	/// Usage count: None = unlimited, Some(n) = n uses remaining
 	pub count: Option<u32>,
 	/// Resource ID for share links (e.g., file_id for share.file type)
@@ -169,11 +175,16 @@ pub struct RefData {
 	pub params: Option<Box<str>>,
 }
 
+#[derive(Default)]
 pub struct ListRefsOptions {
 	pub typ: Option<String>,
 	pub filter: Option<String>, // 'active', 'used', 'expired', 'all'
 	/// Filter by resource_id (for listing share links for a specific resource)
 	pub resource_id: Option<String>,
+	/// Page size; `None` = every row (internal callers that must see all of them)
+	pub limit: Option<u32>,
+	/// Keyset cursor: only refs sorting after this `ref_id` in `(created_at, ref_id)` DESC order
+	pub after: Option<String>,
 }
 
 #[derive(Default)]
@@ -219,8 +230,7 @@ pub struct Tenant<S: AsRef<str>> {
 	pub typ: ProfileType,
 	pub profile_pic: Option<S>,
 	pub cover_pic: Option<S>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
+	pub created_at: ApiTime,
 	/// Presence: stamped when the tenant's last ws-bus connection closes.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub last_seen_at: Option<Timestamp>,
@@ -254,8 +264,7 @@ pub struct TenantListMeta {
 	#[serde(rename = "type")]
 	pub typ: ProfileType,
 	pub profile_pic: Option<Box<str>>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
+	pub created_at: ApiTime,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -332,32 +341,27 @@ pub struct ReaderState {
 	#[serde(rename = "ref")]
 	pub ref_: Box<str>,
 	/// Read watermark, forward-only.
-	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
-	pub read_at: Option<Timestamp>,
+	pub read_at: Option<ApiTime>,
 	/// Latest activity on the ref, forward-only.
-	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
-	pub last_at: Option<Timestamp>,
+	pub last_at: Option<ApiTime>,
 	pub last_id: Option<Box<str>>,
 	/// Recomputed count of unread items; `None` = not maintained for this kind.
 	/// Excludes `unread_flag` (the client shows ≥ 1 when that is set).
 	pub unread: Option<i64>,
 	/// `@` badge shows while `mentioned_at > read_at`.
-	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
-	pub mentioned_at: Option<Timestamp>,
-	/// `W` all / `T` relevant / `M` none; `None` = the kind's default. An expired
-	/// `notify_until` already reads as `None` here.
+	pub mentioned_at: Option<ApiTime>,
+	/// Stored `W` / `T` / `M`, wire `all` / `mentions` / `none` (`api_enums::notify`);
+	/// `None` = the kind's default. An expired `notify_until` already reads as `None` here.
+	#[serde(with = "crate::api_enums::notify::opt")]
 	pub notify: Option<char>,
-	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
-	pub notify_until: Option<Timestamp>,
+	pub notify_until: Option<ApiTime>,
 	pub pinned: bool,
 	pub archived: bool,
 	pub ignore_all: bool,
 	/// Manual mark-unread; cleared when `read_at` advances.
 	pub unread_flag: bool,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub updated_at: Timestamp,
+	pub created_at: ApiTime,
+	pub updated_at: ApiTime,
 	/// `include_ref` embed for `P:*` rows (local profile row). The wire form is built
 	/// from it by the handler.
 	#[serde(skip)]
@@ -384,8 +388,8 @@ pub struct PatchReaderState {
 	pub ignore_all: Patch<bool>,
 	#[serde(default)]
 	pub unread_flag: Patch<bool>,
-	/// `W` | `T` | `M` (other values → `ValidationError`).
-	#[serde(default)]
+	/// `all` | `mentions` | `none` → stored `W` | `T` | `M`; `null` clears (other words → error).
+	#[serde(default, deserialize_with = "crate::api_enums::notify::patch_nullable::deserialize")]
 	pub notify: Patch<char>,
 	#[serde(default)]
 	pub notify_until: Patch<Timestamp>,
@@ -468,8 +472,7 @@ pub struct ProfileData {
 	/// Federation lifecycle: "active" | "trusted" | "suspended" | "blocked" | "muted" | "banned"
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub status: Option<Box<str>>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
+	pub created_at: ApiTime,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -671,7 +674,8 @@ pub struct FinalizeActionOptions<'a> {
 	pub key: Option<&'a str>,
 }
 
-fn deserialize_split<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+/// The one comma-list query deserializer: `a, b,,c` → `["a","b","c"]`; empty → `None`.
+pub fn deserialize_split<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
 	D: serde::Deserializer<'de>,
 {
@@ -681,9 +685,14 @@ where
 	if values.is_empty() { Ok(None) } else { Ok(Some(values)) }
 }
 
-/// Query-string timestamp: unix seconds or RFC 3339. `Timestamp`'s own `Deserialize` cannot
-/// take unix seconds here, since `serde_urlencoded` hands every value over as a string.
-fn deserialize_query_timestamp<'de, D>(deserializer: D) -> Result<Option<Timestamp>, D::Error>
+/// Whether an `include=a,b` expansion list (parsed by [`deserialize_split`]) names `word`.
+/// Unknown words are ignored.
+pub fn includes(include: Option<&[String]>, word: &str) -> bool {
+	include.is_some_and(|list| list.iter().any(|w| w == word))
+}
+
+/// Query-string time filter: RFC 3339 only (the `ApiTime` wire form); empty = no filter.
+fn deserialize_query_time<'de, D>(deserializer: D) -> Result<Option<ApiTime>, D::Error>
 where
 	D: serde::Deserializer<'de>,
 {
@@ -692,12 +701,9 @@ where
 	if s.is_empty() {
 		return Ok(None);
 	}
-	if let Ok(secs) = s.parse::<i64>() {
-		return Ok(Some(Timestamp(secs)));
-	}
 	chrono::DateTime::parse_from_rfc3339(s)
-		.map(|dt| Some(Timestamp(dt.timestamp())))
-		.map_err(|_| serde::de::Error::custom("expected unix seconds or an RFC 3339 timestamp"))
+		.map(|dt| Some(ApiTime(dt.timestamp())))
+		.map_err(|_| serde::de::Error::custom("expected an RFC 3339 timestamp"))
 }
 
 /// Audience filter axis: classify actions by the **type of the effective wall
@@ -725,7 +731,7 @@ pub const HIDDEN_ACTION_STATUSES: [&str; 3] = ["D", "V", "F"];
 
 /// Options for listing actions
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ListActionOptions {
 	/// Maximum number of items to return (default: 20)
 	pub limit: Option<u32>,
@@ -740,16 +746,23 @@ pub struct ListActionOptions {
 	pub sort_dir: Option<String>,
 	#[serde(default, rename = "type", deserialize_with = "deserialize_split")]
 	pub typ: Option<Vec<String>>,
-	#[serde(default, deserialize_with = "deserialize_split")]
+	/// Status words (`api_enums::action_status`), converted to the stored chars.
+	#[serde(default, deserialize_with = "crate::api_enums::action_status::list::deserialize")]
 	pub status: Option<Vec<String>>,
 	pub tag: Option<String>,
+	/// Free-text search (wire `q`).
+	#[serde(rename = "q")]
 	pub search: Option<String>,
-	#[serde(default, deserialize_with = "deserialize_split")]
+	/// Visibility words (`api_enums::visibility`, `direct` excluded), converted to chars.
+	#[serde(default, deserialize_with = "crate::api_enums::visibility::list::deserialize")]
 	pub visibility: Option<Vec<String>>,
+	#[serde(rename = "issuerIdTag")]
 	pub issuer: Option<String>,
+	#[serde(rename = "audienceIdTag")]
 	pub audience: Option<String>,
 	#[serde(rename = "audienceType")]
 	pub audience_type: Option<AudienceType>,
+	#[serde(rename = "involvedIdTag")]
 	pub involved: Option<String>,
 	/// The authenticated user's id_tag (set by handler, not from query params)
 	#[serde(skip)]
@@ -765,26 +778,30 @@ pub struct ListActionOptions {
 	pub container: Option<String>,
 	#[serde(default, deserialize_with = "deserialize_split")]
 	pub subject: Option<Vec<String>>,
-	#[serde(rename = "createdAfter")]
-	pub created_after: Option<Timestamp>,
-	#[serde(rename = "createdBefore")]
-	pub created_before: Option<Timestamp>,
+	#[serde(default, deserialize_with = "deserialize_query_time")]
+	pub created_after: Option<ApiTime>,
+	#[serde(default, deserialize_with = "deserialize_query_time")]
+	pub created_before: Option<ApiTime>,
 	/// HTTP boolean flag: when true, return only actions that carry attachments
 	/// (the Messages "Media & files" tab).
 	pub attachments: Option<bool>,
 	/// HTTP boolean flag: when true, return only rows the viewer is subscribed
 	/// to: its `reader_state` row (`A:<type>`) has `notify` W or T, not expired.
 	pub subscribed: Option<bool>,
+	/// Expansions, `include=tokens,subject` (sets `include_tokens` / `include_subject` via
+	/// [`ListActionOptions::apply_include`], which the list handler calls).
+	#[serde(default, deserialize_with = "deserialize_split")]
+	pub include: Option<Vec<String>>,
 	/// When true, the list path populates each `ActionView.token` with the raw
 	/// signed JWS from `action_tokens`. Opt-in so normal feed payloads stay lean.
-	#[serde(rename = "includeTokens")]
+	#[serde(skip)]
 	pub include_tokens: Option<bool>,
 	/// When true, hydrate each row's `subject_action` (the referenced action with
 	/// its full `stat`) for any row whose `subject` is a real action id (not an
 	/// `@`-prefixed placeholder). Opt-in — unread-dot count probes omit it to stay
 	/// lean; feed/banner/conversation-list paths set it to get the subject's
 	/// commentCount/lastCommentAt and `readerState` in one round-trip.
-	#[serde(rename = "includeSubject")]
+	#[serde(skip)]
 	pub include_subject: Option<bool>,
 	/// Exclude actions whose issuer's profile has any of these statuses.
 	/// LEFT JOIN profiles ON (tn_id, id_tag=issuer.id_tag) — missing-profile
@@ -824,13 +841,13 @@ pub struct ListActionOptions {
 	/// Requires an authenticated request (viewer_id_tag set by the handler).
 	#[serde(rename = "excludeOwnIssuer")]
 	pub exclude_own_issuer: Option<bool>,
-	/// When true, `GET /actions` returns only a `COUNT(*)` of matching rows (under
-	/// `cursorPagination.count`) instead of the row list. The count applies
+	/// When true, `GET /actions` returns only a `COUNT(*)` of matching rows (as the
+	/// top-level `total`) instead of the row list. The count applies
 	/// `visibility_guard` below, so it's a post-visibility count.
 	pub count: Option<bool>,
-	/// Visibility guard for the aggregate count path (H1). NEVER deserialized from
+	/// Visibility guard for both the list and count paths. NEVER deserialized from
 	/// the client — set only by the `/actions` handler. Reuses `Patch<String>`:
-	/// `Undefined` → no guard (tenant see-all, internal callers, list path);
+	/// `Undefined` → no guard (tenant see-all, internal callers);
 	/// `Null` → guest, only Public ('P') rows; `Value(id_tag)` → viewer, full ABAC
 	/// translation for `id_tag`.
 	///
@@ -846,15 +863,24 @@ pub struct ListActionOptions {
 	pub viewer_relation: ProfileRelation,
 }
 
+impl ListActionOptions {
+	/// Turn the wire `include=` list into the expansion flags.
+	pub fn apply_include(&mut self) {
+		let include = self.include.as_deref();
+		self.include_tokens = Some(includes(include, "tokens"));
+		self.include_subject = Some(includes(include, "subject"));
+	}
+}
+
+/// The one embedded profile shape (`issuer`, `audience`, `owner`, `upstream`, …).
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
-pub struct ProfileInfo {
-	#[serde(rename = "idTag")]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileRef {
 	pub id_tag: Box<str>,
 	pub name: Box<str>,
 	#[serde(rename = "type")]
 	pub typ: ProfileType,
-	#[serde(rename = "profilePic")]
 	pub profile_pic: Option<Box<str>>,
 }
 
@@ -884,7 +910,8 @@ pub struct Action<S: AsRef<str>> {
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct AttachmentView {
-	#[serde(rename = "fileId")]
+	/// Content id (`f1~…`).
+	#[serde(rename = "contentId")]
 	pub file_id: Box<str>,
 	pub dim: Option<(u32, u32)>,
 	#[serde(rename = "localVariants")]
@@ -895,6 +922,7 @@ pub struct AttachmentView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionView {
+	#[serde(rename = "id")]
 	pub action_id: Box<str>,
 	#[serde(rename = "type")]
 	pub typ: Box<str>,
@@ -902,14 +930,14 @@ pub struct ActionView {
 	pub sub_typ: Option<Box<str>>,
 	pub parent_id: Option<Box<str>>,
 	pub root_id: Option<Box<str>>,
-	pub issuer: ProfileInfo,
-	pub audience: Option<ProfileInfo>,
+	pub issuer: ProfileRef,
+	pub audience: Option<ProfileRef>,
 	pub content: Option<serde_json::Value>,
 	pub attachments: Option<Vec<AttachmentView>>,
 	pub subject: Option<Box<str>>,
-	pub subject_profile: Option<ProfileInfo>,
+	pub subject_profile: Option<ProfileRef>,
 	/// Community whose hat the issuer wore (`actions.hat_tag`), resolved like `issuer`.
-	pub hat: Option<ProfileInfo>,
+	pub hat: Option<ProfileRef>,
 	/// Absolute channel (`@tenant~name`); `None` = open floor.
 	pub channel: Option<Box<str>>,
 	/// Hydrated original action referenced by `subject` (e.g. the post a REPOST
@@ -918,32 +946,40 @@ pub struct ActionView {
 	/// the recursive type sized.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub subject_action: Option<Box<ActionView>>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
+	pub created_at: ApiTime,
 	/// LOCAL ingestion time (when this action was inserted on this node), emitted
 	/// as `receivedAt`. Drives the home feed's arrival-order sort and its unread
 	/// watermark so late-federated posts (old `created_at`, recent arrival)
 	/// surface correctly. Optional: NULL on relationship/system rows inserted via
 	/// paths that don't stamp it. See `meta-adapter-sqlite` migration 36.
-	#[serde(
-		serialize_with = "serialize_timestamp_iso_opt",
-		skip_serializing_if = "Option::is_none"
-	)]
-	pub received_at: Option<Timestamp>,
-	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
-	pub expires_at: Option<Timestamp>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub received_at: Option<ApiTime>,
+	pub expires_at: Option<ApiTime>,
+	#[serde(with = "crate::api_enums::action_status::opt_text")]
 	pub status: Option<Box<str>>,
 	pub stat: Option<serde_json::Value>,
+	/// Stored char; wire word, `direct` for NULL (`api_enums::visibility`).
+	#[serialize_always]
+	#[serde(with = "crate::api_enums::visibility::opt")]
 	pub visibility: Option<char>,
-	pub flags: Option<Box<str>>, // Action flags: R/r (reactions), C/c (comments), O/o (open)
+	/// Stored letters R/r C/c O/o; wire [`crate::api_enums::ActionFlags`] object.
+	#[serialize_always]
+	#[serde(with = "crate::api_enums::flags::opt")]
+	pub flags: Option<Box<str>>,
 	/// Reader's own state for this action (`reader_state` row `A:<type>`).
 	#[serde(rename = "readerState", skip_serializing_if = "Option::is_none")]
 	pub reader_state: Option<ReaderState>,
-	pub x: Option<serde_json::Value>, // Extensible metadata (x.role for SUBS, etc.)
+	/// Extensible metadata (stored / signed as `x`; `x.role` for SUBS, etc.)
+	#[serde(rename = "extra")]
+	pub x: Option<serde_json::Value>,
 	/// Raw signed JWS for this action, populated only when the list query sets
-	/// `includeTokens=true`. Lets clients verify action signatures locally.
+	/// `include=tokens`. Lets clients verify action signatures locally.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub token: Option<Box<str>>,
+	/// Sender-side terminal delivery failure (`actions.delivery_error`), emitted as
+	/// `deliveryError`. Today only `"unsupported"`: a directed delivery refused with
+	/// 422 `E-FED-UNSUPPORTED`.
+	pub delivery_error: Option<Box<str>>,
 }
 
 // Files
@@ -982,17 +1018,20 @@ pub enum FileResolution {
 pub enum ActionId<S: AsRef<str>> {
 	ActionId(S),
 	AId(u64),
+	/// Inbound only: a live row with the same key is newer, so the incoming action was
+	/// stored already retired ('D'). No hook, effect or status write may follow.
+	SupersededOnArrival,
 }
 
 /// File status enum
 /// Note: Mutability is determined by fileTp (BLOB=immutable, CRDT/RTDB=mutable)
+/// Stored as one char (mapped by hand in the SQLite adapter); serde = REST wire word, the same
+/// table as `api_enums::file_status`.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FileStatus {
-	#[serde(rename = "A")]
 	Active,
-	#[serde(rename = "P")]
 	Pending,
-	#[serde(rename = "D")]
 	Deleted,
 }
 
@@ -1001,10 +1040,10 @@ pub enum FileStatus {
 #[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileUserData {
-	#[serde(default, serialize_with = "serialize_timestamp_iso_opt")]
-	pub accessed_at: Option<Timestamp>,
-	#[serde(default, serialize_with = "serialize_timestamp_iso_opt")]
-	pub modified_at: Option<Timestamp>,
+	#[serde(default)]
+	pub accessed_at: Option<ApiTime>,
+	#[serde(default)]
+	pub modified_at: Option<ApiTime>,
 	#[serde(default)]
 	pub pinned: bool,
 	#[serde(default)]
@@ -1022,12 +1061,13 @@ pub struct FileUserData {
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileView {
-	/// Placement id (`entries.entry_id`). Every placement method takes this id.
-	#[serde(default)]
+	/// Placement id (`entries.entry_id`), wire `id`. Every placement method takes this id.
+	#[serde(default, rename = "id")]
 	pub entry_id: Box<str>,
 	/// Content id (`files.file_id`). Several entries may share it (BLOB only).
 	/// `None` for a local folder (no `files` row); a reference folder carries its upstream id.
-	#[serde(default)]
+	/// Wire `contentId`.
+	#[serde(default, rename = "contentId")]
 	#[serialize_always]
 	pub file_id: Option<Box<str>>,
 	#[serde(default)]
@@ -1036,7 +1076,7 @@ pub struct FileView {
 	pub root_id: Option<Box<str>>, // Document tree root file_id (None = standalone)
 	/// Where the canonical copy lives — `None` when the file originates here.
 	#[serde(default)]
-	pub upstream: Option<ProfileInfo>,
+	pub upstream: Option<ProfileRef>,
 	/// Raw `entries.upstream_tag`, per placement — `None` for an entry that originates here.
 	/// One BLOB content can carry local and mirrored entries side by side.
 	///
@@ -1047,7 +1087,7 @@ pub struct FileView {
 	pub upstream_tag: Option<Box<str>>,
 	/// The profile with owner authority — `None` falls back to the tenant.
 	#[serde(default)]
-	pub owner: Option<ProfileInfo>,
+	pub owner: Option<ProfileRef>,
 	/// Raw `entries.owner_tag` column — `None` when the tenant owns the row.
 	///
 	/// Not part of the API surface: `owner` above carries the resolved profile, whose NULL
@@ -1064,19 +1104,21 @@ pub struct FileView {
 	#[serde(default)]
 	pub content_type: Option<Box<str>>,
 	pub file_name: Box<str>,
-	#[serde(default)]
+	#[serde(default, rename = "fileType")]
 	pub file_tp: Option<Box<str>>, // 'BLOB', 'CRDT', 'RTDB', 'FLDR'
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	#[serde(default, serialize_with = "crate::types::serialize_timestamp_iso_opt")]
-	pub accessed_at: Option<Timestamp>, // Global: when anyone last accessed
-	#[serde(default, serialize_with = "crate::types::serialize_timestamp_iso_opt")]
-	pub modified_at: Option<Timestamp>, // Global: when anyone last modified
+	pub created_at: ApiTime,
+	#[serde(default)]
+	pub accessed_at: Option<ApiTime>, // Global: when anyone last accessed
+	#[serde(default)]
+	pub modified_at: Option<ApiTime>, // Global: when anyone last modified
 	pub status: FileStatus,
 	#[serde(default)]
 	pub tags: Option<Vec<Box<str>>>,
-	#[serde(default)]
-	pub visibility: Option<char>, // None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower, C: Connected
+	/// Stored char (None: Direct, P: Public, V: Verified, 2: 2nd degree, F: Follower,
+	/// C: Connected); wire word via `api_enums::visibility`, `direct` for NULL.
+	#[serialize_always]
+	#[serde(default, with = "crate::api_enums::visibility::opt")]
+	pub visibility: Option<char>,
 	/// Absolute channel (`@tenant~name`); `None` = open floor.
 	#[serde(default)]
 	pub channel: Option<Box<str>>,
@@ -1090,26 +1132,27 @@ pub struct FileView {
 	pub access_level: Option<crate::types::AccessLevel>, // User's access level to this file (R/W)
 	#[serde(default)]
 	pub user_data: Option<FileUserData>, // User-specific data (only when authenticated)
-	#[serde(default)]
-	pub x: Option<serde_json::Value>, // Extensible metadata (e.g., {"dim": [width, height]} for images)
+	/// Extensible metadata (e.g., {"dim": [width, height]} for images)
+	#[serde(default, rename = "extra")]
+	pub x: Option<serde_json::Value>,
 	/// Immediate parent folder name. Populated only when listing requests
-	/// `withParent=true`; `None` for root, trash, managed-parent, or when not
+	/// `include=parent`; `None` for root, trash, managed-parent, or when not
 	/// requested. Serialized as `parentName` and omitted when `None`.
 	#[serde(default)]
 	pub parent_name: Option<Box<str>>,
 	/// Full path from root → immediate parent (not including the file itself).
-	/// Populated only when listing requests `withPath=true` (typically a
+	/// Populated only when listing requests `include=path` (typically a
 	/// single-file fetch). Serialized as `path` and omitted when `None`.
 	#[serde(default)]
 	pub path: Option<Vec<PathSegment>>,
 	/// Tombstone: when set, the source of this cross-context row has issued
 	/// an authoritative permanent signal (deleted or revoked). Written by
-	/// `POST /api/files/{file_id}/refresh`; the frontend calls that endpoint
+	/// `POST /api/files/{id}/refresh`; the frontend calls that endpoint
 	/// when it detects an inconsistency (broken thumbnail, 404 on blob,
 	/// stale access). Transient network failures do NOT set this — they
 	/// surface via the response wrapper's `refreshStatus` field instead.
-	#[serde(default, serialize_with = "crate::types::serialize_timestamp_iso_opt")]
-	pub broken_at: Option<Timestamp>,
+	#[serde(default)]
+	pub broken_at: Option<ApiTime>,
 	/// Tombstone reason, set together with `broken_at`. See
 	/// [`BrokenReason`] for the closed set of values.
 	#[serde(default)]
@@ -1225,14 +1268,15 @@ pub struct ShareSetReader {
 /// By default (when `status` is `None`), deleted files (status 'D') are excluded.
 /// To include deleted files, explicitly set `status` to `FileStatus::Deleted`.
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ListFileOptions {
 	/// Maximum number of items to return (default: 30)
 	pub limit: Option<u32>,
 	/// Cursor for pagination (opaque base64-encoded string)
 	pub cursor: Option<String>,
-	#[serde(default, rename = "fileId", deserialize_with = "deserialize_split")]
+	/// Content-id filter (wire `contentId`).
+	#[serde(default, rename = "contentId", deserialize_with = "deserialize_split")]
 	pub file_id: Option<Vec<String>>,
 	#[serde(rename = "parentId")]
 	pub parent_id: Option<String>, // Filter by parent folder (None = root, "__trash__" = trash)
@@ -1243,22 +1287,22 @@ pub struct ListFileOptions {
 	pub not_parent_id: Option<String>,
 	#[serde(rename = "rootId")]
 	pub root_id: Option<String>, // Filter by document tree root
-	pub tag: Option<String>,
 	pub preset: Option<String>,
 	pub variant: Option<String>,
 	/// File status filter. If None, excludes deleted files by default.
 	pub status: Option<FileStatus>,
-	#[serde(default, rename = "fileTp", deserialize_with = "deserialize_split")]
+	#[serde(default, rename = "type", deserialize_with = "deserialize_split")]
 	pub file_type: Option<Vec<String>>,
 	/// Filter by content type pattern (e.g., "image/*", "video/*")
 	#[serde(default, rename = "contentType", deserialize_with = "deserialize_split")]
 	pub content_type: Option<Vec<String>>,
 	/// Include folders (file_tp='FLDR') even when a content_type/file_type filter
 	/// is set, so folder navigation keeps working in type-filtered pickers.
-	#[serde(default, rename = "includeFolders")]
+	/// Wire `include=folders`, set by [`ListFileOptions::apply_include`].
+	#[serde(skip)]
 	pub include_folders: bool,
-	/// Substring search in file name
-	#[serde(rename = "fileName")]
+	/// Substring search in file name (wire `q`)
+	#[serde(rename = "q")]
 	pub file_name: Option<String>,
 	/// Filter by owner id_tag
 	#[serde(rename = "ownerIdTag")]
@@ -1276,11 +1320,6 @@ pub struct ListFileOptions {
 	pub pinned: Option<bool>,
 	/// Filter by starred status (user-specific)
 	pub starred: Option<bool>,
-	/// LEGACY hidden filter. None = exclude hidden (default). Some(true) = only hidden.
-	/// Kept so pre-migration `hidden=1` rows still drop out of user-library
-	/// listings; new system-managed files use `parent_id = MANAGED_PARENT_ID`
-	/// instead and are filtered by the managed-folder rule above.
-	pub hidden: Option<bool>,
 	/// Sort order: 'recent' (accessed_at), 'modified' (modified_at), 'name', 'created'
 	pub sort: Option<String>,
 	/// Sort direction: 'asc' or 'desc' (default: desc for dates, asc for name)
@@ -1291,21 +1330,22 @@ pub struct ListFileOptions {
 	/// applies). Ignored for the trash and managed sentinels.
 	#[serde(default)]
 	pub recursive: bool,
-	/// Exact tags, ANDed: a file must carry every one. The legacy `tag` is a substring match.
+	/// Exact tags, ANDed: a file must carry every one.
 	#[serde(default, deserialize_with = "deserialize_split")]
 	pub tags: Option<Vec<String>>,
 	/// Exposure filter, ORed: `private|audience|network|people|link|public`.
 	#[serde(default, deserialize_with = "deserialize_split")]
 	pub access: Option<Vec<String>>,
-	/// Only entries the calling user opened (`file_user_data.accessed_at`) at or after this.
-	#[serde(default, rename = "openedSince", deserialize_with = "deserialize_query_timestamp")]
-	pub opened_since: Option<Timestamp>,
+	/// Only entries the calling user opened (`file_user_data.accessed_at`) at or after this
+	/// (wire `openedAfter`).
+	#[serde(default, rename = "openedAfter", deserialize_with = "deserialize_query_time")]
+	pub opened_since: Option<ApiTime>,
 	/// Entry modified (`COALESCE(files.modified_at, entries.updated_at)`) at or after this.
-	#[serde(default, rename = "modifiedAfter", deserialize_with = "deserialize_query_timestamp")]
-	pub modified_after: Option<Timestamp>,
+	#[serde(default, deserialize_with = "deserialize_query_time")]
+	pub modified_after: Option<ApiTime>,
 	/// Entry modified strictly before this.
-	#[serde(default, rename = "modifiedBefore", deserialize_with = "deserialize_query_timestamp")]
-	pub modified_before: Option<Timestamp>,
+	#[serde(default, deserialize_with = "deserialize_query_time")]
+	pub modified_before: Option<ApiTime>,
 	/// User id_tag for user-specific data (set by handler, not from query)
 	#[serde(skip)]
 	pub user_id_tag: Option<String>,
@@ -1358,12 +1398,26 @@ pub struct ListFileOptions {
 	/// When true, populate `FileView.parent_name` with the immediate parent
 	/// folder's name (one level). Resolved via a shared LRU cache; on cache
 	/// misses, one SQL round-trip per distinct missing parent on the page.
-	#[serde(default, rename = "withParent")]
+	#[serde(skip)]
 	pub with_parent: bool,
 	/// When true, populate `FileView.path` with the full root→parent chain.
 	/// Typically used together with `file_id` to fetch a single file's location.
-	#[serde(default, rename = "withPath")]
+	#[serde(skip)]
 	pub with_path: bool,
+	/// Expansions, `include=parent,path,folders` (sets `with_parent` / `with_path` /
+	/// `include_folders` via [`ListFileOptions::apply_include`], which the list handler calls).
+	#[serde(default, deserialize_with = "deserialize_split")]
+	pub include: Option<Vec<String>>,
+}
+
+impl ListFileOptions {
+	/// Turn the wire `include=` list into the expansion flags.
+	pub fn apply_include(&mut self) {
+		let include = self.include.as_deref();
+		self.with_parent = includes(include, "parent");
+		self.with_path = includes(include, "path");
+		self.include_folders = includes(include, "folders");
+	}
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1401,9 +1455,10 @@ pub struct UpdateFileOptions {
 	pub file_name: Patch<String>,
 	#[serde(default, rename = "parentId")]
 	pub parent_id: Patch<String>, // Move file to different folder (null = root)
-	#[serde(default)]
+	/// Visibility word; `null` / `"direct"` clears to NULL.
+	#[serde(default, deserialize_with = "crate::api_enums::visibility::patch::deserialize")]
 	pub visibility: Patch<char>,
-	#[serde(default)]
+	#[serde(default, deserialize_with = "crate::api_enums::file_status::patch::deserialize")]
 	pub status: Patch<char>,
 	/// LEGACY: writes to the `hidden` column. Prefer moving files into the
 	/// managed folder via `parent_id = MANAGED_PARENT_ID`.
@@ -1481,32 +1536,40 @@ pub struct DeleteFileResult {
 // Share Entries
 //**************
 
+#[serde_with::serde_as]
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareEntry {
+	/// i64 in Rust (cursor, path param), a string on the wire.
+	#[serde_as(as = "serde_with::DisplayFromStr")]
 	pub id: i64,
+	#[serde(with = "crate::api_enums::share_resource")]
 	pub resource_type: char,
 	pub resource_id: Box<str>,
+	#[serde(with = "crate::api_enums::share_subject")]
 	pub subject_type: char,
 	pub subject_id: Box<str>,
+	#[serde(with = "crate::api_enums::share_permission")]
 	pub permission: char,
-	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
-	pub expires_at: Option<Timestamp>,
+	pub expires_at: Option<ApiTime>,
+	#[serde(rename = "creatorIdTag")]
 	pub created_by: Box<str>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
+	pub created_at: ApiTime,
 	// Enrichment fields (populated by JOINs in list_by_resource)
 	pub subject_file_name: Option<Box<str>>,
 	pub subject_content_type: Option<Box<str>>,
+	#[serde(rename = "subjectFileType")]
 	pub subject_file_tp: Option<Box<str>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateShareEntry {
+	#[serde(with = "crate::api_enums::share_subject")]
 	pub subject_type: char,
 	pub subject_id: String,
+	#[serde(with = "crate::api_enums::share_permission")]
 	pub permission: char,
 	pub expires_at: Option<Timestamp>,
 }
@@ -1560,8 +1623,7 @@ pub struct PushSubscription {
 	/// The subscription data (endpoint, keys, etc.)
 	pub subscription: PushSubscriptionData,
 	/// When this subscription was created
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
+	pub created_at: ApiTime,
 }
 
 // Tasks
@@ -1617,13 +1679,13 @@ pub struct InstalledApp {
 	pub action_id: Box<str>,
 	pub file_id: Box<str>,
 	pub blob_id: Box<str>,
+	#[serde(with = "crate::api_enums::app_status::text")]
 	pub status: Box<str>,
 	pub capabilities: Option<Vec<Box<str>>>,
 	pub auto_update: bool,
 	/// Runs on the shared `cl-o.<idTag>` origin instead of a CSP-sandboxed opaque one.
 	pub trusted: bool,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub installed_at: Timestamp,
+	pub installed_at: ApiTime,
 }
 
 /// Standing of a container's content as an installed app (`MetaAdapter::installed_app_trust`).
@@ -1828,6 +1890,7 @@ pub struct SpaceReport {
 #[serde(rename_all = "camelCase")]
 pub struct DocFormat {
 	pub content_type: Box<str>,
+	#[serde(rename = "publisherIdTag")]
 	pub publisher_tag: Box<str>,
 	pub app_name: Box<str>,
 	/// Encoded document format version, `MMMmmmppp` (three decimal digits per
@@ -1836,7 +1899,7 @@ pub struct DocFormat {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub format_version: Option<i64>,
 	/// `'RTDB'` | `'CRDT'` | `'BLOB'`
-	#[serde(skip_serializing_if = "Option::is_none")]
+	#[serde(rename = "storeType", skip_serializing_if = "Option::is_none")]
 	pub store_tp: Option<Box<str>>,
 	/// Deep-link query param name, e.g. `"nav"`.
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -1844,10 +1907,9 @@ pub struct DocFormat {
 	/// The FTS index manifest.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub search: Option<serde_json::Value>,
-	#[serde(skip_serializing_if = "Option::is_none")]
+	#[serde(rename = "extra", skip_serializing_if = "Option::is_none")]
 	pub x: Option<serde_json::Value>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub updated_at: Timestamp,
+	pub updated_at: ApiTime,
 }
 
 /// Writable subset of [`DocFormat`].
@@ -1883,10 +1945,8 @@ pub struct Site {
 	/// Navigation is not routing: a target may name a path no document serves, omit one
 	/// that is served, or be an external URL.
 	pub nav: Vec<SiteNavItem>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub updated_at: Timestamp,
+	pub created_at: ApiTime,
+	pub updated_at: ApiTime,
 }
 
 /// One top-level entry in the site's explicit main navigation.
@@ -1959,9 +2019,8 @@ pub struct SiteDoc {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub previous_mount_path: Option<Box<str>>,
 	/// When the served generation was published. `None` on a row that has none.
-	#[serde(serialize_with = "serialize_timestamp_iso_opt")]
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub published_at: Option<Timestamp>,
+	pub published_at: Option<ApiTime>,
 }
 
 /// One mount row as the settings page writes it — the binding alone, with no
@@ -1996,10 +2055,8 @@ pub struct AddressBook {
 	pub description: Option<Box<str>>,
 	/// Collection tag — changes on any contact mutation within this book (used by CardDAV sync)
 	pub ctag: Box<str>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub updated_at: Timestamp,
+	pub created_at: ApiTime,
+	pub updated_at: ApiTime,
 }
 
 #[derive(Debug, Default)]
@@ -2089,10 +2146,8 @@ pub struct Channel {
 	pub min_role: Option<Box<str>>,
 	/// Closed rooms additionally require a roster row.
 	pub closed: bool,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub updated_at: Timestamp,
+	pub created_at: ApiTime,
+	pub updated_at: ApiTime,
 }
 
 /// Partial channel update. The name is the key and never changes.
@@ -2148,10 +2203,8 @@ pub struct Calendar {
 	pub components: Box<str>,
 	/// Collection tag — bumps on any calendar-object mutation (used by CalDAV sync).
 	pub ctag: Box<str>,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub updated_at: Timestamp,
+	pub created_at: ApiTime,
+	pub updated_at: ApiTime,
 }
 
 #[derive(Debug, Default)]
@@ -2421,6 +2474,7 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	// Action management
 	//*******************
 	async fn get_action_id(&self, tn_id: TnId, a_id: u64) -> ClResult<Box<str>>;
+	/// List actions matching `opts`. Applies `opts.visibility_guard` like `count_actions`.
 	async fn list_actions(
 		&self,
 		tn_id: TnId,
@@ -2440,8 +2494,8 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Count actions matching `opts` (same filters as `list_actions`), no
 	/// limit/sort/cursor. Backs the `count=true` flag on `GET /actions`. When
 	/// `opts.visibility_guard` is set (`Null` guest / `Value` viewer) the count is
-	/// post-visibility, applying the same ABAC translation of `can_view_item` the
-	/// row-list pass uses. `Undefined` (default) counts every matching row.
+	/// post-visibility, applying the same ABAC translation of `can_view_item` that
+	/// `list_actions` applies. `Undefined` (default) counts every matching row.
 	async fn count_actions(&self, tn_id: TnId, opts: &ListActionOptions) -> ClResult<i64>;
 
 	// Reader state (`reader_state`): `P:*` refs are idTags and are normalized.
@@ -2550,6 +2604,14 @@ pub trait MetaAdapter: Debug + Send + Sync {
 
 	/// Get action token for federation
 	async fn get_action_token(&self, tn_id: TnId, action_id: &str) -> ClResult<Option<Box<str>>>;
+
+	/// Mark the sender's own action with a terminal delivery error (e.g. `"unsupported"`)
+	async fn set_action_delivery_error(
+		&self,
+		tn_id: TnId,
+		action_id: &str,
+		error: &str,
+	) -> ClResult<()>;
 
 	/// Update action data (subject, reactions, comments, status)
 	async fn update_action_data(
@@ -3067,21 +3129,26 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		opts: &UpdateShareEntryOptions,
 	) -> ClResult<ShareEntry>;
 
-	/// List share entries for a resource
+	/// List share entries for a resource, newest (`id` DESC) first.
+	/// `limit: None` = every row; `after_id` = keyset cursor (only entries with `id < after_id`).
 	async fn list_share_entries(
 		&self,
 		tn_id: TnId,
 		resource_type: char,
 		resource_id: &str,
+		limit: Option<u32>,
+		after_id: Option<i64>,
 	) -> ClResult<Vec<ShareEntry>>;
 
-	/// List share entries by subject (reverse lookup).
+	/// List share entries by subject (reverse lookup), paged like [`Self::list_share_entries`].
 	/// If `subject_type` is None, matches all subject types.
 	async fn list_share_entries_by_subject(
 		&self,
 		tn_id: TnId,
 		subject_type: Option<char>,
 		subject_id: &str,
+		limit: Option<u32>,
+		after_id: Option<i64>,
 	) -> ClResult<Vec<ShareEntry>>;
 
 	/// Check if a subject has share access to a resource
@@ -3719,7 +3786,7 @@ mod tests {
 
 	#[test]
 	fn test_deserialize_list_action_options_with_multiple_statuses() {
-		let query = "status=C,N&type=POST,REPLY";
+		let query = "status=confirmation,notification&type=POST,REPLY";
 		let opts: ListActionOptions =
 			serde_urlencoded::from_str(query).expect("should deserialize");
 
@@ -3738,7 +3805,7 @@ mod tests {
 
 	#[test]
 	fn test_deserialize_list_action_options_without_status() {
-		let query = "issuer=alice";
+		let query = "issuerIdTag=alice";
 		let opts: ListActionOptions =
 			serde_urlencoded::from_str(query).expect("should deserialize");
 
@@ -3749,7 +3816,7 @@ mod tests {
 
 	#[test]
 	fn test_deserialize_list_action_options_single_status() {
-		let query = "status=C";
+		let query = "status=confirmation";
 		let opts: ListActionOptions =
 			serde_urlencoded::from_str(query).expect("should deserialize");
 
@@ -3770,7 +3837,7 @@ mod tests {
 		assert!(matches!(opts.audience_type, Some(AudienceType::Community)));
 
 		let opts: ListActionOptions =
-			serde_urlencoded::from_str("issuer=alice").expect("should deserialize");
+			serde_urlencoded::from_str("issuerIdTag=alice").expect("should deserialize");
 		assert!(opts.audience_type.is_none());
 
 		let res: Result<ListActionOptions, _> = serde_urlencoded::from_str("audienceType=garbage");
@@ -3779,39 +3846,38 @@ mod tests {
 
 	#[test]
 	fn test_deserialize_list_action_options_multi_visibility() {
-		let opts: ListActionOptions =
-			serde_urlencoded::from_str("visibility=F,C").expect("should deserialize");
+		let opts: ListActionOptions = serde_urlencoded::from_str("visibility=followers,connected")
+			.expect("should deserialize");
 		let v = opts.visibility.expect("visibility should be Some");
 		assert_eq!(v.len(), 2);
 		assert_eq!(v[0].as_str(), "F");
 		assert_eq!(v[1].as_str(), "C");
 
 		let opts: ListActionOptions =
-			serde_urlencoded::from_str("visibility=P").expect("should deserialize");
+			serde_urlencoded::from_str("visibility=public").expect("should deserialize");
 		let v = opts.visibility.expect("visibility should be Some");
 		assert_eq!(v.len(), 1);
 		assert_eq!(v[0].as_str(), "P");
 
 		let opts: ListActionOptions =
-			serde_urlencoded::from_str("issuer=alice").expect("should deserialize");
+			serde_urlencoded::from_str("issuerIdTag=alice").expect("should deserialize");
 		assert!(opts.visibility.is_none());
 	}
 
 	#[test]
-	fn test_deserialize_list_action_options_visibility_with_direct() {
-		let opts: ListActionOptions =
-			serde_urlencoded::from_str("visibility=D,F").expect("should deserialize");
-		let v = opts.visibility.expect("visibility should be Some");
-		assert_eq!(v.len(), 2);
-		assert_eq!(v[0].as_str(), "D");
-		assert_eq!(v[1].as_str(), "F");
+	fn test_deserialize_list_action_options_visibility_rejects_direct_and_letters() {
+		// `direct` (NULL) is no filter value; the old letter codes are no words.
+		for q in ["visibility=direct,followers", "visibility=D,F", "visibility=P", "status=C"] {
+			let res: Result<ListActionOptions, _> = serde_urlencoded::from_str(q);
+			assert!(res.is_err(), "{q} should be refused");
+		}
 	}
 
 	#[test]
 	fn test_deserialize_list_file_options_new_filters() {
 		let opts: ListFileOptions = serde_urlencoded::from_str(
-			"recursive=true&tags=a,%20b&access=people,link&openedSince=1700000000\
-			 &modifiedAfter=2024-01-01T00:00:00Z&modifiedBefore=1800000000",
+			"recursive=true&tags=a,%20b&access=people,link&openedAfter=2023-11-14T22:13:20Z\
+			 &modifiedAfter=2024-01-01T00:00:00Z&modifiedBefore=2027-01-15T08:00:00Z&include=parent,path,folders",
 		)
 		.expect("should deserialize");
 		assert!(opts.recursive);
@@ -3820,17 +3886,23 @@ mod tests {
 		assert_eq!(opts.opened_since.map(|t| t.0), Some(1_700_000_000));
 		assert_eq!(opts.modified_after.map(|t| t.0), Some(1_704_067_200));
 		assert_eq!(opts.modified_before.map(|t| t.0), Some(1_800_000_000));
+		let mut opts = opts;
+		opts.apply_include();
+		assert!(opts.with_parent && opts.with_path && opts.include_folders);
 
-		let res: Result<ListFileOptions, _> = serde_urlencoded::from_str("openedSince=yesterday");
-		assert!(res.is_err(), "garbage openedSince should error");
+		let res: Result<ListFileOptions, _> = serde_urlencoded::from_str("openedAfter=yesterday");
+		assert!(res.is_err(), "garbage openedAfter should error");
+		let res: Result<ListFileOptions, _> = serde_urlencoded::from_str("openedAfter=1700000000");
+		assert!(res.is_err(), "unix seconds are refused");
 
 		let opts: ListFileOptions =
-			serde_urlencoded::from_str("openedSince=&modifiedAfter=2024-01-01T02:00:00%2B02:00")
+			serde_urlencoded::from_str("openedAfter=&modifiedAfter=2024-01-01T02:00:00%2B02:00")
 				.expect("should deserialize");
-		assert!(opts.opened_since.is_none(), "empty openedSince is no filter");
+		assert!(opts.opened_since.is_none(), "empty openedAfter is no filter");
 		assert_eq!(opts.modified_after.map(|t| t.0), Some(1_704_067_200));
 		let opts: ListFileOptions =
-			serde_urlencoded::from_str("openedSince=%201700000000%20").expect("should deserialize");
+			serde_urlencoded::from_str("openedAfter=%202023-11-14T22:13:20Z%20")
+				.expect("should deserialize");
 		assert_eq!(opts.opened_since.map(|t| t.0), Some(1_700_000_000));
 	}
 

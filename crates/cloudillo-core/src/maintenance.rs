@@ -28,7 +28,7 @@ const DEFAULT_CRON: &str = "20 4 * * *";
 const DEFAULT_MIN_FREE_PCT: i64 = 20;
 
 /// Meta-database maintenance. Scheduled via cron at process start, and on
-/// demand from `POST /api/admin/db-maintenance`.
+/// demand from `POST /api/admin/db/maintenance`.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct DbMaintenanceTask {
 	/// Tenant to push the outcome to when the sweep ends. `None` — the nightly
@@ -140,7 +140,7 @@ impl Task<App> for DbMaintenanceTask {
 				None => serde_json::json!({ "ok": false }),
 			};
 			let msg =
-				crate::ws_broadcast::BroadcastMessage::new("DB_MAINTENANCE_DONE", data, "system");
+				crate::ws_broadcast::BroadcastMessage::new("dbMaintenanceDone", data, "system");
 			let delivered = app.broadcast.send_to_tenant(tn_id, msg).await;
 			debug!(tn_id = %tn_id, delivered, "db_maintenance outcome broadcast");
 		}

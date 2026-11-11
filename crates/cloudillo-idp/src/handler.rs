@@ -12,14 +12,14 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
-use cloudillo_core::extract::{Auth, IdTag, OptionalRequestId};
+use cloudillo_core::extract::{Auth, IdTag};
 use cloudillo_core::settings::SettingValue;
 use cloudillo_types::address::parse_address_type;
 use cloudillo_types::identity_provider_adapter::{
 	CreateIdentityOptions, Identity, IdentityStatus, ListIdentityOptions, UpdateIdentityOptions,
 };
 use cloudillo_types::meta_adapter::IDP_ACTIVATION_REF_TYPE;
-use cloudillo_types::types::{ApiResponse, serialize_timestamp_iso, serialize_timestamp_iso_opt};
+use cloudillo_types::types::{ApiResponse, ApiTime, CursorData};
 use cloudillo_types::utils::parse_and_validate_identity_id_tag;
 
 use crate::prelude::*;
@@ -146,20 +146,14 @@ pub struct IdentityResponse {
 	pub owner_id_tag: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub address: Option<String>,
-	#[serde(
-		skip_serializing_if = "Option::is_none",
-		serialize_with = "serialize_timestamp_iso_opt"
-	)]
-	pub address_updated_at: Option<Timestamp>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub address_updated_at: Option<ApiTime>,
 	/// Dynamic DNS mode - uses 60s TTL for faster propagation (default: false)
 	pub dyndns: bool,
 	pub status: String,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub created_at: Timestamp,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub updated_at: Timestamp,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub expires_at: Timestamp,
+	pub created_at: ApiTime,
+	pub updated_at: ApiTime,
+	pub expires_at: ApiTime,
 	/// API key (only returned during creation, never stored or returned in subsequent reads)
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub api_key: Option<String>,
@@ -175,12 +169,12 @@ impl From<Identity> for IdentityResponse {
 			registrar_id_tag: identity.registrar_id_tag.to_string(),
 			owner_id_tag: identity.owner_id_tag.map(|o| o.to_string()),
 			address: identity.address.map(|a| a.to_string()),
-			address_updated_at: identity.address_updated_at,
+			address_updated_at: identity.address_updated_at.map(Into::into),
 			dyndns: identity.dyndns,
 			status: identity.status.to_string(),
-			created_at: identity.created_at,
-			updated_at: identity.updated_at,
-			expires_at: identity.expires_at,
+			created_at: identity.created_at.into(),
+			updated_at: identity.updated_at.into(),
+			expires_at: identity.expires_at.into(),
 			api_key: None, // Never included in From<Identity>, only set during creation
 		}
 	}
@@ -218,10 +212,11 @@ fn default_true() -> bool {
 
 /// Request structure for updating identity address
 #[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateAddressRequest {
-	/// New address for the identity (optional, leave empty for automatic peer IP)
+	/// New address for the identity; absent, `null`, `""` or `"auto"` = automatic peer IP
 	#[serde(default)]
-	pub address: Option<String>,
+	pub address: Patch<String>,
 	/// If true and address is not provided, use the peer IP address
 	#[serde(default)]
 	pub auto_address: bool,
@@ -229,6 +224,7 @@ pub struct UpdateAddressRequest {
 
 /// Response structure for address update - only returns the updated address
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AddressUpdateResponse {
 	pub address: String,
 }
@@ -259,13 +255,13 @@ pub struct ListIdentitiesQuery {
 	pub owner_id_tag: Option<String>,
 	/// Filter by status (pending, active, suspended)
 	pub status: Option<String>,
-	/// Limit results
+	/// Page size: default 20, max 200
 	pub limit: Option<u32>,
-	/// Offset for pagination
-	pub offset: Option<u32>,
+	/// Opaque cursor: the previous page's `next`
+	pub cursor: Option<String>,
 }
 
-/// GET /api/idp/identities/:id - Get a specific identity by id_tag
+/// GET /api/idp/identities/{id} - Get a specific identity by id_tag
 #[axum::debug_handler]
 pub async fn get_identity_by_id(
 	State(app): State<App>,
@@ -273,13 +269,12 @@ pub async fn get_identity_by_id(
 	IdTag(idp_domain): IdTag,
 	Auth(auth): Auth,
 	Path(identity_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<IdentityResponse>>)> {
 	info!(
 		identity_id = %identity_id,
 		idp_domain = %idp_domain,
 		auth_id_tag = %auth.id_tag,
-		"GET /api/idp/identities/:id"
+		"GET /api/idp/identities/{{id}}"
 	);
 
 	// Check if IDP is enabled for this tenant
@@ -322,10 +317,7 @@ pub async fn get_identity_by_id(
 	}
 
 	let response_data = IdentityResponse::from(identity);
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(response_data);
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -338,7 +330,6 @@ pub async fn list_identities(
 	IdTag(idp_domain): IdTag,
 	Auth(auth): Auth,
 	Query(query_params): Query<ListIdentitiesQuery>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<IdentityResponse>>>)> {
 	info!(
 		idp_domain = %idp_domain,
@@ -365,6 +356,9 @@ pub async fn list_identities(
 		Some(auth.id_tag.to_string())
 	};
 
+	let limit = query_params.limit.unwrap_or(20).clamp(1, 200);
+	let offset = CursorData::parse_offset(query_params.cursor.as_deref())?;
+	// One extra row tells whether another page exists.
 	let opts = ListIdentityOptions {
 		id_tag_domain: idp_domain.to_string(),
 		email: query_params.email.clone(),
@@ -373,22 +367,19 @@ pub async fn list_identities(
 		status: query_params.status.as_ref().and_then(|s| s.parse().ok()),
 		expires_after: None,
 		expired_only: false,
-		limit: query_params.limit,
-		offset: query_params.offset,
+		limit: Some(limit + 1),
+		offset: Some(offset),
 	};
 
-	let identities = idp_adapter.list_identities(opts).await?;
+	let mut identities = idp_adapter.list_identities(opts).await?;
+	let has_more = identities.len() > limit as usize;
+	identities.truncate(limit as usize);
 
 	let response_data: Vec<IdentityResponse> =
 		identities.into_iter().map(IdentityResponse::from).collect();
 
-	let total = response_data.len();
-	let offset = query_params.offset.unwrap_or(0) as usize;
-	let limit = query_params.limit.unwrap_or(20) as usize;
-	let mut response = ApiResponse::with_pagination(response_data, offset, limit, total);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let next = has_more.then(|| CursorData::offset(offset + limit));
+	let response = ApiResponse::with_next(response_data, next);
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -400,7 +391,6 @@ pub async fn create_identity(
 	tn_id: TnId,
 	IdTag(idp_domain): IdTag,
 	Auth(auth): Auth,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(create_req): Json<CreateIdentityRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<IdentityResponse>>)> {
 	info!(
@@ -620,20 +610,16 @@ pub async fn create_identity(
 	// Include the API key in the response (only shown once!)
 	response_data.api_key = created_key;
 
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(response_data);
 
 	Ok((StatusCode::CREATED, Json(response)))
 }
 
-/// PUT /api/idp/identities/:id/address - Update identity address
+/// PATCH /api/idp/identities/{id}/address - Update identity address
 ///
 /// Authorization: The authenticated identity (via IDP API key) must match
 /// the identity being updated. This endpoint is designed for self-updates
 /// where each identity uses its own API key to update its address.
-#[expect(clippy::too_many_arguments, reason = "IdP registration requires all fields")]
 #[axum::debug_handler]
 pub async fn update_identity_address(
 	State(app): State<App>,
@@ -642,14 +628,13 @@ pub async fn update_identity_address(
 	Auth(auth): Auth,
 	Path(identity_id): Path<String>,
 	ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	body: Bytes,
 ) -> ClResult<(StatusCode, Json<ApiResponse<AddressUpdateResponse>>)> {
 	info!(
 		identity_id = %identity_id,
 		idp_domain = %idp_domain,
 		auth_id_tag = %auth.id_tag,
-		"PUT /api/idp/identities/:id/address - Updating identity address"
+		"PATCH /api/idp/identities/{{id}}/address - Updating identity address"
 	);
 
 	// Parse request body - accept empty body as auto mode
@@ -697,13 +682,13 @@ pub async fn update_identity_address(
 
 	// Determine the address to use
 	// Empty/missing body or address = use peer IP (auto mode)
-	// Supports: auto_address=true, address="auto", address="", address=null, empty body
+	// Supports: autoAddress=true, address="auto", address="", address=null, empty body
 	let address_to_update = if update_req.auto_address {
 		// Explicit auto flag
 		socket_addr.ip().to_string()
 	} else {
 		match update_req.address {
-			Some(addr) if !addr.is_empty() && addr != "auto" => {
+			Patch::Value(addr) if !addr.is_empty() && addr != "auto" => {
 				// Explicit non-empty address provided
 				addr
 			}
@@ -725,10 +710,7 @@ pub async fn update_identity_address(
 			"Address unchanged, skipping update"
 		);
 		let response_data = AddressUpdateResponse { address: address_to_update };
-		let mut response = ApiResponse::new(response_data);
-		if let Some(id) = req_id {
-			response = response.with_req_id(id);
-		}
+		let response = ApiResponse::new(response_data);
 		return Ok((StatusCode::OK, Json(response)));
 	}
 
@@ -753,15 +735,12 @@ pub async fn update_identity_address(
 
 	// Return only the address in the response
 	let response_data = AddressUpdateResponse { address: address_to_update };
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(response_data);
 
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// DELETE /api/idp/identities/:id - Delete an identity
+/// DELETE /api/idp/identities/{id} - Delete an identity
 #[axum::debug_handler]
 pub async fn delete_identity(
 	State(app): State<App>,
@@ -769,13 +748,12 @@ pub async fn delete_identity(
 	IdTag(idp_domain): IdTag,
 	Auth(auth): Auth,
 	Path(identity_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
-) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
+) -> ClResult<StatusCode> {
 	info!(
 		identity_id = %identity_id,
 		idp_domain = %idp_domain,
 		auth_id_tag = %auth.id_tag,
-		"DELETE /api/idp/identities/:id - Deleting identity"
+		"DELETE /api/idp/identities/{{id}} - Deleting identity"
 	);
 
 	// Check if IDP is enabled for this tenant
@@ -822,23 +800,19 @@ pub async fn delete_identity(
 		e
 	})?;
 
-	let mut response = ApiResponse::new(());
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
-
-	Ok((StatusCode::OK, Json(response)))
+	Ok(StatusCode::NO_CONTENT)
 }
 
 /// Request structure for updating identity settings
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateIdentitySettingsRequest {
-	/// Enable dynamic DNS mode (60s TTL instead of 3600s)
-	pub dyndns: Option<bool>,
+	/// Enable dynamic DNS mode (60s TTL instead of 3600s). Not clearable: `null` is refused.
+	#[serde(default)]
+	pub dyndns: Patch<bool>,
 }
 
-/// PATCH /api/idp/identities/:id - Update identity settings
+/// PATCH /api/idp/identities/{id} - Update identity settings
 #[axum::debug_handler]
 pub async fn update_identity_settings(
 	State(app): State<App>,
@@ -846,7 +820,6 @@ pub async fn update_identity_settings(
 	IdTag(idp_domain): IdTag,
 	Auth(auth): Auth,
 	Path(identity_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(update_req): Json<UpdateIdentitySettingsRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<IdentityResponse>>)> {
 	info!(
@@ -854,8 +827,12 @@ pub async fn update_identity_settings(
 		idp_domain = %idp_domain,
 		auth_id_tag = %auth.id_tag,
 		dyndns = ?update_req.dyndns,
-		"PATCH /api/idp/identities/:id - Updating identity settings"
+		"PATCH /api/idp/identities/{{id}} - Updating identity settings"
 	);
+
+	if update_req.dyndns.is_null() {
+		return Err(Error::ValidationError("dyndns cannot be null".into()));
+	}
 
 	// Check if IDP is enabled for this tenant
 	check_idp_enabled(&app, tn_id).await?;
@@ -896,7 +873,8 @@ pub async fn update_identity_settings(
 	}
 
 	// Build update options
-	let update_opts = UpdateIdentityOptions { dyndns: update_req.dyndns, ..Default::default() };
+	let update_opts =
+		UpdateIdentityOptions { dyndns: update_req.dyndns.value().copied(), ..Default::default() };
 
 	// Update the identity
 	let updated_identity = idp_adapter
@@ -908,10 +886,7 @@ pub async fn update_identity_settings(
 		})?;
 
 	let response_data = IdentityResponse::from(updated_identity);
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(response_data);
 
 	Ok((StatusCode::OK, Json(response)))
 }
@@ -919,6 +894,7 @@ pub async fn update_identity_settings(
 /// Response structure for IDP public info
 /// This is returned by GET /api/idp/info - a public endpoint for provider selection
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IdpInfoResponse {
 	/// The provider domain (e.g., "cloudillo.net")
 	pub domain: String,
@@ -940,7 +916,6 @@ pub struct IdpInfoResponse {
 pub async fn get_idp_info(
 	State(app): State<App>,
 	tn_id: TnId,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<IdpInfoResponse>>)> {
 	info!(tn_id = tn_id.0, "GET /api/idp/info");
 
@@ -970,16 +945,14 @@ pub async fn get_idp_info(
 
 	let response_data = IdpInfoResponse { domain, name, info, url };
 
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(response_data);
 
 	Ok((StatusCode::OK, Json(response)))
 }
 
 /// Response structure for identity availability check
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AvailabilityResponse {
 	pub available: bool,
 	pub id_tag: String,
@@ -993,7 +966,7 @@ pub struct CheckAvailabilityQuery {
 	pub id_tag: String,
 }
 
-/// GET /api/idp/check-availability - Check if an identity id_tag is available
+/// GET /api/idp/availability - Check if an identity id_tag is available
 ///
 /// Intentionally unauthenticated (public, rate-limited) to support
 /// registration UX. Reveals only whether a prefix is taken, not who owns it.
@@ -1003,14 +976,13 @@ pub async fn check_identity_availability(
 	tn_id: TnId,
 	IdTag(my_id_tag): IdTag,
 	Query(query): Query<CheckAvailabilityQuery>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<AvailabilityResponse>>)> {
 	let id_tag = query.id_tag.trim().to_lowercase();
 
 	info!(
 		id_tag = %id_tag,
 		registrar_id_tag = %my_id_tag,
-		"GET /api/idp/check-availability - Checking identity availability"
+		"GET /api/idp/availability - Checking identity availability"
 	);
 
 	// Check if IDP is enabled for this tenant
@@ -1085,10 +1057,7 @@ pub async fn check_identity_availability(
 		let response_data =
 			AvailabilityResponse { available: !identity_exists, id_tag: id_tag.clone() };
 
-		let mut response = ApiResponse::new(response_data);
-		if let Some(id) = req_id {
-			response = response.with_req_id(id);
-		}
+		let response = ApiResponse::new(response_data);
 
 		Ok((StatusCode::OK, Json(response)))
 	} else {
@@ -1100,7 +1069,7 @@ pub async fn check_identity_availability(
 
 /// Response structure for the per-identity status endpoint.
 ///
-/// Returned by `GET /api/idp/identities/:id/status`. Authenticated callers
+/// Returned by `GET /api/idp/identities/{id}/status`. Authenticated callers
 /// (the tenant home for the same identity, via a proxy token whose `iss`
 /// matches the identity id_tag) get the live IDP-side status plus the
 /// deletion deadline so the verify-idp UI can drive a countdown without a
@@ -1109,8 +1078,7 @@ pub async fn check_identity_availability(
 #[serde(rename_all = "camelCase")]
 pub struct IdentityStatusResponse {
 	pub status: String,
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub expires_at: Timestamp,
+	pub expires_at: ApiTime,
 }
 
 /// Response structure for the per-identity resend endpoint.
@@ -1121,8 +1089,7 @@ pub struct IdentityStatusResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentityResendResponse {
-	#[serde(serialize_with = "serialize_timestamp_iso")]
-	pub expires_at: Timestamp,
+	pub expires_at: ApiTime,
 }
 
 /// Common authorization for the per-identity status/resend endpoints.
@@ -1143,7 +1110,7 @@ fn require_self_query(auth_id_tag: &str, target_id_tag: &str) -> ClResult<()> {
 	Ok(())
 }
 
-/// GET /api/idp/identities/:id/status
+/// GET /api/idp/identities/{id}/status
 ///
 /// Live status for the identity, gated by issuer-match auth. The tenant home
 /// uses this to drive the verify-idp page's polling and the community
@@ -1155,7 +1122,6 @@ pub async fn get_identity_status(
 	IdTag(idp_domain): IdTag,
 	Auth(auth): Auth,
 	Path(identity_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<IdentityStatusResponse>>)> {
 	check_idp_enabled(&app, tn_id).await?;
 
@@ -1177,21 +1143,18 @@ pub async fn get_identity_status(
 
 	let response_data = IdentityStatusResponse {
 		status: identity.status.to_string(),
-		expires_at: identity.expires_at,
+		expires_at: identity.expires_at.into(),
 	};
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(response_data);
 	Ok((StatusCode::OK, Json(response)))
 }
 
-/// POST /api/idp/identities/:id/resend
+/// POST /api/idp/identities/{id}/resend
 ///
 /// Mints a fresh activation ref (TTL clamped to `min(24h, expires_at - now)`)
 /// and re-sends the activation email. Does NOT bump `Identity.expires_at` —
-/// the deadline is fixed at registration time. Returns `410 Gone` if the
-/// identity has already expired.
+/// the deadline is fixed at registration time. Returns 410 `E-REF-EXPIRED` if the
+/// identity has already expired, 400 `E-IDP-NOTPENDING` if it is no longer Pending.
 #[axum::debug_handler]
 pub async fn resend_identity_activation(
 	State(app): State<App>,
@@ -1199,7 +1162,6 @@ pub async fn resend_identity_activation(
 	IdTag(idp_domain): IdTag,
 	Auth(auth): Auth,
 	Path(identity_id): Path<String>,
-	OptionalRequestId(req_id): OptionalRequestId,
 ) -> ClResult<(StatusCode, Json<ApiResponse<IdentityResendResponse>>)> {
 	check_idp_enabled(&app, tn_id).await?;
 
@@ -1224,13 +1186,11 @@ pub async fn resend_identity_activation(
 	// active identity with a stale `expires_at` would otherwise return 410
 	// here — check status first so the response is "not Pending", not "gone".
 	if identity.status != IdentityStatus::Pending {
-		return Err(Error::ValidationError(format!(
-			"Identity is not in Pending status (current: {})",
-			identity.status
-		)));
+		warn!(identity = %target_id_tag, status = ?identity.status, "Resend rejected - not Pending");
+		return Err(Error::IdpNotPending);
 	}
 
-	// 410 Gone past expiry — let the caller surface "register again".
+	// 410 `E-REF-EXPIRED` past expiry — let the caller surface "register again".
 	let now = Timestamp::now();
 	if identity.expires_at.0 <= now.0 {
 		warn!(
@@ -1238,7 +1198,7 @@ pub async fn resend_identity_activation(
 			expires_at = ?identity.expires_at,
 			"Resend rejected — identity has already expired"
 		);
-		return Err(Error::Gone);
+		return Err(Error::RefExpired);
 	}
 
 	// Need an email address to send to. Owner-only identities (no email,
@@ -1273,11 +1233,8 @@ pub async fn resend_identity_activation(
 		return Err(e);
 	}
 
-	let response_data = IdentityResendResponse { expires_at: identity.expires_at };
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response_data = IdentityResendResponse { expires_at: identity.expires_at.into() };
+	let response = ApiResponse::new(response_data);
 	Ok((StatusCode::OK, Json(response)))
 }
 
@@ -1289,7 +1246,7 @@ pub struct ActivateIdentityRequest {
 	pub ref_id: String,
 }
 
-/// POST /api/idp/activate - Activate an identity using a ref token
+/// POST /api/idp/activations - Activate an identity using a ref token (body `{refId}`)
 ///
 /// This endpoint activates a pending identity by consuming an activation ref.
 /// After activation:
@@ -1299,12 +1256,11 @@ pub struct ActivateIdentityRequest {
 pub async fn activate_identity(
 	State(app): State<App>,
 	tn_id: TnId,
-	OptionalRequestId(req_id): OptionalRequestId,
 	Json(activate_req): Json<ActivateIdentityRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<IdentityResponse>>)> {
 	info!(
 		ref_id = %activate_req.ref_id,
-		"POST /api/idp/activate - Activating identity"
+		"POST /api/idp/activations - Activating identity"
 	);
 
 	// Check if IDP is enabled for this tenant
@@ -1364,10 +1320,7 @@ pub async fn activate_identity(
 			status = ?existing.status,
 			"Cannot activate identity - not in Pending status"
 		);
-		return Err(Error::ValidationError(format!(
-			"Identity is not in Pending status (current: {})",
-			existing.status
-		)));
+		return Err(Error::IdpNotPending);
 	}
 
 	// Recalculate expires_at from idp.renewal_interval now that the identity is being activated.
@@ -1403,10 +1356,7 @@ pub async fn activate_identity(
 	);
 
 	let response_data = IdentityResponse::from(updated_identity);
-	let mut response = ApiResponse::new(response_data);
-	if let Some(id) = req_id {
-		response = response.with_req_id(id);
-	}
+	let response = ApiResponse::new(response_data);
 
 	Ok((StatusCode::OK, Json(response)))
 }

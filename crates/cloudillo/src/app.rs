@@ -334,6 +334,17 @@ impl AppBuilder {
 			})?;
 		}
 
+		// The strict known-check refuses an unlisted subtype on arrival, so a subtype a
+		// native hook handles must have its own definition or a base `subtypes` entry.
+		for t in cloudillo_action::dsl::engine::HOOK_HANDLED_TYPES {
+			if !dsl_engine.is_known(t) {
+				error!("FATAL: hook-handled action type '{t}' is neither defined nor listed");
+				return Err(Error::Internal(format!(
+					"hook-handled action type '{t}' is not known"
+				)));
+			}
+		}
+
 		// Build extensions map for feature-specific state
 		let mut extensions = Extensions::new();
 		let dsl_for_search = dsl_engine.clone();

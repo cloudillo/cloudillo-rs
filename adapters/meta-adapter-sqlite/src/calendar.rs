@@ -18,6 +18,7 @@ use cloudillo_types::{
 		UpdateCalendarData,
 	},
 	prelude::*,
+	types::ApiTime,
 };
 use sqlx::{Row, SqlitePool};
 
@@ -167,8 +168,8 @@ fn row_to_calendar(row: &sqlx::sqlite::SqliteRow) -> Calendar {
 		timezone: row.get::<Option<String>, _>("timezone").map(Into::into),
 		components: row.get::<String, _>("components").into(),
 		ctag: row.get::<String, _>("ctag").into(),
-		created_at: Timestamp(row.get::<i64, _>("created_at")),
-		updated_at: Timestamp(row.get::<i64, _>("updated_at")),
+		created_at: ApiTime(row.get::<i64, _>("created_at")),
+		updated_at: ApiTime(row.get::<i64, _>("updated_at")),
 	}
 }
 

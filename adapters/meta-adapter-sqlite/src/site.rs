@@ -15,6 +15,7 @@ use crate::utils::Db;
 use cloudillo_types::{
 	meta_adapter::{PublishSiteDoc, Site, SiteDoc, UpsertSite, UpsertSiteMount},
 	prelude::*,
+	types::ApiTime,
 };
 use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 
@@ -308,8 +309,8 @@ fn map_site(row: &SqliteRow) -> Result<Site, sqlx::Error> {
 			.try_get::<Option<String>, _>("nav")?
 			.and_then(|raw| serde_json::from_str(&raw).ok())
 			.unwrap_or_default(),
-		created_at: Timestamp(row.try_get::<Option<i64>, _>("created_at")?.unwrap_or(0)),
-		updated_at: Timestamp(row.try_get::<Option<i64>, _>("updated_at")?.unwrap_or(0)),
+		created_at: ApiTime(row.try_get::<Option<i64>, _>("created_at")?.unwrap_or(0)),
+		updated_at: ApiTime(row.try_get::<Option<i64>, _>("updated_at")?.unwrap_or(0)),
 	})
 }
 
@@ -329,7 +330,7 @@ fn map_doc(row: &SqliteRow) -> Result<SiteDoc, sqlx::Error> {
 			.map(Into::into),
 		// No `unwrap_or(0)`: an unpublished row has no publish date, and 1970 is a
 		// worse answer than none for a settings page that labels the generation.
-		published_at: row.try_get::<Option<i64>, _>("published_at")?.map(Timestamp),
+		published_at: row.try_get::<Option<i64>, _>("published_at")?.map(ApiTime),
 	})
 }
 

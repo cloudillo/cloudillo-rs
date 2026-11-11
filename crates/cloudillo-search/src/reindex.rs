@@ -26,7 +26,7 @@
 //! # Who hears about the outcome
 //!
 //! `Tenant` is the only scope that reports back to the user, as a
-//! `SEARCH_REINDEX_DONE` message on the tenant's WebSocket bus — it is the only
+//! `searchReindexDone` message on the tenant's WebSocket bus — it is the only
 //! scope a person can ask for (`POST /api/search/reindex`), so it is the only one
 //! anybody is waiting on. `All` and `Startup` are the server's own housekeeping
 //! and stay silent: a toast for a sweep nobody requested is an unexplained
@@ -496,7 +496,7 @@ pub struct ReindexTask {
 /// task or block its retry.
 async fn notify_reindex(app: &App, tn_id: TnId, data: serde_json::Value) {
 	let msg =
-		cloudillo_core::ws_broadcast::BroadcastMessage::new("SEARCH_REINDEX_DONE", data, "system");
+		cloudillo_core::ws_broadcast::BroadcastMessage::new("searchReindexDone", data, "system");
 	let delivered = app.broadcast.send_to_tenant(tn_id, msg).await;
 	debug!(tn_id = %tn_id, delivered, "Search reindex outcome broadcast");
 }

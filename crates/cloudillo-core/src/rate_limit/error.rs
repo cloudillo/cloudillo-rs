@@ -7,9 +7,8 @@
 
 use std::time::Duration;
 
-use axum::Json;
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use cloudillo_types::error::Error;
 
 /// Rate limit error types
 #[derive(Debug)]
@@ -52,56 +51,33 @@ impl std::fmt::Display for RateLimitError {
 
 impl std::error::Error for RateLimitError {}
 
-impl IntoResponse for RateLimitError {
-	fn into_response(self) -> Response {
-		match self {
+impl From<RateLimitError> for Error {
+	fn from(err: RateLimitError) -> Self {
+		match err {
 			RateLimitError::RateLimited { level, retry_after } => {
-				let retry_secs = retry_after.as_secs();
-				let body = serde_json::json!({
-					"error": {
-						"code": "E-RATE-LIMITED",
-						"message": "Too many requests. Please slow down.",
-						"details": {
-							"level": level,
-							"retryAfter": retry_secs
-						}
-					}
-				});
-
-				let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
-
-				// Add standard rate limit headers
-				if let Ok(val) = retry_secs.to_string().parse() {
-					response.headers_mut().insert("Retry-After", val);
-				}
-				if let Ok(val) = level.parse() {
-					response.headers_mut().insert("X-RateLimit-Level", val);
-				}
-
-				response
+				Error::RateLimited { level, retry_after_secs: retry_after.as_secs() }
 			}
 			RateLimitError::Banned { remaining } => {
-				let body = serde_json::json!({
-					"error": {
-						"code": "E-RATE-BANNED",
-						"message": "Access temporarily blocked due to repeated violations.",
-						"details": {
-							"remainingSecs": remaining.map(|d| d.as_secs())
-						}
-					}
-				});
-				(StatusCode::FORBIDDEN, Json(body)).into_response()
+				Error::RateBanned { remaining_secs: remaining.map(|d| d.as_secs()) }
 			}
-			RateLimitError::UnknownCategory(_) => {
-				let body = serde_json::json!({
-					"error": {
-						"code": "E-INTERNAL",
-						"message": "Internal rate limit error"
-					}
-				});
-				(StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+			RateLimitError::UnknownCategory(cat) => {
+				Error::Internal(format!("unknown rate limit category: {}", cat))
 			}
 		}
+	}
+}
+
+impl IntoResponse for RateLimitError {
+	fn into_response(self) -> Response {
+		let retry_after = match &self {
+			RateLimitError::RateLimited { retry_after, .. } => Some(retry_after.as_secs()),
+			_ => None,
+		};
+		let mut response = Error::from(self).into_response();
+		if let Some(Ok(val)) = retry_after.map(|secs| secs.to_string().parse()) {
+			response.headers_mut().insert("Retry-After", val);
+		}
+		response
 	}
 }
 
@@ -133,23 +109,11 @@ impl std::fmt::Display for PowError {
 
 impl std::error::Error for PowError {}
 
-impl IntoResponse for PowError {
-	fn into_response(self) -> Response {
-		match self {
+impl From<PowError> for Error {
+	fn from(err: PowError) -> Self {
+		match err {
 			PowError::InsufficientWork { required, suffix } => {
-				let body = serde_json::json!({
-					"error": {
-						"code": "E-POW-REQUIRED",
-						"message": "Proof of work required for this action",
-						"details": {
-							"required": required,
-							"postfix": suffix,
-							"hint": format!("Action token must end with '{}'", suffix)
-						}
-					}
-				});
-				// HTTP 428 Precondition Required
-				(StatusCode::PRECONDITION_REQUIRED, Json(body)).into_response()
+				Error::PowRequired { required, suffix }
 			}
 		}
 	}
