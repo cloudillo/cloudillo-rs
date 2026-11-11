@@ -33,7 +33,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
 }
 
 // Current schema version - update this when adding new migrations
-const CURRENT_DB_VERSION: i64 = 10;
+const CURRENT_DB_VERSION: i64 = 11;
 
 /// Initialize the database schema and run migrations
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -480,9 +480,29 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 		set_db_version(&mut tx, 10).await;
+		version = 10;
+	}
+
+	// Version 11: keys timestamps (DBs predating versioned migrations never got them)
+	if version == 10 {
+		for (col, alter) in [
+			("created_at", "ALTER TABLE keys ADD COLUMN created_at INTEGER"),
+			("updated_at", "ALTER TABLE keys ADD COLUMN updated_at INTEGER"),
+		] {
+			let exists: i64 =
+				sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('keys') WHERE name = ?")
+					.bind(col)
+					.fetch_one(&mut *tx)
+					.await?;
+			if exists == 0 {
+				// SQLite rejects a non-constant DEFAULT on ADD COLUMN; INSERTs set created_at
+				sqlx::query(alter).execute(&mut *tx).await?;
+			}
+		}
+		set_db_version(&mut tx, 11).await;
 		#[allow(unused_assignments)]
 		{
-			version = 10;
+			version = 11;
 		}
 	}
 
@@ -514,6 +534,8 @@ mod tests {
 			"ALTER TABLE tenants DROP COLUMN suspended_at",
 			"ALTER TABLE tenants DROP COLUMN expires_at",
 			"ALTER TABLE api_keys DROP COLUMN auth_time",
+			"ALTER TABLE keys DROP COLUMN created_at",
+			"ALTER TABLE keys DROP COLUMN updated_at",
 			"UPDATE vars SET value = '6' WHERE key = 'db_version'",
 		] {
 			sqlx::query(sql).execute(&db).await.unwrap();
@@ -527,6 +549,7 @@ mod tests {
 		for sql in [
 			"SELECT totp_secret, totp_last_step, suspended_at, expires_at FROM tenants",
 			"SELECT auth_time FROM api_keys",
+			"SELECT created_at, updated_at FROM keys",
 			"SELECT id, ts, tn_id, actor, event, category, ip, outcome, details FROM audit_event",
 		] {
 			sqlx::query(sql).fetch_all(&db).await.unwrap();
