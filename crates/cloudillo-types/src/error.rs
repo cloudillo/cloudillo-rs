@@ -24,6 +24,7 @@ macro_rules! error_codes {
 
 error_codes! {
 	CORE_NOTFOUND = "E-CORE-NOTFOUND",
+	CORE_NOROUTE = "E-CORE-NOROUTE",
 	CORE_GONE = "E-CORE-GONE",
 	CORE_INVALID = "E-CORE-INVALID",
 	CORE_CONFLICT = "E-CORE-CONFLICT",
@@ -66,6 +67,8 @@ error_codes! {
 pub enum Error {
 	// Core errors
 	NotFound,
+	/// 404 `E-CORE-NOROUTE` - no route matches the request path (the API fallback).
+	NoRoute,
 	/// 410 - the resource existed but is permanently gone (e.g. an MFA login token that
 	/// expired or ran out of attempts, or a peer answering 410).
 	Gone,
@@ -201,6 +204,7 @@ impl Error {
 				| Error::Unsupported(_)
 				| Error::Parse
 				| Error::Gone
+				| Error::NoRoute
 				| Error::RefExpired
 				| Error::RefUsed
 		)
@@ -239,6 +243,9 @@ impl Error {
 		let (status, code, message) = match self {
 			Error::NotFound => {
 				(StatusCode::NOT_FOUND, codes::CORE_NOTFOUND, "Resource not found".into())
+			}
+			Error::NoRoute => {
+				(StatusCode::NOT_FOUND, codes::CORE_NOROUTE, "No such API route".into())
 			}
 			Error::Gone => (StatusCode::GONE, codes::CORE_GONE, "Resource is gone".into()),
 			Error::PermissionDenied => (

@@ -69,15 +69,19 @@ use policy::{
 use static_files::{api_asset_handler, static_fallback_handler};
 
 async fn api_not_found() -> Error {
-	Error::NotFound
+	Error::NoRoute
 }
 
 fn init_api_service(app: App) -> Router {
-	let cors_layer = tower_http::cors::CorsLayer::very_permissive();
+	let cors_layer = tower_http::cors::CorsLayer::very_permissive()
+		.expose_headers([axum::http::HeaderName::from_static(policy::VERSION_HEADER)]);
 
-	// Browser-facing routes get the permissive CORS layer.
-	let browser_routes =
-		public::init(app.clone()).merge(protected::init(app.clone())).layer(cors_layer);
+	// Browser-facing routes get the permissive CORS layer. The fallback sits inside it so a
+	// cross-origin `E-CORE-NOROUTE` body is readable; merged routers below must have none.
+	let browser_routes = public::init(app.clone())
+		.merge(protected::init(app.clone()))
+		.fallback(api_not_found)
+		.layer(cors_layer);
 
 	// App bundles live here, not on the app domain: an app iframe must not share
 	// the shell's origin. `/fonts/**` follows because bundle CSS references it
@@ -102,7 +106,6 @@ fn init_api_service(app: App) -> Router {
 	let router = browser_routes
 		.merge(dav::init(app.clone()))
 		.merge(asset_routes)
-		.fallback(api_not_found)
 		.layer(middleware::from_fn(request_id_middleware))
 		// Compress only an allowlist of text-based, genuinely-compressible media
 		// types (default-deny — see `is_compressible_media_type`). SVG and other

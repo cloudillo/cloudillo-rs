@@ -9,7 +9,7 @@
 use axum::{
 	Router,
 	extract::DefaultBodyLimit,
-	http::{HeaderMap, HeaderValue, header},
+	http::{HeaderMap, HeaderName, HeaderValue, header},
 	response::Response,
 };
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -79,10 +79,10 @@ pub(super) fn is_compressible_media_type(
 		|| essence.ends_with("+xml") // includes image/svg+xml — intentionally compressed
 }
 
-/// Add transport/sniffing/referrer hardening headers to every response of a
-/// router.
+/// Add transport/sniffing/referrer hardening headers, plus `X-Cloudillo-Version`, to every
+/// response of a router.
 ///
-/// Deliberately scoped to three headers and **no framing policy**: the shell
+/// Deliberately scoped to these headers and **no framing policy**: the shell
 /// embeds sandboxed apps in iframes (including apps served from other
 /// instances), so no router-wide `X-Frame-Options` or `frame-ancestors` CSP may
 /// be added here — it would land on the app bundles too. Document CSPs are set
@@ -91,7 +91,7 @@ pub(super) fn is_compressible_media_type(
 /// on the shell document only), published sites' in
 /// `cloudillo-site/src/cache.rs::content_security_policy`.
 ///
-/// All three use `if_not_present` so handler- or file-specific headers (e.g.
+/// All of them use `if_not_present` so handler- or file-specific headers (e.g.
 /// the per-SVG `Content-Security-Policy` set when serving uploaded files) are
 /// never overwritten.
 pub(super) fn with_security_headers(router: Router) -> Router {
@@ -111,7 +111,15 @@ pub(super) fn with_security_headers(router: Router) -> Router {
 			header::REFERRER_POLICY,
 			HeaderValue::from_static("strict-origin-when-cross-origin"),
 		))
+		// Server version, so clients can detect what they talk to (exposed via CORS).
+		.layer(SetResponseHeaderLayer::if_not_present(
+			HeaderName::from_static(VERSION_HEADER),
+			HeaderValue::from_static(crate::app::VERSION),
+		))
 }
+
+/// Response header carrying the server version (`cloudillo_core::app::VERSION`).
+pub(super) const VERSION_HEADER: &str = "x-cloudillo-version";
 
 /// Add `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'` to
 /// every `application/json` response of a router (API router only).
