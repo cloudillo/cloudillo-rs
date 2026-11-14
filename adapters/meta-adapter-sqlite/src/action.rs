@@ -8,8 +8,8 @@ use sqlx::{Row, SqlitePool};
 use crate::utils::{Db, escape_like, inspect, parse_str_list, push_in};
 use cloudillo_types::meta_adapter::{
 	Action, ActionData, ActionId, ActionView, AttachmentView, AudienceType, FinalizeActionOptions,
-	HIDDEN_ACTION_STATUSES, ListActionOptions, ProfileRef, ProfileRelation, ProfileStatus,
-	ProfileType, UpdateActionDataOptions,
+	ListActionOptions, ProfileRef, ProfileRelation, ProfileStatus, ProfileType,
+	UpdateActionDataOptions, VISIBLE_ACTION_STATUSES,
 };
 use cloudillo_types::utils::normalize_id_tag;
 use cloudillo_types::{prelude::*, types::ApiTime};
@@ -73,13 +73,12 @@ fn push_action_filters(
 		query = push_in(query, status);
 	} else if opts.container.is_some() {
 		// Superseded joins and invites are conversation history.
-		query.push(
-			" AND coalesce(a.status, 'A') NOT IN ('V','F') \
-			 AND (coalesce(a.status, 'A') <> 'D' OR a.type IN ('SUBS','INVT'))",
-		);
+		query.push(" AND (coalesce(a.status, 'A') IN ");
+		query = push_in(query, VISIBLE_ACTION_STATUSES);
+		query.push(" OR (coalesce(a.status, 'A') = 'D' AND a.type IN ('SUBS','INVT')))");
 	} else {
-		query.push(" AND coalesce(a.status, 'A') NOT IN ");
-		query = push_in(query, &HIDDEN_ACTION_STATUSES);
+		query.push(" AND coalesce(a.status, 'A') IN ");
+		query = push_in(query, VISIBLE_ACTION_STATUSES);
 	}
 	// Drafts ('R') and scheduled ('S') rows are private to their issuer, whether
 	// the status was asked for explicitly or not. No viewer → never visible.

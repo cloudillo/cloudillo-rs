@@ -1787,7 +1787,7 @@ both_modes! {
 	/// row is physically gone. Only the sweep can un-index it, and the sweep can
 	/// only un-index what its listing returns. `ListActionOptions` with no
 	/// `status` is not "every row": the adapter reads it as the client-facing
-	/// default `NOT IN ('D', 'V', 'F')`, which hides exactly these. So the sweep
+	/// allowlist `VISIBLE_ACTION_STATUSES`, which hides exactly these. So the sweep
 	/// asks for every status explicitly, and `cloudillo_search`'s `is_live` check
 	/// then routes anything but an Active row to the deletion path — mirrored here
 	/// by `index_action`.

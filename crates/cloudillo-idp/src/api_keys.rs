@@ -5,9 +5,10 @@
 
 use axum::{
 	Json,
-	extract::{Path, Query, State},
+	extract::{Path, State},
 	http::StatusCode,
 };
+use cloudillo_types::extract::{JsonBody, Query};
 use serde::{Deserialize, Serialize};
 
 use std::sync::Arc;
@@ -159,7 +160,7 @@ pub async fn create_api_key(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
-	Json(create_req): Json<CreateApiKeyRequest>,
+	JsonBody(create_req): JsonBody<CreateApiKeyRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CreatedApiKeyResponse>>)> {
 	check_idp_enabled(&app, tn_id).await?;
 

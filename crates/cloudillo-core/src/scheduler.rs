@@ -19,6 +19,7 @@ use std::str::FromStr;
 
 use crate::prelude::*;
 use cloudillo_types::meta_adapter;
+use futures::future::BoxFuture;
 
 pub type TaskId = u64;
 
@@ -78,7 +79,7 @@ pub trait Task<S: Clone>: Send + Sync + Debug {
 	fn build(id: TaskId, context: &str) -> ClResult<Arc<dyn Task<S>>>
 	where
 		Self: Sized;
-	fn serialize(&self) -> String;
+	fn serialize(&self) -> ClResult<String>;
 	async fn run(&self, state: &S) -> ClResult<()>;
 
 	fn kind_of(&self) -> &'static str;
@@ -202,7 +203,7 @@ impl<S: Clone> TaskStore<S> for MetaAdapterTaskStore {
 	async fn add(&self, task: &TaskMeta<S>, key: Option<&str>) -> ClResult<TaskId> {
 		let id = self
 			.meta_adapter
-			.create_task(task.task.kind_of(), key, &task.task.serialize(), &task.deps)
+			.create_task(task.task.kind_of(), key, &task.task.serialize()?, &task.deps)
 			.await?;
 
 		// Store cron schedule if present
@@ -288,7 +289,7 @@ impl<S: Clone> TaskStore<S> for MetaAdapterTaskStore {
 
 		// Build TaskPatch from TaskMeta
 		let mut patch = meta_adapter::TaskPatch {
-			input: Patch::Value(task.task.serialize()),
+			input: Patch::Value(task.task.serialize()?),
 			next_at: match task.next_at {
 				Some(ts) => Patch::Value(ts),
 				None => Patch::Null,
@@ -562,6 +563,9 @@ pub struct TaskMeta<S: Clone> {
 
 type TaskBuilderRegistry<S> = HashMap<&'static str, Box<TaskBuilder<S>>>;
 type ScheduledTaskMap<S> = BTreeMap<(Timestamp, TaskId), TaskMeta<S>>;
+/// Called with `(state, task id, kind, error)` for a persisted row `load` cannot decode.
+type UnloadableHook<S> =
+	Box<dyn Fn(S, TaskId, Box<str>, String) -> BoxFuture<'static, ()> + Send + Sync>;
 
 // Scheduler
 #[derive(Clone)]
@@ -575,6 +579,7 @@ pub struct Scheduler<S: Clone> {
 	tx_finish: flume::Sender<TaskId>,
 	rx_finish: flume::Receiver<TaskId>,
 	notify_schedule: Arc<tokio::sync::Notify>,
+	unloadable_hook: Arc<RwLock<Option<UnloadableHook<S>>>>,
 }
 
 impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
@@ -591,11 +596,21 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			tx_finish,
 			rx_finish,
 			notify_schedule: Arc::new(tokio::sync::Notify::new()),
+			unloadable_hook: Arc::new(RwLock::new(None)),
 		};
 
 		//scheduler.run(rx_finish)?;
 
 		Arc::new(scheduler)
+	}
+
+	/// Set the callback run for each persisted row [`Self::load`] marks failed as undecodable
+	/// (e.g. to audit it). Replaces any earlier one.
+	pub fn on_unloadable(
+		&self,
+		f: impl Fn(S, TaskId, Box<str>, String) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+	) {
+		*self.unloadable_hook.write() = Some(Box::new(f));
 	}
 
 	pub fn start(&self, state: S) {
@@ -704,6 +719,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 		// Handle scheduled tasks
 		let schedule = self.clone();
+		let load_state = state.clone();
 		tokio::spawn(async move {
 			loop {
 				let is_empty = schedule.tasks_scheduled.lock().is_empty();
@@ -747,7 +763,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			// Only fatal failures reach here — `load` contains per-row ones itself.
 			// A scheduler that loaded nothing must say so rather than start empty
 			// and look healthy.
-			if let Err(e) = schedule.load().await {
+			if let Err(e) = schedule.load(&load_state).await {
 				error!("scheduler: failed to load persisted tasks: {}", e);
 			}
 		});
@@ -819,7 +835,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 		if let Some(key) = key
 			&& let Some((existing_id, existing_data)) = existing
 		{
-			let new_serialized = task.serialize();
+			let new_serialized = task.serialize()?;
 			let existing_serialized = existing_data.input.as_ref();
 			let params_changed = new_serialized != existing_serialized;
 
@@ -1133,39 +1149,103 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 
 	/// Re-queue every pending task the store holds.
 	///
-	/// Per-row failures are contained: an unregistered task kind, a malformed
-	/// `retry` column or a rejected `add_queue` costs exactly that one row. The
-	/// store's ordering is not partitioned by kind, so propagating out of the loop
-	/// would let one bad row — a task kind an older build persisted and this one
-	/// does not register — discard every ACME renewal, action fanout and email
-	/// task behind it.
+	/// Per-row failures are contained, so one bad row cannot discard every ACME renewal,
+	/// action fanout and email task behind it:
+	/// - a row whose kind this build does not register stays `'P'` and is skipped (logged):
+	///   a later build may load it;
+	/// - a row that cannot be decoded (input the builder rejects, malformed `retry`
+	///   column) is marked failed (`'E'`) with an audit event, and its dependents are
+	///   released — otherwise it would stay `'P'` and be retried forever;
+	/// - except a cron row: it stays `'P'` and is skipped (logged), since failing it would
+	///   lose the recurring task for good when a rollback or hot-fix can still decode it;
+	/// - a rejected `add_queue` (a store error, possibly transient) is logged and the row
+	///   stays `'P'` for the next start.
 	///
-	/// Only genuinely fatal failures propagate: the store read itself, and a
-	/// poisoned `task_builders` lock.
-	async fn load(&self) -> ClResult<()> {
+	/// Only the store read itself propagates.
+	async fn load(&self, state: &S) -> ClResult<()> {
 		let tasks = self.store.load().await?;
 		debug!("Loaded {} tasks from store", tasks.len());
-		let (mut seen, mut queued, mut skipped) = (0usize, 0usize, 0usize);
+		let (mut seen, mut queued, mut failed, mut skipped) = (0usize, 0usize, 0usize, 0usize);
 		for t in tasks {
 			if !matches!(t.status, TaskStatus::Pending) {
 				continue;
 			}
 			seen += 1;
-			let (id, kind) = (t.id, t.kind.clone());
-			match self.load_one(t).await {
-				Ok(()) => queued += 1,
+			let (id, kind, is_cron) = (t.id, t.kind.clone(), t.cron_data.is_some());
+			if !self.task_builders.read().contains_key(kind.as_ref()) {
+				error!(
+					"scheduler: no builder for persisted task {} ({}), leaving pending",
+					id, kind
+				);
+				skipped += 1;
+				continue;
+			}
+			let task_meta = match self.decode_task(t) {
+				Ok(task_meta) => task_meta,
+				Err(e) if is_cron => {
+					error!(
+						"scheduler: cannot decode recurring task {} ({}), leaving pending: {}",
+						id, kind, e
+					);
+					skipped += 1;
+					continue;
+				}
+				Err(e) => {
+					failed += 1;
+					self.fail_unloadable(state, id, &kind, &e.to_string()).await;
+					continue;
+				}
+			};
+			match self.add_queue(id, task_meta).await {
+				Ok(_) => queued += 1,
 				Err(e) => {
 					skipped += 1;
 					error!("scheduler: skipping persisted task {} ({}): {}", id, kind, e);
 				}
 			}
 		}
-		info!("scheduler: loaded {} pending tasks, {} queued, {} skipped", seen, queued, skipped);
+		info!(
+			"scheduler: loaded {} pending tasks, {} queued, {} failed, {} skipped",
+			seen, queued, failed, skipped
+		);
 		Ok(())
 	}
 
-	/// Re-queue one persisted task. Every failure here is per-row — see [`Self::load`].
-	async fn load_one(&self, t: TaskData) -> ClResult<()> {
+	/// Mark an undecodable persisted row failed, report it to the hook and release its
+	/// dependents.
+	///
+	/// `tx_finish` cannot release them: the row never reaches `tasks_running`. Dependents
+	/// loaded later resolve on their own, since `find_completed_deps` counts `'E'` as done.
+	async fn fail_unloadable(&self, state: &S, id: TaskId, kind: &str, reason: &str) {
+		error!(
+			"scheduler: persisted task {} ({}) cannot be loaded, marking failed: {}",
+			id, kind, reason
+		);
+		if let Err(e) = self.store.update_task_error(id, reason, None).await {
+			error!("scheduler: failed to mark task {} as failed: {}", id, e);
+		}
+		let hook = self
+			.unloadable_hook
+			.read()
+			.as_ref()
+			.map(|f| f(state.clone(), id, kind.into(), reason.to_owned()));
+		if let Some(fut) = hook {
+			fut.await;
+		}
+		let released = self.release_dependents(id);
+		if !released.is_empty() {
+			let mut scheduled = self.tasks_scheduled.lock();
+			for (dep_id, dep_meta) in released {
+				scheduled.insert((Timestamp(0), dep_id), dep_meta);
+			}
+			drop(scheduled);
+			self.notify_schedule.notify_one();
+		}
+	}
+
+	/// Decode one persisted row into its queue entry. Every error here means the row
+	/// itself is unusable — see [`Self::load`].
+	fn decode_task(&self, t: TaskData) -> ClResult<TaskMeta<S>> {
 		debug!("Loading task {} {}", t.id, t.kind);
 		let task = {
 			let builder_map = self.task_builders.read();
@@ -1219,7 +1299,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			None => None,
 		};
 
-		let task_meta = TaskMeta {
+		Ok(TaskMeta {
 			task,
 			next_at: t.next_at,
 			deps: t.deps.into(),
@@ -1227,8 +1307,7 @@ impl<S: Clone + Send + Sync + 'static> Scheduler<S> {
 			retry,
 			cron,
 			rerun_requested: false,
-		};
-		self.add_queue(t.id, task_meta).await.map(|_| ())
+		})
 	}
 
 	/// Take `id`'s entry out of `tasks_running`, metadata and rerun flag together.
@@ -1515,8 +1594,8 @@ mod tests {
 			Ok(task)
 		}
 
-		fn serialize(&self) -> String {
-			self.num.to_string()
+		fn serialize(&self) -> ClResult<String> {
+			Ok(self.num.to_string())
 		}
 
 		fn kind_of(&self) -> &'static str {
@@ -1575,8 +1654,8 @@ mod tests {
 			Ok(FailingTask::new(id, fail_count))
 		}
 
-		fn serialize(&self) -> String {
-			format!("{},{}", self.id, self.fail_count)
+		fn serialize(&self) -> ClResult<String> {
+			Ok(format!("{},{}", self.id, self.fail_count))
 		}
 
 		fn kind_of(&self) -> &'static str {
@@ -2348,6 +2427,8 @@ mod tests {
 		/// persisted status: `Some` keeps the row `'P'` (a cron task is not
 		/// finished by a failed run), `None` stamps it `'E'`.
 		errors: Mutex<Vec<(TaskId, Option<Timestamp>)>>,
+		/// Rows `load` hands back once, as if persisted by an earlier process.
+		loaded: Mutex<Vec<TaskData>>,
 		/// Hold `finished` open so a test can land a re-request *inside* that
 		/// await, which is where the race lives. Separate from `update_gate`
 		/// because a test that parks one still needs the other to run: the
@@ -2387,6 +2468,7 @@ mod tests {
 				input: Mutex::new(HashMap::new()),
 				finished: Mutex::new(Vec::new()),
 				errors: Mutex::new(Vec::new()),
+				loaded: Mutex::new(Vec::new()),
 				finished_gate: Arc::new(tokio::sync::Semaphore::new(finished_permits)),
 				update_gate: Arc::new(tokio::sync::Semaphore::new(update_permits)),
 				finished_entered: Arc::new(tokio::sync::Notify::new()),
@@ -2443,7 +2525,7 @@ mod tests {
 			};
 			self.input
 				.lock()
-				.insert(id, (task.task.kind_of().to_owned(), task.task.serialize()));
+				.insert(id, (task.task.kind_of().to_owned(), task.task.serialize()?));
 			if let Some(key) = key {
 				self.by_key.lock().insert(key.to_owned(), id);
 			}
@@ -2478,7 +2560,7 @@ mod tests {
 				.map(tokio::sync::SemaphorePermit::forget)
 				.map_err(|_| Error::Internal("store gate closed".into()))?;
 			if let Some(entry) = self.input.lock().get_mut(&id) {
-				entry.1 = task.task.serialize();
+				entry.1 = task.task.serialize()?;
 			}
 			Ok(())
 		}
@@ -2494,7 +2576,7 @@ mod tests {
 			Ok(())
 		}
 		async fn load(&self) -> ClResult<Vec<TaskData>> {
-			Ok(vec![])
+			Ok(std::mem::take(&mut *self.loaded.lock()))
 		}
 		async fn update_task_error(
 			&self,
@@ -2508,6 +2590,68 @@ mod tests {
 		async fn find_completed_deps(&self, _deps: &[TaskId]) -> ClResult<Vec<TaskId>> {
 			Ok(vec![])
 		}
+	}
+
+	fn pending_row(id: TaskId, kind: &str, input: &str) -> TaskData {
+		TaskData {
+			id,
+			kind: kind.into(),
+			status: TaskStatus::Pending,
+			input: input.into(),
+			deps: Box::new([]),
+			retry_data: None,
+			cron_data: None,
+			next_at: None,
+		}
+	}
+
+	/// A persisted pending row whose kind no builder is registered for stays `'P'`
+	/// (no `update_task_error`): a later build may register it.
+	#[tokio::test]
+	async fn unknown_kind_row_stays_pending_on_load() {
+		let store = KeyedTaskStore::new();
+		store.loaded.lock().push(pending_row(42, "nope.unknown", "{}"));
+		let task_store: Arc<dyn TaskStore<State>> = store.clone();
+		let scheduler = Scheduler::new(task_store);
+		// `load` directly, not `start`: no spawned load racing the assertion.
+		scheduler.load(&Arc::new(Mutex::new(Vec::new()))).await.unwrap();
+		assert!(store.errors.lock().is_empty());
+		assert!(store.finished.lock().is_empty());
+	}
+
+	/// A registered builder that rejects the persisted input marks the row failed
+	/// (`update_task_error` with no `next_at`, i.e. `'E'`) and reports it to the hook once.
+	#[tokio::test]
+	async fn rejected_input_row_is_marked_failed_on_load() {
+		let store = KeyedTaskStore::new();
+		store.loaded.lock().push(pending_row(43, "test", "not-a-u8"));
+		let task_store: Arc<dyn TaskStore<State>> = store.clone();
+		let scheduler = Scheduler::new(task_store);
+		scheduler.register::<TestTask>().unwrap();
+		scheduler.on_unloadable(|state: State, id, _kind, _error| {
+			Box::pin(async move { state.lock().extend(u8::try_from(id)) })
+		});
+		let state: State = Arc::new(Mutex::new(Vec::new()));
+		scheduler.load(&state).await.unwrap();
+		assert_eq!(*store.errors.lock(), vec![(43, None)]);
+		assert_eq!(*state.lock(), vec![43]);
+	}
+
+	/// The same rejected input on a cron row leaves it `'P'`: failing it would lose the
+	/// recurring task for good, while a rollback or hot-fix can still decode it.
+	#[tokio::test]
+	async fn rejected_input_cron_row_stays_pending_on_load() {
+		let store = KeyedTaskStore::new();
+		store.loaded.lock().push(TaskData {
+			cron_data: Some("0 3 * * *".into()),
+			..pending_row(44, "test", "not-a-u8")
+		});
+		let task_store: Arc<dyn TaskStore<State>> = store.clone();
+		let scheduler = Scheduler::new(task_store);
+		scheduler.register::<TestTask>().unwrap();
+		scheduler.load(&Arc::new(Mutex::new(Vec::new()))).await.unwrap();
+		assert!(store.errors.lock().is_empty());
+		assert!(store.finished.lock().is_empty());
 	}
 
 	/// A task whose body a test drives directly: `entered` fires the moment a run
@@ -2538,8 +2682,8 @@ mod tests {
 		fn build(_id: TaskId, _ctx: &str) -> ClResult<Arc<dyn Task<State>>> {
 			Err(Error::Internal("not rebuilt in this test".into()))
 		}
-		fn serialize(&self) -> String {
-			self.param.to_string()
+		fn serialize(&self) -> ClResult<String> {
+			Ok(self.param.to_string())
 		}
 		async fn run(&self, _state: &State) -> ClResult<()> {
 			self.runs.lock().push(self.param);
@@ -2949,7 +3093,11 @@ mod tests {
 			.iter()
 			.find(|((_, tid), _)| *tid == id)
 			.expect("cron task must be rescheduled");
-		assert_eq!(meta.task.serialize(), "2", "the cron reschedule used the stale snapshot");
+		assert_eq!(
+			meta.task.serialize().ok().as_deref(),
+			Some("2"),
+			"the cron reschedule used the stale snapshot"
+		);
 	}
 }
 

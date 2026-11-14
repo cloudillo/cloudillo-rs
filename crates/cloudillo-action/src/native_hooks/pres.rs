@@ -23,10 +23,16 @@ use crate::prelude::*;
 use cloudillo_types::action_types::CreateAction;
 use cloudillo_types::meta_adapter::{self, ActionView};
 
+/// `s` is an action id (`a{version}~…`) of any version: a CONV subject of an unknown version
+/// still takes the CONV path, where it finds no CONV and is refused.
+fn is_action_id(s: &str) -> bool {
+	cloudillo_types::hasher::parse_content_id(s).is_some_and(|(p, _, _)| p == "a")
+}
+
 /// Minimum gap between two hints of one issuer in one scope.
 const PRES_INTERVAL: Duration = Duration::from_secs(3);
 
-/// `(tn_id, scope, iss)` of a hint: the scope is a CONV id (`a1~…`) for a typing relay, the
+/// `(tn_id, scope, iss)` of a hint: the scope is a CONV id (`a{version}~…`) for a typing relay, the
 /// PRES type for a DM hint, so the two never collide.
 type PresKey = (TnId, Box<str>, Box<str>);
 
@@ -54,7 +60,7 @@ fn throttled(tn_id: TnId, scope: &str, iss: &str) -> bool {
 /// other PRES (DM presence) is addressed to someone and signed by the tenant itself.
 pub(crate) async fn before_create(app: App, ctx: BeforeCreate) -> ClResult<CreateAction> {
 	let mut action = ctx.action;
-	if let Some(conv_id) = action.subject.as_deref().filter(|s| s.starts_with("a1~")) {
+	if let Some(conv_id) = action.subject.as_deref().filter(|s| is_action_id(s)) {
 		let Some(conv) = helpers::get_group(app.meta_adapter.as_ref(), ctx.tn_id, conv_id).await?
 		else {
 			return Err(Error::PermissionDenied);
@@ -81,7 +87,7 @@ pub(crate) async fn before_create(app: App, ctx: BeforeCreate) -> ClResult<Creat
 /// addressed to us; relay an admitted group `PRES:TYPING`.
 pub(crate) async fn before_receive(app: App, ctx: BeforeReceive) -> ClResult<()> {
 	let a = &ctx.action;
-	if let Some(conv_id) = a.sub.as_deref().filter(|s| s.starts_with("a1~")) {
+	if let Some(conv_id) = a.sub.as_deref().filter(|s| is_action_id(s)) {
 		let Some(conv) = helpers::get_group(app.meta_adapter.as_ref(), ctx.tn_id, conv_id).await?
 		else {
 			debug!(sub = %conv_id, iss = %a.iss, "PRES refused: subject is not a CONV here");
@@ -126,7 +132,7 @@ pub(crate) async fn before_receive(app: App, ctx: BeforeReceive) -> ClResult<()>
 /// owner's own `PRES:TYPING` reaches its members through [`relay_typing`], as a member's does.
 pub(crate) async fn on_create(app: App, ctx: HookContext) -> ClResult<HookResult> {
 	let done = Ok(HookResult::default());
-	let Some(conv_id) = ctx.subject.as_deref().filter(|s| s.starts_with("a1~")) else {
+	let Some(conv_id) = ctx.subject.as_deref().filter(|s| is_action_id(s)) else {
 		return done;
 	};
 	let Some(token) = ctx.vars.get("token").and_then(|t| t.as_str()) else {

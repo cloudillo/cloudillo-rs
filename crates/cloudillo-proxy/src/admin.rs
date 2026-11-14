@@ -8,6 +8,7 @@ use axum::{
 	extract::{Path, State},
 	http::StatusCode,
 };
+use cloudillo_types::extract::JsonBody;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
@@ -137,7 +138,7 @@ pub async fn list_proxy_sites(
 pub async fn create_proxy_site(
 	State(app): State<App>,
 	Auth(auth_ctx): Auth,
-	Json(body): Json<CreateProxySiteRequest>,
+	JsonBody(body): JsonBody<CreateProxySiteRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ProxySiteResponse>>)> {
 	info!(domain = %body.domain, "POST /api/admin/proxy-sites - Creating proxy site");
 
@@ -205,7 +206,7 @@ pub async fn get_proxy_site(
 pub async fn update_proxy_site(
 	State(app): State<App>,
 	Path(site_id): Path<i64>,
-	Json(body): Json<UpdateProxySiteRequest>,
+	JsonBody(body): JsonBody<UpdateProxySiteRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ProxySiteResponse>>)> {
 	info!(site_id = site_id, "PATCH /api/admin/proxy-sites/{{siteId}}");
 

@@ -272,8 +272,8 @@ impl Task<App> for AuditPurgeTask {
 		Ok(Arc::new(AuditPurgeTask))
 	}
 
-	fn serialize(&self) -> String {
-		String::new()
+	fn serialize(&self) -> ClResult<String> {
+		Ok(String::new())
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -297,6 +297,15 @@ impl Task<App> for AuditPurgeTask {
 /// Register the purge task kind. Must run before the scheduler loads persisted tasks.
 pub fn init(app: &App) -> ClResult<()> {
 	app.scheduler.register::<AuditPurgeTask>()?;
+	app.scheduler.on_unloadable(|app, id, kind, error| {
+		Box::pin(async move {
+			let ev = AuditEvent {
+				details: Some(serde_json::json!({ "taskId": id, "kind": kind, "error": error })),
+				..AuditEvent::new(AuditCategory::Admin, "scheduler.task.unloadable", "fail")
+			};
+			record(&app, ev).await;
+		})
+	});
 	Ok(())
 }
 

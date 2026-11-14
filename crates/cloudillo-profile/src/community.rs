@@ -4,6 +4,7 @@
 //! Community profile creation handler
 
 use axum::{Json, extract::State, http::StatusCode};
+use cloudillo_types::extract::JsonBody;
 
 use crate::prelude::*;
 use cloudillo_core::{
@@ -35,7 +36,7 @@ pub struct PostCommunityBody {
 pub async fn post_community(
 	State(app): State<App>,
 	Auth(auth): Auth,
-	Json(body): Json<PostCommunityBody>,
+	JsonBody(body): JsonBody<PostCommunityBody>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CommunityProfileResponse>>)> {
 	#[derive(serde::Serialize)]
 	struct InboxRequest {

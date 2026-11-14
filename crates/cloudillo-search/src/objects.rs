@@ -1037,7 +1037,7 @@ impl Task<App> for IndexObjectTask {
 		Ok(Arc::new(serde_json::from_str::<Self>(ctx)?))
 	}
 
-	fn serialize(&self) -> String {
+	fn serialize(&self) -> ClResult<String> {
 		// Built by hand rather than via `to_string().unwrap_or("{}")`: "{}" does
 		// not deserialize back into this type, so a fallback would poison the
 		// persisted task row and log forever on retry.
@@ -1045,7 +1045,7 @@ impl Task<App> for IndexObjectTask {
 		obj.insert("tn_id".into(), self.tn_id.0.into());
 		obj.insert("obj_tp".into(), self.obj_tp.to_string().into());
 		obj.insert("obj_id".into(), self.obj_id.as_ref().into());
-		serde_json::Value::Object(obj).to_string()
+		Ok(serde_json::Value::Object(obj).to_string())
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {

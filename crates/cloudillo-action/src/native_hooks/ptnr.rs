@@ -160,11 +160,8 @@ impl Task<App> for PtnrAnnounceTask {
 		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
-		serde_json::to_string(self).unwrap_or_else(|e| {
-			error!("Failed to serialize PtnrAnnounceTask: {}", e);
-			"{}".to_string()
-		})
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {

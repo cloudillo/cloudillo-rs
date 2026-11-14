@@ -9,6 +9,7 @@ use axum::{
 	http::StatusCode,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use cloudillo_types::extract::JsonBody;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use rand::RngExt;
@@ -362,7 +363,7 @@ pub async fn post_reg(
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
 	headers: axum::http::HeaderMap,
-	Json(req): Json<RegReq>,
+	JsonBody(req): JsonBody<RegReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CredentialInfo>>)> {
 	info!("Registering WebAuthn credential for {}", auth.id_tag);
 
@@ -564,7 +565,7 @@ pub async fn post_login(
 	State(app): State<App>,
 	IdTag(host_id_tag): IdTag,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
-	Json(req): Json<LoginReq>,
+	JsonBody(req): JsonBody<LoginReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<super::handler::Login>>)> {
 	info!("Processing WebAuthn login");
 

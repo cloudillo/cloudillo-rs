@@ -84,6 +84,18 @@ async fn local_profile_pic_present(app: &App, tn_id: TnId, file_id: &str) -> boo
 	app.meta_adapter.read_file_variant(tn_id, &variant_id).await.is_ok()
 }
 
+/// The remote profile `type`; unknown → Person, the most restricted type (compat rules W4).
+fn parse_profile_type(typ: &str) -> ProfileType {
+	match typ {
+		"person" => ProfileType::Person,
+		"community" => ProfileType::Community,
+		_ => {
+			warn!(typ = %typ, "unknown profile type, treating as person");
+			ProfileType::Person
+		}
+	}
+}
+
 /// Ensure a profile exists locally by fetching from remote if needed.
 ///
 /// This function:
@@ -113,11 +125,7 @@ pub async fn ensure_profile(app: &App, tn_id: TnId, id_tag: &str) -> ClResult<bo
 			let remote = api_response.data;
 			check_protocol_version(app, id_tag, &remote).await;
 
-			// Determine profile type
-			let typ = match remote.r#type.as_str() {
-				"community" => ProfileType::Community,
-				_ => ProfileType::Person,
-			};
+			let typ = parse_profile_type(&remote.r#type);
 			let badges = person_badges(app, tn_id, id_tag, typ, &remote).await;
 
 			// Create the row WITHOUT profile_pic; the picture is fetched by a
@@ -320,11 +328,7 @@ pub(crate) async fn apply_refresh(
 				.ok()
 				.and_then(|(_, p)| p.profile_pic);
 
-			// Determine remote profile type
-			let typ = match remote.r#type.as_str() {
-				"community" => ProfileType::Community,
-				_ => ProfileType::Person,
-			};
+			let typ = parse_profile_type(&remote.r#type);
 
 			// Metadata always advances — this bumps `synced_at`, keeping a
 			// reachable `/api/me` permanently out of the abandonment window.
@@ -696,11 +700,8 @@ impl Task<App> for ProfilePicSyncTask {
 		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
-		serde_json::to_string(self).unwrap_or_else(|e| {
-			error!("Failed to serialize ProfilePicSyncTask: {}", e);
-			"{}".to_string()
-		})
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -775,8 +776,8 @@ impl Task<App> for ProfileRefreshBatchTask {
 		Ok(Arc::new(ProfileRefreshBatchTask))
 	}
 
-	fn serialize(&self) -> String {
-		"{}".to_string()
+	fn serialize(&self) -> ClResult<String> {
+		Ok("{}".to_string())
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -886,11 +887,8 @@ impl Task<App> for BadgeResyncTask {
 		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
-		serde_json::to_string(self).unwrap_or_else(|e| {
-			tracing::error!("Failed to serialize BadgeResyncTask: {}", e);
-			"{}".to_string()
-		})
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -928,6 +926,14 @@ impl Task<App> for BadgeResyncTask {
 mod tests {
 	use super::*;
 	use cloudillo_types::meta_adapter::ProfileConnectionStatus;
+
+	#[test]
+	fn unknown_profile_type_is_person() {
+		assert_eq!(parse_profile_type("person"), ProfileType::Person);
+		assert_eq!(parse_profile_type("community"), ProfileType::Community);
+		assert_eq!(parse_profile_type("robot"), ProfileType::Person);
+		assert_eq!(parse_profile_type(""), ProfileType::Person);
+	}
 
 	#[test]
 	fn verified_badge_row_requires_exp_aud_and_catalog() {

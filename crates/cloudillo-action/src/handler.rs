@@ -3,10 +3,11 @@
 
 use axum::{
 	Json,
-	extract::{ConnectInfo, Path, Query, State},
+	extract::{ConnectInfo, Path, State},
 	http::StatusCode,
 	response::IntoResponse,
 };
+use cloudillo_types::extract::{JsonBody, Query};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -58,15 +59,15 @@ pub async fn list_actions(
 	let is_leader = maybe_auth.as_ref().is_some_and(cloudillo_core::abac::is_unscoped_leader);
 	let is_moderator = maybe_auth.as_ref().is_some_and(cloudillo_core::abac::is_unscoped_moderator);
 
-	// `status=` narrows, never widens: hidden statuses stay out, and pending moderation (`C`)
-	// is the tenant's and its moderators'. A group moderator+ asking for `C` alone gets the
-	// knocks (SUBS) on their own groups, narrowed by `subject` in the query itself so
-	// `limit` stays exact.
+	// `status=` narrows, never widens: only visible statuses pass (unknown ones too stay out),
+	// and pending moderation (`C`) is the tenant's and its moderators'. A group moderator+
+	// asking for `C` alone gets the knocks (SUBS) on their own groups, narrowed by `subject`
+	// in the query itself so `limit` stays exact.
 	if let Some(status) = opts.status.take() {
 		let knocks_only = !is_tenant && !is_moderator && status.iter().all(|s| s == "C");
 		let mut status: Vec<String> = status
 			.into_iter()
-			.filter(|s| !meta_adapter::HIDDEN_ACTION_STATUSES.contains(&s.as_str()))
+			.filter(|s| meta_adapter::VISIBLE_ACTION_STATUSES.contains(&s.as_str()))
 			.filter(|s| is_tenant || is_moderator || knocks_only || s != "C")
 			.collect();
 		if knocks_only && !status.is_empty() {
@@ -265,7 +266,7 @@ pub async fn list_actions(
 			.filter_map(|a| a.subject_action.take().map(|s| *s))
 			.filter(|s| {
 				let status = s.status.as_deref().unwrap_or("A");
-				!meta_adapter::HIDDEN_ACTION_STATUSES.contains(&status)
+				meta_adapter::VISIBLE_ACTION_STATUSES.contains(&status)
 					&& (status != "C" || is_tenant || is_moderator)
 					&& s.channel.as_ref().is_none_or(|c| enterable.is_none_or(|e| e.contains(c)))
 					&& s.hat.as_ref().is_none_or(|h| hidden_hat != Some(&*h.id_tag))
@@ -455,13 +456,13 @@ pub async fn patch_reader_state(
 	Auth(auth): Auth,
 	IdTag(id_tag): IdTag,
 	Path((kind, ref_)): Path<(String, String)>,
-	Json(body): Json<serde_json::Value>,
+	JsonBody(body): JsonBody<serde_json::Value>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ReaderStateItem>>)> {
 	if !cloudillo_core::abac::is_tenant_account(&auth, &id_tag) {
 		return Err(Error::PermissionDenied);
 	}
-	// Decoded here rather than by `Json<PatchReaderState>` so a bad body (`readAt: null`,
-	// an unknown field) is a 400 like the other validation errors, not axum's 422.
+	// Decoded here so a bad body (`readAt: null`) names the reader-state patch in its 400.
+	// Unknown fields are ignored.
 	let patch: meta_adapter::PatchReaderState = serde_json::from_value(body)
 		.map_err(|e| Error::ValidationError(format!("invalid reader-state patch: {e}")))?;
 	let (kind, ref_) = if kind == "A" || kind.starts_with("A:") {
@@ -608,7 +609,7 @@ pub async fn post_action(
 	tn_id: TnId,
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
-	Json(req): Json<CreateActionRequest>,
+	JsonBody(req): JsonBody<CreateActionRequest>,
 ) -> ClResult<axum::response::Response> {
 	let mut action = CreateAction { visibility: req.visibility, flags: req.flags, ..req.action };
 	// Defense-in-depth: apkg:publish scoped keys can only create APKG actions
@@ -795,7 +796,7 @@ pub async fn post_inbox(
 	State(app): State<App>,
 	tn_id: TnId,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
-	Json(inbox): Json<Inbox>,
+	JsonBody(inbox): JsonBody<Inbox>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<()>>)> {
 	let dsl = app.ext::<Arc<DslEngine>>()?;
 	// Pre-decode for the strict known-check and the PoW requirement, so both errors are returned
@@ -883,7 +884,7 @@ pub async fn post_inbox_sync(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	ConnectInfo(socket_addr): ConnectInfo<std::net::SocketAddr>,
-	Json(inbox): Json<Inbox>,
+	JsonBody(inbox): JsonBody<Inbox>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	use crate::process::process_inbound_action_token;
 
@@ -1317,7 +1318,7 @@ pub async fn patch_action(
 	Auth(auth): Auth,
 	IdTag(id_tag): IdTag,
 	Path(action_id): Path<String>,
-	Json(mut req): Json<PatchActionRequest>,
+	JsonBody(mut req): JsonBody<PatchActionRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
 	// Only drafts can be updated
 	if !action_id.starts_with('@') {
@@ -1418,7 +1419,7 @@ pub async fn publish_draft(
 	Auth(auth): Auth,
 	IdTag(id_tag): IdTag,
 	Path(action_id): Path<String>,
-	Json(req): Json<PublishDraftRequest>,
+	JsonBody(req): JsonBody<PublishDraftRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::ActionView>>)> {
 	// Only drafts can be published
 	if !action_id.starts_with('@') {
@@ -2088,7 +2089,7 @@ pub async fn post_verify_tokens(
 	tn_id: TnId,
 	Auth(auth): Auth,
 	IdTag(id_tag): IdTag,
-	Json(body): Json<VerifyTokensBody>,
+	JsonBody(body): JsonBody<VerifyTokensBody>,
 ) -> ClResult<Json<ApiResponse<Vec<VerifyTokenResult>>>> {
 	if !cloudillo_core::abac::is_tenant_account(&auth, &id_tag) {
 		return Err(Error::PermissionDenied);

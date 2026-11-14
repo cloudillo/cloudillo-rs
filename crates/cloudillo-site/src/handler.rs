@@ -33,6 +33,7 @@ use axum::{
 	extract::{Path, State},
 	http::StatusCode,
 };
+use cloudillo_types::extract::JsonBody;
 use serde::{Deserialize, Serialize};
 
 use crate::cache;
@@ -69,7 +70,7 @@ pub struct SiteConfig {
 /// `status` is deliberately not writable: it is the serving kill switch and the
 /// settings page has no control for it yet. A new record is created `'A'`.
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase", default)]
 pub struct PatchSite {
 	/// The owner's explicit main navigation, assigned wholesale. `null` is the
 	/// editor's "reset to automatic"; an empty array means the same thing, since empty
@@ -101,7 +102,7 @@ pub async fn patch_site(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
-	Json(mut body): Json<PatchSite>,
+	JsonBody(mut body): JsonBody<PatchSite>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SiteConfig>>)> {
 	// Trimmed before it is checked: `is_safe_nav_target` judges the *trimmed* string,
 	// so canonicalising here keeps the value checked and the value emitted the same
@@ -291,7 +292,7 @@ pub async fn publish_site(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
-	Json(body): Json<PublishRequest>,
+	JsonBody(body): JsonBody<PublishRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SiteDoc>>)> {
 	// Publishing into an unconfigured tenant would succeed and serve nothing; into a
 	// disabled one it would quietly re-arm the kill switch.
@@ -485,7 +486,7 @@ pub async fn mount_site_doc(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
-	Json(body): Json<MountRequest>,
+	JsonBody(body): JsonBody<MountRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SiteConfig>>)> {
 	if body.doc_file_id.trim().is_empty() {
 		return Err(Error::ValidationError("docFileId must not be empty".into()));
@@ -601,7 +602,7 @@ pub async fn rollback_site(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(auth): Auth,
-	Json(body): Json<RollbackRequest>,
+	JsonBody(body): JsonBody<RollbackRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SiteDoc>>)> {
 	// The adapter answers `false` for both "no such row" and "published once only".
 	// Neither is a server fault and both need the same fix, so they share a message.

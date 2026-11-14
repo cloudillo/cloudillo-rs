@@ -48,6 +48,20 @@ impl VideoTranscoderTask {
 			bitrate,
 		})
 	}
+
+	// Pre-JSON input of rows queued before the upgrade; drop at 1.0.
+	fn build_legacy(ctx: &str) -> ClResult<Self> {
+		let (tn_id, f_id, variant, max_dim, bitrate, path) =
+			ctx.split(',').collect_tuple().ok_or(Error::Parse)?;
+		Ok(Self {
+			tn_id: TnId(tn_id.parse()?),
+			f_id: f_id.parse()?,
+			input_path: Box::from(Path::new(path)),
+			variant: variant.into(),
+			max_dim: max_dim.parse()?,
+			bitrate: bitrate.parse()?,
+		})
+	}
 }
 
 #[async_trait]
@@ -60,29 +74,16 @@ impl Task<App> for VideoTranscoderTask {
 	}
 
 	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
-		let (tn_id, f_id, variant, max_dim, bitrate, path) =
-			ctx.split(',').collect_tuple().ok_or(Error::Parse)?;
-		let task = VideoTranscoderTask::new(
-			TnId(tn_id.parse()?),
-			f_id.parse()?,
-			Box::from(Path::new(path)),
-			variant,
-			max_dim.parse()?,
-			bitrate.parse()?,
-		);
-		Ok(task)
+		let task = if ctx.trim_start().starts_with('{') {
+			serde_json::from_str::<Self>(ctx)?
+		} else {
+			Self::build_legacy(ctx)?
+		};
+		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
-		format!(
-			"{},{},{},{},{},{}",
-			self.tn_id,
-			self.f_id,
-			self.variant,
-			self.max_dim,
-			self.bitrate,
-			self.input_path.to_string_lossy()
-		)
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -173,11 +174,34 @@ mod tests {
 		let task =
 			VideoTranscoderTask::new(TnId(1), 42, Path::new("/tmp/test.mp4"), "vid.hd", 1080, 5000);
 
-		let serialized = Task::<App>::serialize(task.as_ref());
-		assert!(serialized.contains("1,42,vid.hd,1080,5000"));
+		let serialized = Task::<App>::serialize(task.as_ref()).unwrap();
+		assert!(serialized.starts_with('{'));
+		assert!(serialized.contains("\"variant\":\"vid.hd\""));
+
+		let decoded: VideoTranscoderTask = serde_json::from_str(&serialized).unwrap();
+		assert_eq!(decoded.tn_id, task.tn_id);
+		assert_eq!(decoded.f_id, task.f_id);
+		assert_eq!(decoded.variant, task.variant);
+		assert_eq!(decoded.input_path, task.input_path);
+		assert_eq!(decoded.max_dim, task.max_dim);
+		assert_eq!(decoded.bitrate, task.bitrate);
 
 		let rebuilt = VideoTranscoderTask::build(0, &serialized).unwrap();
 		assert_eq!(rebuilt.kind_of(), "video.transcode");
+	}
+
+	#[test]
+	fn test_video_transcoder_build_legacy() {
+		let ctx = "1,42,vid.hd,1080,5000,/tmp/test.mp4";
+		assert_eq!(VideoTranscoderTask::build(0, ctx).unwrap().kind_of(), "video.transcode");
+
+		let task = VideoTranscoderTask::build_legacy(ctx).unwrap();
+		assert_eq!(task.tn_id, TnId(1));
+		assert_eq!(task.f_id, 42);
+		assert_eq!(&*task.variant, "vid.hd");
+		assert_eq!(&*task.input_path, Path::new("/tmp/test.mp4"));
+		assert_eq!(task.max_dim, 1080);
+		assert_eq!(task.bitrate, 5000);
 	}
 }
 

@@ -5,9 +5,10 @@
 
 use axum::{
 	Extension, Json,
-	extract::{ConnectInfo, Path, Query, State},
+	extract::{ConnectInfo, Path, State},
 	http::StatusCode,
 };
+use cloudillo_types::extract::{JsonBody, Query};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
@@ -265,7 +266,7 @@ pub async fn patch_file(
 	Auth(auth): Auth,
 	Path(file_id): Path<String>,
 	Extension(ResolvedEntry(file)): Extension<ResolvedEntry>,
-	Json(req): Json<PatchFileRequest>,
+	JsonBody(req): JsonBody<PatchFileRequest>,
 ) -> ClResult<Json<ApiResponse<meta_adapter::FileView>>> {
 	let mut opts = req.opts;
 	// `status` rides along on the same read as `visibility`, and is further held to `'A'` under
@@ -448,7 +449,7 @@ pub async fn restore_file(
 	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
 	Extension(ResolvedEntry(file)): Extension<ResolvedEntry>,
-	Json(req): Json<RestoreFileRequest>,
+	JsonBody(req): JsonBody<RestoreFileRequest>,
 ) -> ClResult<Json<ApiResponse<meta_adapter::FileView>>> {
 	require_lifecycle(&app, &auth, &tenant_id_tag, &file).await?;
 
@@ -576,7 +577,7 @@ pub async fn patch_file_user_data(
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
 	Path(file_id): Path<String>,
-	Json(req): Json<PatchFileUserDataRequest>,
+	JsonBody(req): JsonBody<PatchFileUserDataRequest>,
 ) -> ClResult<Json<ApiResponse<meta_adapter::FileView>>> {
 	// Pins and stars are kept per user: a share link (`sub`-less and scoped, so its id_tag
 	// names the tenant) or a guest has no user to keep them for. The owner's own session is
@@ -654,7 +655,7 @@ pub async fn duplicate_file(
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
 	Path(file_id): Path<String>,
-	Json(req): Json<DuplicateFileRequest>,
+	JsonBody(req): JsonBody<DuplicateFileRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::FileView>>)> {
 	// Read access to the *source* is required before copying its contents, otherwise
 	// any private CRDT/RTDB document could be exfiltrated by duplicating it. The check

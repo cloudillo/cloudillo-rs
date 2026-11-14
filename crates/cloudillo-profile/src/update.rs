@@ -8,6 +8,7 @@ use axum::{
 	extract::{ConnectInfo, Path, State},
 	http::StatusCode,
 };
+use cloudillo_types::extract::JsonBody;
 use std::net::SocketAddr;
 
 use serde::Deserialize;
@@ -41,7 +42,7 @@ pub async fn patch_own_profile(
 	State(app): State<App>,
 	IdTag(tenant): IdTag,
 	Auth(auth): Auth,
-	Json(patch): Json<ProfilePatch>,
+	JsonBody(patch): JsonBody<ProfilePatch>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ProfileView>>)> {
 	let tn_id = auth.tn_id;
 
@@ -178,7 +179,7 @@ pub async fn patch_profile_admin(
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
 	Path(id_tag): Path<String>,
-	Json(patch): Json<AdminProfilePatch>,
+	JsonBody(patch): JsonBody<AdminProfilePatch>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ProfileView>>)> {
 	let tn_id = auth.tn_id;
 	refuse_suspended(patch.status)?;
@@ -443,7 +444,7 @@ pub async fn patch_profile_relationship(
 	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
 	Path(id_tag): Path<String>,
-	Json(patch): Json<PatchProfileRelationshipRequest>,
+	JsonBody(patch): JsonBody<PatchProfileRelationshipRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ProfileView>>)> {
 	let tn_id = auth.tn_id;
 	refuse_suspended(patch.status)?;

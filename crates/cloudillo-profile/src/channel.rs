@@ -9,6 +9,7 @@ use axum::{
 	http::StatusCode,
 	response::{IntoResponse, Response},
 };
+use cloudillo_types::extract::JsonBody;
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
@@ -57,7 +58,7 @@ struct PorchMember {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateChannelRequest {
 	name: String,
 	title: Option<String>,
@@ -70,10 +71,12 @@ pub struct CreateChannelRequest {
 	closed: bool,
 }
 
-/// No `name`: channel names are immutable, and `deny_unknown_fields` refuses one.
+/// Channel names are immutable: a `name` key is a 400; other unknown fields are ignored.
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct PatchChannelRequest {
+	#[serde(default)]
+	name: Patch<serde::de::IgnoredAny>,
 	#[serde(default)]
 	title: Patch<String>,
 	#[serde(default)]
@@ -219,7 +222,7 @@ pub async fn list_channels(
 pub async fn post_channel(
 	State(app): State<App>,
 	Auth(auth): Auth,
-	Json(req): Json<CreateChannelRequest>,
+	JsonBody(req): JsonBody<CreateChannelRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Channel>>)> {
 	require_room_creator(&app, &auth).await?;
 	if !validate_channel_name(&req.name) {
@@ -254,9 +257,12 @@ pub async fn patch_channel(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Path(name): Path<String>,
-	Json(req): Json<PatchChannelRequest>,
+	JsonBody(req): JsonBody<PatchChannelRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Channel>>)> {
 	require_moderator(&auth)?;
+	if !matches!(req.name, Patch::Undefined) {
+		return Err(Error::ValidationError("channel name is immutable".into()));
+	}
 	if let Patch::Value(c) = req.visibility {
 		validate_visibility(c)?;
 	}

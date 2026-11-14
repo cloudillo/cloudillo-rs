@@ -122,8 +122,8 @@ impl Task<App> for TenantImageUpdaterTask {
 		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
-		serde_json::to_string(self).unwrap_or_default()
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {

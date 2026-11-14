@@ -59,4 +59,36 @@ pub fn ref_surrogate(ref_id: &str) -> Box<str> {
 	hash("r", ref_id.as_bytes())
 }
 
+/// Splits a content id `{letters}{digits}~{hash}` (e.g. `b1~abc`) into `(prefix, version, hash)`.
+/// `None` when `s` is not shaped like a content id. The version is not checked here: only
+/// version 1 can be verified, so callers treat any other version as unsupported.
+pub fn parse_content_id(s: &str) -> Option<(&str, u32, &str)> {
+	let (head, hash) = s.split_once('~')?;
+	let digits_at = head.find(|c: char| c.is_ascii_digit())?;
+	let (prefix, version) = head.split_at(digits_at);
+	if prefix.is_empty()
+		|| hash.is_empty()
+		|| !prefix.bytes().all(|b| b.is_ascii_alphabetic())
+		|| !version.bytes().all(|b| b.is_ascii_digit())
+	{
+		return None;
+	}
+	Some((prefix, version.parse().ok()?, hash))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn content_id_parsing() {
+		assert_eq!(parse_content_id("b1~abc"), Some(("b", 1, "abc")));
+		assert_eq!(parse_content_id("ab12~x-y_z"), Some(("ab", 12, "x-y_z")));
+		assert_eq!(parse_content_id(&hash("f", b"x")).map(|(p, v, _)| (p, v)), Some(("f", 1)));
+		for bad in ["b~abc", "1~abc", "b1~", "b1abc", "b1x~abc", "", "~"] {
+			assert_eq!(parse_content_id(bad), None, "{bad}");
+		}
+	}
+}
+
 // vim: ts=4

@@ -370,11 +370,8 @@ impl Task<App> for CertRenewalTask {
 		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
-		// Cannot fail: only String and u32 fields, no custom Serialize impl.
-		// Fallback to "null" so build() fails loudly rather than creating a
-		// corrupt task with default values.
-		serde_json::to_string(self).unwrap_or_else(|_| "null".to_string())
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -557,9 +554,8 @@ impl Task<App> for AcmeEarlyRetryTask {
 		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
-		// Same as CertRenewalTask::serialize — no fallible field types.
-		serde_json::to_string(self).unwrap_or_else(|_| "null".to_string())
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {

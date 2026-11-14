@@ -79,6 +79,7 @@ use cloudillo_core::{
 	abac, doc_format,
 	extract::{Auth, IdTag},
 };
+use cloudillo_types::extract::JsonBody;
 use cloudillo_types::{
 	auth_adapter::AuthCtx,
 	meta_adapter::{DocFormat, UpsertDocFormat},
@@ -90,10 +91,10 @@ use crate::prelude::*;
 
 /// Body of `PUT /api/doc-formats/{content_type}`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct PutDocFormat {
-	/// `publisherTag` is the pre-rename key, kept so an older shell is not refused (see
-	/// `version` below). Remove together with `version`.
+	/// `publisherTag` is the pre-rename key, kept so an older shell's registration still
+	/// carries its publisher.
 	#[serde(rename = "publisherIdTag", alias = "publisherTag")]
 	pub publisher_tag: String,
 	pub app_name: String,
@@ -101,13 +102,6 @@ pub struct PutDocFormat {
 	/// of `major.minor.patch`, so `2.1` patch `42` is `2_001_042`. Registrations are
 	/// ordered by it; see the module docs.
 	pub format_version: Option<i64>,
-	/// Legacy app-version string, accepted and ignored.
-	///
-	/// `deny_unknown_fields` above would turn an older shell's request into a 400 on
-	/// every app start. Keeping the field is what lets the backend ship before the
-	/// frontend, which is the required deploy order. Remove one release after both
-	/// halves have shipped.
-	pub version: Option<String>,
 	/// `"RTDB"` | `"CRDT"` | `"BLOB"`. `storeTp` is the pre-rename key (see `publisherTag`).
 	#[serde(rename = "storeType", alias = "storeTp")]
 	pub store_tp: Option<String>,
@@ -161,7 +155,7 @@ pub async fn put_doc_format(
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
 	Path(content_type): Path<String>,
-	Json(body): Json<PutDocFormat>,
+	JsonBody(body): JsonBody<PutDocFormat>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Option<DocFormat>>>)> {
 	require_tenant_admin(&auth, &tenant_id_tag)?;
 	if content_type.is_empty() || content_type.len() > 128 {
@@ -551,7 +545,6 @@ mod tests {
 			publisher_tag: "cloudillo.org".into(),
 			app_name: "notillo".into(),
 			format_version,
-			version: None,
 			store_tp: Some("RTDB".into()),
 			nav_param: Some("nav".into()),
 			search,

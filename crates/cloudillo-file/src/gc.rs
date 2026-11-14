@@ -74,8 +74,8 @@ impl Task<App> for GcTask {
 		Ok(Arc::new(GcTask))
 	}
 
-	fn serialize(&self) -> String {
-		String::new()
+	fn serialize(&self) -> ClResult<String> {
+		Ok(String::new())
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {

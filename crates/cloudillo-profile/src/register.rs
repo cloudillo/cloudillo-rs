@@ -3,10 +3,8 @@
 
 //! Registration and email verification handlers
 
-use axum::{
-	extract::{Json, State},
-	http::StatusCode,
-};
+use axum::{Json, extract::State, http::StatusCode};
+use cloudillo_types::extract::JsonBody;
 use regex::Regex;
 use serde_with::skip_serializing_none;
 
@@ -291,7 +289,7 @@ pub async fn verify_register_data(
 pub async fn post_verify_profile(
 	State(app): State<cloudillo_core::app::App>,
 	OptionalAuth(auth): OptionalAuth,
-	Json(req): Json<RegisterVerifyCheckRequest>,
+	JsonBody(req): JsonBody<RegisterVerifyCheckRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<DomainValidationResponse>>)> {
 	// Require either authentication OR valid token
 	let is_authenticated = auth.is_some();
@@ -975,7 +973,7 @@ pub struct RegisterResponse {
 /// Requires a valid registration token (invitation ref)
 pub async fn post_register(
 	State(app): State<cloudillo_core::app::App>,
-	Json(req): Json<RegisterRequest>,
+	JsonBody(req): JsonBody<RegisterRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<RegisterResponse>>)> {
 	// Validate request fields
 	if req.id_tag.is_empty() || req.token.is_empty() || req.email.is_empty() {

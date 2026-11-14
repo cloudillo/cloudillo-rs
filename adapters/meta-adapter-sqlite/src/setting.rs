@@ -50,6 +50,13 @@ fn push_prefix_filter(builder: &mut QueryBuilder<Sqlite>, prefix: Option<&[Strin
 	builder.push(")");
 }
 
+/// Parse a stored setting value; an unparseable one is logged and treated as absent.
+fn parse_stored(name: &str, raw: &str) -> Option<serde_json::Value> {
+	serde_json::from_str(raw)
+		.inspect_err(|e| warn!("Unparseable stored setting {name:?}, ignoring it: {e}"))
+		.ok()
+}
+
 /// Decode `(name, value)` rows into a settings map, dropping unparseable values and stored
 /// JSON `null`s — `null` is the delete sentinel on the write path, so it is never a value.
 fn rows_to_settings(rows: Vec<SqliteRow>) -> ClResult<HashMap<String, serde_json::Value>> {
@@ -57,8 +64,7 @@ fn rows_to_settings(rows: Vec<SqliteRow>) -> ClResult<HashMap<String, serde_json
 	for row in rows {
 		let name: String = row.try_get("name").db()?;
 		let value: Option<String> = row.try_get("value").db()?;
-		if let Some(json_value) =
-			value.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+		if let Some(json_value) = value.and_then(|v| parse_stored(&name, &v))
 			&& !json_value.is_null()
 		{
 			settings.insert(name, json_value);
@@ -96,7 +102,7 @@ pub(crate) async fn read(
 
 	Ok(row.and_then(|r| {
 		let value: Option<String> = r.get("value");
-		value.and_then(|v| serde_json::from_str(&v).ok())
+		value.and_then(|v| parse_stored(name, &v))
 	}))
 }
 
@@ -184,9 +190,7 @@ pub(crate) async fn read_profile(
 	let value: Option<String> = row.try_get("value").db()?;
 	// Drop a stored JSON `null` so this agrees with `list_profile`, which filters them out.
 	// Unreachable today — `update_profile` routes a `null` body to the delete branch.
-	Ok(value
-		.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
-		.filter(|v| !v.is_null()))
+	Ok(value.and_then(|v| parse_stored(name, &v)).filter(|v| !v.is_null()))
 }
 
 /// Update or create a profile setting (None = delete)

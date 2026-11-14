@@ -96,14 +96,8 @@ impl Task<App> for HistoryFetchTask {
 		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
-		// `tn_id: TnId(i64)` and `peer_id_tag: Box<str>` cannot fail to
-		// serialize as JSON, so the error branch is unreachable in practice;
-		// the fallback exists only because the trait signature is infallible.
-		serde_json::to_string(self).unwrap_or_else(|e| {
-			error!("Failed to serialize HistoryFetchTask: {}", e);
-			"{}".to_string()
-		})
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {

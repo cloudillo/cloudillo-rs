@@ -29,8 +29,8 @@ impl Task<App> for AuthCleanupTask {
 		Ok(Arc::new(AuthCleanupTask))
 	}
 
-	fn serialize(&self) -> String {
-		String::new()
+	fn serialize(&self) -> ClResult<String> {
+		Ok(String::new())
 	}
 
 	fn kind_of(&self) -> &'static str {

@@ -415,7 +415,7 @@ async fn reindex_profiles(app: &App, tn_id: TnId) -> ClResult<SweepStats> {
 ///
 /// Spelled out so the sweep sees *all* of them. An absent `status` filter is not
 /// "no filter" in the meta adapter — `push_action_filters` reads it as the
-/// client-facing default `NOT IN ('D', 'V', 'F')`, which hides exactly the rows
+/// client-facing allowlist `VISIBLE_ACTION_STATUSES`, which hides exactly the rows
 /// the sweep has to visit in order to *un*-index them.
 const ALL_ACTION_STATUSES: [&str; 6] = ["A", "P", "R", "D", "V", "F"];
 
@@ -529,7 +529,7 @@ impl Task<App> for ReindexTask {
 		Ok(Arc::new(serde_json::from_str::<Self>(ctx)?))
 	}
 
-	fn serialize(&self) -> String {
+	fn serialize(&self) -> ClResult<String> {
 		// Built by hand rather than via `to_string().unwrap_or(…)`, like the sibling
 		// tasks in `objects` and `indexer`. A string fallback has to name *some*
 		// scope, and every scope that always parses is broader than the one that was
@@ -560,7 +560,7 @@ impl Task<App> for ReindexTask {
 				obj.insert("content_type".into(), content_type.as_ref().into());
 			}
 		}
-		serde_json::Value::Object(obj).to_string()
+		Ok(serde_json::Value::Object(obj).to_string())
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -699,7 +699,7 @@ mod tests {
 		for scope in scopes {
 			let task = ReindexTask { scope };
 			let derived = serde_json::to_string(&task).expect("derive serializes");
-			let ours = <ReindexTask as Task<App>>::serialize(&task);
+			let ours = <ReindexTask as Task<App>>::serialize(&task).expect("serialize");
 			assert_eq!(
 				serde_json::from_str::<serde_json::Value>(&ours).expect("ours parses"),
 				serde_json::from_str::<serde_json::Value>(&derived).expect("derived parses"),
@@ -713,7 +713,7 @@ mod tests {
 	#[test]
 	fn a_persisted_task_rebuilds_with_the_scope_it_was_created_with() {
 		let task = ReindexTask { scope: ReindexScope::Tenant { tn_id: TnId(42) } };
-		let stored = <ReindexTask as Task<App>>::serialize(&task);
+		let stored = <ReindexTask as Task<App>>::serialize(&task).expect("serialize");
 		let back: ReindexTask = serde_json::from_str(&stored).expect("round-trips");
 		assert!(
 			matches!(back.scope, ReindexScope::Tenant { tn_id } if tn_id == TnId(42)),

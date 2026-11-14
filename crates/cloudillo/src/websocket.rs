@@ -10,9 +10,10 @@
 
 use axum::{
 	extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
-	extract::{ConnectInfo, Path, Query, State},
+	extract::{ConnectInfo, Path, State},
 	response::Response,
 };
+use cloudillo_types::extract::Query;
 use futures::SinkExt;
 use serde::Deserialize;
 use std::net::SocketAddr;

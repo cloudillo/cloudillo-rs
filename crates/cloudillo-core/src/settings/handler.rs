@@ -5,9 +5,10 @@
 
 use axum::{
 	Json,
-	extract::{ConnectInfo, Path, Query, State},
+	extract::{ConnectInfo, Path, State},
 	http::StatusCode,
 };
+use cloudillo_types::extract::{JsonBody, Query};
 use serde::Deserialize;
 use std::net::SocketAddr;
 
@@ -235,7 +236,7 @@ pub async fn update_setting(
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Path(name): Path<String>,
 	Query(query): Query<SettingScopeQuery>,
-	Json(req): Json<UpdateSettingRequest>,
+	JsonBody(req): JsonBody<UpdateSettingRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SettingResponse>>)> {
 	// Get setting definition for validation and permission check
 	let definition = app.settings_registry.get(&name).ok_or(Error::NotFound)?;
@@ -553,7 +554,7 @@ pub async fn put_profile_setting(
 	State(app): State<App>,
 	Auth(auth): Auth,
 	Path((id_tag, name)): Path<(String, String)>,
-	Json(req): Json<UpdateProfileSettingRequest>,
+	JsonBody(req): JsonBody<UpdateProfileSettingRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	// Canonicalize at the boundary; see `list_profile_settings`.
 	let id_tag = normalize_id_tag(&id_tag).into_owned();

@@ -9,9 +9,10 @@
 
 use axum::{
 	Json,
-	extract::{Path, Query, State},
+	extract::{Path, State},
 	http::StatusCode,
 };
+use cloudillo_types::extract::{JsonBody, Query};
 use uuid::Uuid;
 
 use cloudillo_core::{IdTag, extract::Auth, prelude::*};
@@ -317,7 +318,7 @@ pub async fn create_address_book(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	Json(body): Json<AddressBookCreate>,
+	JsonBody(body): JsonBody<AddressBookCreate>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<AddressBookOutput>>)> {
 	let name = body.name.trim();
 	validate_ab_name(name)?;
@@ -335,7 +336,7 @@ pub async fn patch_address_book(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path(ab_id): Path<u64>,
-	Json(patch): Json<AddressBookPatch>,
+	JsonBody(patch): JsonBody<AddressBookPatch>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<AddressBookOutput>>)> {
 	let name = match &patch.name {
 		Patch::Value(v) => Patch::Value(v.trim().to_string()),
@@ -441,7 +442,7 @@ pub async fn create_contact(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path(ab_id): Path<u64>,
-	Json(body): Json<ContactInput>,
+	JsonBody(body): JsonBody<ContactInput>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ContactOutput>>)> {
 	// Address book must exist.
 	app.meta_adapter.get_address_book(tn_id, ab_id).await?.ok_or(Error::NotFound)?;
@@ -456,7 +457,7 @@ pub async fn put_contact(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path((ab_id, uid)): Path<(u64, String)>,
-	Json(mut body): Json<ContactInput>,
+	JsonBody(mut body): JsonBody<ContactInput>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ContactOutput>>)> {
 	app.meta_adapter.get_address_book(tn_id, ab_id).await?.ok_or(Error::NotFound)?;
 	body.uid = Some(uid);
@@ -471,7 +472,7 @@ pub async fn patch_contact(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path((ab_id, uid)): Path<(u64, String)>,
-	Json(patch): Json<ContactPatch>,
+	JsonBody(patch): JsonBody<ContactPatch>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ContactOutput>>)> {
 	let stored = app.meta_adapter.get_contact(tn_id, ab_id, &uid).await?.ok_or(Error::NotFound)?;
 

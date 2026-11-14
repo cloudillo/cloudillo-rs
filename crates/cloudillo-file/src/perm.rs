@@ -181,16 +181,17 @@ async fn resolve_entry(
 	use std::borrow::Cow;
 	use tracing::debug;
 
-	// A variant id (`b…~hash`) resolves to its file id. A random entry id can start with `b`
-	// too, but never carries a `~`.
-	let file_id: Cow<str> =
-		if file_or_variant_id.starts_with('b') && file_or_variant_id.contains('~') {
-			debug!("Looking up file_id for variant_id: {}", file_or_variant_id);
-			let fid = app.meta_adapter.read_file_id_by_variant(tn_id, file_or_variant_id).await?;
-			Cow::Owned(fid.to_string())
-		} else {
-			Cow::Borrowed(file_or_variant_id)
-		};
+	// A variant id (`b{version}~hash`) resolves to its file id. A random entry id can start
+	// with `b` too, but never carries a `~`. An unknown version just finds no variant.
+	let file_id: Cow<str> = if cloudillo_types::hasher::parse_content_id(file_or_variant_id)
+		.is_some_and(|(p, _, _)| p == "b")
+	{
+		debug!("Looking up file_id for variant_id: {}", file_or_variant_id);
+		let fid = app.meta_adapter.read_file_id_by_variant(tn_id, file_or_variant_id).await?;
+		Cow::Owned(fid.to_string())
+	} else {
+		Cow::Borrowed(file_or_variant_id)
+	};
 
 	let ctx = file_access::FileAccessCtx::from_auth(Some(auth), tenant_id_tag);
 	let entries = file_access::access_entries(app, tn_id, &file_id).await?;

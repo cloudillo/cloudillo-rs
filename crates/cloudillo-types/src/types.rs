@@ -328,6 +328,22 @@ pub struct RegisterRequest {
 	pub lang: Option<String>,
 }
 
+/// Decodes an optional map keeping only its string values, so one unexpected value type from a
+/// peer drops that entry instead of failing the whole profile.
+fn string_values_only<'de, D: Deserializer<'de>>(
+	d: D,
+) -> Result<Option<BTreeMap<String, String>>, D::Error> {
+	let map = Option::<BTreeMap<String, serde_json::Value>>::deserialize(d)?;
+	Ok(map.map(|m| {
+		m.into_iter()
+			.filter_map(|(k, v)| match v {
+				serde_json::Value::String(s) => Some((k, s)),
+				_ => None,
+			})
+			.collect()
+	}))
+}
+
 /// Public profile wire type for federated profile exchange
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -341,7 +357,8 @@ pub struct Profile {
 	pub cover_pic: Option<String>,
 	pub keys: Vec<crate::auth_adapter::AuthKey>,
 	/// Extensible metadata (profile sections, tab config, etc.). Ordered, so the `/me/full`
-	/// ETag hashed over it is stable.
+	/// ETag hashed over it is stable. Read tolerantly: non-string values are dropped.
+	#[serde(default, deserialize_with = "string_values_only")]
 	pub x: Option<BTreeMap<String, String>>,
 	/// A community's partner communities: connected peers holding a hat contract for our
 	/// members. `None` = not a community; `Some([])` = no contracted partners.

@@ -39,6 +39,7 @@ use cloudillo_types::{
 	meta_adapter::{
 		ENTRY_PART_KIND, SEARCH_MAX_CONTENT_TYPES, SEARCH_MAX_LIMIT, SEARCH_MAX_OFFSET,
 		SEARCH_MAX_TAGS, SearchMatch, SearchObject, SearchOptions, SearchPart, SearchRow,
+		VISIBLE_ACTION_STATUSES,
 	},
 	prelude::*,
 };
@@ -1230,6 +1231,16 @@ pub async fn count(db: &SqlitePool, tn_id: TnId, opts: &SearchOptions) -> ClResu
 	Ok(row.get("n"))
 }
 
+/// Push `(?, ?, …)` bound to [`VISIBLE_ACTION_STATUSES`].
+fn push_visible_statuses(query: &mut QueryBuilder<Sqlite>) {
+	query.push("(");
+	let mut sep = query.separated(", ");
+	for status in VISIBLE_ACTION_STATUSES {
+		sep.push_bind(*status);
+	}
+	sep.push_unseparated(")");
+}
+
 /// Push the `FROM … WHERE …` shared by [`search`] and [`count`], so the two can
 /// never disagree about which rows a query matches.
 ///
@@ -1386,18 +1397,20 @@ fn push_search_filters(
 		push_file_grants(query, tn_id, opts);
 		query.push("))");
 
-		// The status test mirrors `push_action_filters`' default and `get_action`:
-		// 'D' deleted, 'V' inbound-verifying, 'F' permanently failed. Without it a
-		// retracted or key-superseded action stays a search hit while
-		// `GET /api/actions` already hides it — the raw-SQL dedup paths in
-		// `action.rs` set the status without notifying the index, so nothing else
-		// would correct it before the weekly full reindex. Drafts and scheduled
-		// rows are the issuer's alone, as in `push_action_filters`.
+		// The status test mirrors `push_action_filters`' default: only `VISIBLE_ACTION_STATUSES`
+		// ('D' deleted, 'V' inbound-verifying, 'F' failed and any unknown status stay out).
+		// Without it a retracted or key-superseded action stays a search hit while
+		// `GET /api/actions` already hides it — the raw-SQL dedup paths in `action.rs` set the
+		// status without notifying the index, so nothing else would correct it before the
+		// weekly full reindex. Drafts and scheduled rows are the issuer's alone, as in
+		// `push_action_filters`.
 		query.push(
 			" OR (d.obj_tp='A' AND EXISTS (SELECT 1 FROM actions a \
 			 WHERE a.tn_id=d.tn_id AND a.action_id=d.obj_id \
-			 AND coalesce(a.status, 'A') NOT IN ('D', 'V', 'F') AND ",
+			 AND coalesce(a.status, 'A') IN ",
 		);
+		push_visible_statuses(query);
+		query.push(" AND ");
 		crate::action::push_draft_guard(query, "a", viewer);
 		if !opts.actions_unguarded {
 			query.push(" AND ");
@@ -1415,8 +1428,10 @@ fn push_search_filters(
 		query.push(
 			" AND (d.obj_tp<>'A' OR EXISTS (SELECT 1 FROM actions a \
 			 WHERE a.tn_id=d.tn_id AND a.action_id=d.obj_id \
-			 AND coalesce(a.status, 'A') NOT IN ('D', 'V', 'F') AND ",
+			 AND coalesce(a.status, 'A') IN ",
 		);
+		push_visible_statuses(query);
+		query.push(" AND ");
 		crate::action::push_draft_guard(query, "a", viewer);
 		query.push("))");
 	}

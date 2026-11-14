@@ -593,14 +593,14 @@ impl Task<App> for IndexDocumentTask {
 		Ok(Arc::new(serde_json::from_str::<Self>(ctx)?))
 	}
 
-	fn serialize(&self) -> String {
+	fn serialize(&self) -> ClResult<String> {
 		// Built by hand rather than via `to_string().unwrap_or("{}")`: "{}"
 		// does not deserialize back into this type, so a fallback would poison
 		// the persisted task row and log forever on retry.
 		let mut obj = serde_json::Map::with_capacity(2);
 		obj.insert("tn_id".into(), self.tn_id.0.into());
 		obj.insert("file_id".into(), self.file_id.as_ref().into());
-		serde_json::Value::Object(obj).to_string()
+		Ok(serde_json::Value::Object(obj).to_string())
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {

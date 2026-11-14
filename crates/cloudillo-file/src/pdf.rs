@@ -184,13 +184,16 @@ pub struct PdfProcessorTask {
 }
 
 impl PdfProcessorTask {
-	pub fn new(
-		tn_id: TnId,
-		f_id: u64,
-		input_path: impl Into<Box<Path>>,
-		thumbnail_size: u32,
-	) -> Arc<Self> {
-		Arc::new(Self { tn_id, f_id, input_path: input_path.into(), thumbnail_size })
+	// Pre-JSON input of rows queued before the upgrade; drop at 1.0.
+	fn build_legacy(ctx: &str) -> ClResult<Self> {
+		let (tn_id, f_id, thumbnail_size, path) =
+			ctx.split(',').collect_tuple().ok_or(Error::Parse)?;
+		Ok(Self {
+			tn_id: TnId(tn_id.parse()?),
+			f_id: f_id.parse()?,
+			input_path: Box::from(Path::new(path)),
+			thumbnail_size: thumbnail_size.parse()?,
+		})
 	}
 }
 
@@ -204,25 +207,16 @@ impl Task<App> for PdfProcessorTask {
 	}
 
 	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
-		let (tn_id, f_id, thumbnail_size, path) =
-			ctx.split(',').collect_tuple().ok_or(Error::Parse)?;
-		let task = PdfProcessorTask::new(
-			TnId(tn_id.parse()?),
-			f_id.parse()?,
-			Box::from(Path::new(path)),
-			thumbnail_size.parse()?,
-		);
-		Ok(task)
+		let task = if ctx.trim_start().starts_with('{') {
+			serde_json::from_str::<Self>(ctx)?
+		} else {
+			Self::build_legacy(ctx)?
+		};
+		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
-		format!(
-			"{},{},{},{}",
-			self.tn_id,
-			self.f_id,
-			self.thumbnail_size,
-			self.input_path.to_string_lossy()
-		)
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -250,13 +244,37 @@ mod tests {
 
 	#[test]
 	fn test_pdf_processor_serialize_deserialize() {
-		let task = PdfProcessorTask::new(TnId(1), 42, Path::new("/tmp/test.pdf"), 256);
+		let task = PdfProcessorTask {
+			tn_id: TnId(1),
+			f_id: 42,
+			input_path: Path::new("/tmp/test.pdf").into(),
+			thumbnail_size: 256,
+		};
 
-		let serialized = Task::<App>::serialize(task.as_ref());
-		assert!(serialized.contains("1,42,256"));
+		let serialized = Task::<App>::serialize(&task).unwrap();
+		assert!(serialized.starts_with('{'));
+		assert!(serialized.contains("\"thumbnail_size\":256"));
+
+		let decoded: PdfProcessorTask = serde_json::from_str(&serialized).unwrap();
+		assert_eq!(decoded.tn_id, task.tn_id);
+		assert_eq!(decoded.f_id, task.f_id);
+		assert_eq!(decoded.input_path, task.input_path);
+		assert_eq!(decoded.thumbnail_size, task.thumbnail_size);
 
 		let rebuilt = PdfProcessorTask::build(0, &serialized).unwrap();
 		assert_eq!(rebuilt.kind_of(), "pdf.process");
+	}
+
+	#[test]
+	fn test_pdf_processor_build_legacy() {
+		let ctx = "1,42,256,/tmp/test.pdf";
+		assert_eq!(PdfProcessorTask::build(0, ctx).unwrap().kind_of(), "pdf.process");
+
+		let task = PdfProcessorTask::build_legacy(ctx).unwrap();
+		assert_eq!(task.tn_id, TnId(1));
+		assert_eq!(task.f_id, 42);
+		assert_eq!(&*task.input_path, Path::new("/tmp/test.pdf"));
+		assert_eq!(task.thumbnail_size, 256);
 	}
 }
 

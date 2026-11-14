@@ -110,11 +110,11 @@ fn primary_class(variants: &[cloudillo_types::meta_adapter::FileVariant<&str>]) 
 /// IDs are formatted as `prefix~hash` (e.g., `b1~abc123`, `f1~xyz789`, `d1~...`)
 /// Returns Ok(()) if hash matches, Err if mismatch
 fn verify_content_hash(data: &[u8], expected_id: &str) -> ClResult<()> {
-	// Extract prefix from expected ID (e.g., "b" from "b1~hash", "f" from "f1~hash")
-	let prefix = expected_id
-		.find('1')
-		.map(|pos| &expected_id[..pos])
+	let (prefix, version, _) = hasher::parse_content_id(expected_id)
 		.ok_or_else(|| Error::ValidationError(format!("Invalid ID format: {}", expected_id)))?;
+	if version != 1 {
+		return Err(Error::Unsupported(format!("content id version {}", version)));
+	}
 
 	// Compute hash using the same hasher that generates IDs
 	let computed_id = hasher::hash(prefix, data);
@@ -214,6 +214,9 @@ pub async fn sync_file_variants(
 
 	// 2. Verify descriptor hash matches file_id
 	if let Err(e) = verify_content_hash(descriptor.as_bytes(), file_id) {
+		if matches!(e, Error::Unsupported(_)) {
+			return Err(e);
+		}
 		// Regenerate the descriptor from parsed pieces; if it differs from what we fetched,
 		// the source's canonicalizer disagrees with ours. If it matches, the source's variants
 		// table has drifted from what was hashed at finalize.

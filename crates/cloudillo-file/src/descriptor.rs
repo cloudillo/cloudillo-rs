@@ -3,13 +3,14 @@
 
 //! File descriptor generation and parsing.
 //!
-//! Supports two descriptor formats:
-//! - d1~ (legacy): variant separator is `,`, ID separator is `~`
-//! - d2, (new): variant separator is `;`, ID separator is `,`
+//! Grammar (entries joined by `;`):
+//! `d2,[R=<root_id>;]<variant>:<variant_id>:f=<fmt>:s=<size>:r=<W>x<H>[:dur=..][:br=..][:pg=..]`
 //!
-//! Format examples:
-//! d1~tn:b1~abc123:f=webp:s=2048:r=128x128,sd:b1~def456:f=webp:s=10240:r=720x720
-//! d2,vis.tn:b1,abc123:f=webp:s=2048:r=128x128;vis.sd:b1,def456:f=webp:s=10240:r=720x720:dur=120.5:br=5000
+//! Example:
+//! `d2,R=f1~rootid;vis.tn:b1~abc123:f=webp:s=2048:r=128x128;`
+//! `vis.sd:b1~def456:f=webp:s=10240:r=720x720:dur=120.5:br=5000` (one string, split here)
+//!
+//! The parser still reads the legacy `d1~` format, whose entries are joined by `,`.
 
 use async_trait::async_trait;
 use itertools::Itertools;
@@ -151,7 +152,8 @@ pub fn parse_file_descriptor(
 			.collect::<ClResult<_>>()?;
 		Ok((None, variants))
 	} else {
-		Err(Error::Parse)
+		let version = descriptor.split([',', '~']).next().unwrap_or_default();
+		Err(Error::Unsupported(format!("descriptor version {}", version)))
 	}
 }
 
@@ -287,6 +289,15 @@ impl FileIdGeneratorTask {
 	pub fn new(tn_id: TnId, f_id: u64) -> Arc<Self> {
 		Arc::new(Self { tn_id, f_id })
 	}
+
+	// Pre-JSON input of rows queued before the upgrade; drop at 1.0.
+	fn build_legacy(ctx: &str) -> ClResult<Self> {
+		let (tn_id, f_id) = ctx
+			.split(',')
+			.collect_tuple()
+			.ok_or(Error::Internal("invalid FileIdGenerator context format".into()))?;
+		Ok(Self { tn_id: TnId(tn_id.parse()?), f_id: f_id.parse()? })
+	}
 }
 
 #[async_trait]
@@ -299,16 +310,16 @@ impl Task<App> for FileIdGeneratorTask {
 	}
 
 	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
-		let (tn_id, f_id) = ctx
-			.split(',')
-			.collect_tuple()
-			.ok_or(Error::Internal("invalid FileIdGenerator context format".into()))?;
-		let task = FileIdGeneratorTask::new(TnId(tn_id.parse()?), f_id.parse()?);
-		Ok(task)
+		let task = if ctx.trim_start().starts_with('{') {
+			serde_json::from_str::<Self>(ctx)?
+		} else {
+			Self::build_legacy(ctx)?
+		};
+		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
-		format!("{},{}", self.tn_id, self.f_id)
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -364,6 +375,21 @@ impl Task<App> for FileIdGeneratorTask {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn test_file_id_generator_build_legacy() {
+		assert_eq!(FileIdGeneratorTask::build(0, "1,42").unwrap().kind_of(), "file.id-generate");
+
+		let task = FileIdGeneratorTask::build_legacy("1,42").unwrap();
+		assert_eq!(task.tn_id, TnId(1));
+		assert_eq!(task.f_id, 42);
+	}
+
+	#[test]
+	fn test_parse_unknown_descriptor_version() {
+		let err = parse_file_descriptor("d3,vis.tn:b1~abc:f=webp").err();
+		assert!(matches!(err, Some(Error::Unsupported(m)) if m == "descriptor version d3"));
+	}
 
 	#[test]
 	fn test_parse_d1_descriptor() {

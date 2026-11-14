@@ -526,8 +526,8 @@ impl Task<App> for BackupTask {
 	fn build(_id: TaskId, _ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
 		Ok(Arc::new(Self))
 	}
-	fn serialize(&self) -> String {
-		String::new()
+	fn serialize(&self) -> ClResult<String> {
+		Ok(String::new())
 	}
 
 	// No retry policy: a failure is audited and shown by `GET /api/admin/backup`, and the next

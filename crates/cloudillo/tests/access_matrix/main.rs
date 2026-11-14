@@ -644,12 +644,14 @@ async fn audit_tenant_isolation() {
 async fn xff_ignored_in_standalone() {
 	use axum::extract::ConnectInfo;
 	use cloudillo::auth_adapter::AuditQuery;
-	let _g = FIXTURE_LOCK.read().await;
+	let _g = FIXTURE_LOCK.write().await;
 	let fx = setup().await;
-	// Unknown user: a server-wide row, so the per-tenant failed-login collapse cannot hide it.
-	let who = "zqm-xff-nobody.test";
+	// Dedicated tenant: its own failed-login window, so no other test's failure collapses this
+	// row (unknown users all share one window).
+	let who = "zqm-xff.test";
+	crate::fixture::tenant(&fx.app, who, None).await;
 	let body = serde_json::json!({ "idTag": who, "password": "wrong" }).to_string();
-	let mut r = req(ALICE, Method::POST, "/api/auth/login", None, Body::from(body));
+	let mut r = req(who, Method::POST, "/api/auth/login", None, Body::from(body));
 	r.headers_mut().insert("x-forwarded-for", "203.0.113.66".parse().unwrap());
 	let peer = r.extensions().get::<ConnectInfo<std::net::SocketAddr>>().unwrap().0.ip();
 	let (status, _) = call(&fx.api, r).await;
@@ -2347,7 +2349,7 @@ async fn patch_status_is_lifecycle_gated() {
 	let (st, body) =
 		send("owner@alice", Method::PATCH, uri.clone(), serde_json::json!({"status": "bogus"}))
 			.await;
-	assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "owner writes an unknown status: {body}");
+	assert_eq!(st, StatusCode::BAD_REQUEST, "owner writes an unknown status: {body}");
 	let (st, body) =
 		send("owner@alice", Method::PATCH, uri, serde_json::json!({"status": "deleted"})).await;
 	assert_eq!(st, StatusCode::BAD_REQUEST, "even the owner deletes through DELETE: {body}");
@@ -6499,7 +6501,8 @@ async fn export_download_repeats_for_owner_only() {
 	assert_eq!(st, StatusCode::ACCEPTED, "request export: {b}");
 	let raw = tokio::fs::read(fx.app.export_path(tn_id, "json")).await.unwrap();
 	let status: ExportStatus = serde_json::from_slice(&raw).unwrap();
-	let task = ExportTask::build(0, &format!("{}:{}", tn_id.0, status.created_at.0)).unwrap();
+	let ctx = serde_json::json!({ "tn_id": tn_id, "created_at": status.created_at }).to_string();
+	let task = ExportTask::build(0, &ctx).unwrap();
 	task.run(&fx.app).await.unwrap();
 	for n in 1..=2 {
 		let (st, b) = send(owner, Method::GET, "/api/export/download").await;

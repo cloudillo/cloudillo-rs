@@ -67,8 +67,8 @@ impl Task<App> for DbMaintenanceTask {
 		}
 	}
 
-	fn serialize(&self) -> String {
-		serde_json::to_string(self).unwrap_or_default()
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	// Deliberately no retry policy, matching `file.gc`: a retry storm of VACUUMs

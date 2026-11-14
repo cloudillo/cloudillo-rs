@@ -9,10 +9,11 @@
 
 use axum::{
 	Json,
-	extract::{Path, Query, State},
+	extract::{Path, State},
 	http::StatusCode,
 };
 use cloudillo_core::{IdTag, extract::Auth, prelude::*};
+use cloudillo_types::extract::{JsonBody, Query};
 use cloudillo_types::{
 	meta_adapter::{
 		Calendar, CalendarObject, CalendarObjectExtracted, CalendarObjectView, CalendarObjectWrite,
@@ -165,7 +166,7 @@ pub async fn create_calendar(
 	tn_id: TnId,
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
-	Json(body): Json<CalendarCreate>,
+	JsonBody(body): JsonBody<CalendarCreate>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CalendarOutput>>)> {
 	let name = body.name.trim();
 	validate_cal_name(name)?;
@@ -200,7 +201,7 @@ pub async fn patch_calendar(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path(cal_id): Path<u64>,
-	Json(patch): Json<CalendarPatch>,
+	JsonBody(patch): JsonBody<CalendarPatch>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CalendarOutput>>)> {
 	let name = match &patch.name {
 		Patch::Value(v) => Patch::Value(v.trim().to_string()),
@@ -335,7 +336,7 @@ pub async fn create_object(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path(cal_id): Path<u64>,
-	Json(body): Json<CalendarObjectInput>,
+	JsonBody(body): JsonBody<CalendarObjectInput>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CalendarObjectOutput>>)> {
 	app.meta_adapter.get_calendar(tn_id, cal_id).await?.ok_or(Error::NotFound)?;
 	let out = write_object(&app, tn_id, cal_id, body).await?;
@@ -349,7 +350,7 @@ pub async fn put_object(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path((cal_id, uid)): Path<(u64, String)>,
-	Json(mut body): Json<CalendarObjectInput>,
+	JsonBody(mut body): JsonBody<CalendarObjectInput>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CalendarObjectOutput>>)> {
 	app.meta_adapter.get_calendar(tn_id, cal_id).await?.ok_or(Error::NotFound)?;
 	body.uid = Some(uid);
@@ -454,7 +455,7 @@ pub async fn patch_object(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path((cal_id, uid)): Path<(u64, String)>,
-	Json(patch): Json<CalendarObjectPatch>,
+	JsonBody(patch): JsonBody<CalendarObjectPatch>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CalendarObjectOutput>>)> {
 	app.meta_adapter.get_calendar(tn_id, cal_id).await?.ok_or(Error::NotFound)?;
 
@@ -537,7 +538,7 @@ pub async fn split_series(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path((cal_id, uid)): Path<(u64, String)>,
-	Json(body): Json<SplitSeriesRequest>,
+	JsonBody(body): JsonBody<SplitSeriesRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SplitSeriesResponse>>)> {
 	app.meta_adapter.get_calendar(tn_id, cal_id).await?.ok_or(Error::NotFound)?;
 
@@ -680,7 +681,7 @@ pub async fn put_exception(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path((cal_id, uid, rid)): Path<(u64, String, String)>,
-	Json(mut body): Json<CalendarObjectInput>,
+	JsonBody(mut body): JsonBody<CalendarObjectInput>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CalendarObjectOutput>>)> {
 	// Master must already exist — overrides need a series to attach to.
 	app.meta_adapter
@@ -701,7 +702,7 @@ pub async fn patch_exception(
 	IdTag(_id_tag): IdTag,
 	Auth(_auth): Auth,
 	Path((cal_id, uid, rid)): Path<(u64, String, String)>,
-	Json(patch): Json<CalendarObjectPatch>,
+	JsonBody(patch): JsonBody<CalendarObjectPatch>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CalendarObjectOutput>>)> {
 	let ts =
 		parse_iso_ts(&rid).ok_or_else(|| Error::ValidationError("invalid recurrence_id".into()))?;

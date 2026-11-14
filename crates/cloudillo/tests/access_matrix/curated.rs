@@ -1523,6 +1523,14 @@ pub const SE: &[Row] = &[
 	("SE-51", "owner-scoped-w@alice", "container-p-tenant-active@alice", RS_CLEAR_NOTIFY, "Deny"),
 	("SE-52", "sharelink-w@alice", "container-p-tenant-active@alice", RS_CLEAR_NOTIFY, "Deny"),
 	("SE-53", "idp-key@alice", "container-p-tenant-active@alice", RS_CLEAR_NOTIFY, "Deny"),
+	// Unknown query params are ignored (forward compat); an unknown file status word
+	// matches nothing. A known param with a malformed value is still a 400, and an unknown param
+	// does not open a route the subject could not reach without it.
+	("SE-54", "owner@alice", "", Get("/api/actions?zqm=1&type=POST"), "Allow"),
+	("SE-55", "owner@alice", "", Get("/api/files?zqm=1&status=zqm"), "Allow"),
+	("SE-56", "owner@alice", "", Get("/api/actions?limit=zqm"), "400"),
+	("SE-57", "sharelink-w@alice", "", Get("/api/reader-state?zqm=1"), "Deny"),
+	("SE-58", "anon@alice", "", Get("/api/reader-state?zqm=1"), "Deny"),
 ];
 
 const ADMIN_TENANTS: Route = Call("GET", "/api/admin/tenants", "");
@@ -3242,6 +3250,22 @@ pub const CH: &[Row] = &[
 	("CH-71", "m_contributor@club", "", ChanPatch("zqm-scratch"), "Deny"),
 	("CH-72", "hatted@club", "", ChanPatch("zqm-scratch"), "Deny"),
 	("CH-73", "m_moderator@club", "", ChanPatch("zqm-scratch"), "Allow"),
+	// Channel names are immutable: a `name` key is refused, not silently ignored.
+	(
+		"CH-151",
+		"owner@club",
+		"",
+		Call("PATCH", "/api/channels/zqm-scratch", r#"{"name":"x"}"#),
+		"400",
+	),
+	// A `null` name is a `name` key too.
+	(
+		"CH-152",
+		"owner@club",
+		"",
+		Call("PATCH", "/api/channels/zqm-scratch", r#"{"name":null}"#),
+		"400",
+	),
 	// The roster is readable by moderator+ and by its own members; m_contributor is on closed-w's.
 	("CH-74", "m_contributor@club", "", ChanMembers("closed-w"), "Allow"),
 	("CH-75", "hatted@club", "", ChanMembers("closed-w"), "Deny"),

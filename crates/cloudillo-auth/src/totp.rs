@@ -14,6 +14,7 @@ use axum::{
 	http::StatusCode,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL};
+use cloudillo_types::extract::JsonBody;
 use dashmap::DashMap;
 use data_encoding::BASE32_NOPAD;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -405,7 +406,7 @@ pub async fn post_enroll(
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
-	Json(req): Json<TotpEnrollReq>,
+	JsonBody(req): JsonBody<TotpEnrollReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<TotpEnrollRes>>)> {
 	cloudillo_core::abac::require_tenant_account(&auth, &id_tag)?;
 	if mfa_mode(&app).await? == "off" {
@@ -436,7 +437,7 @@ pub async fn post_confirm(
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
-	Json(req): Json<TotpCodeReq>,
+	JsonBody(req): JsonBody<TotpCodeReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<TotpStatus>>)> {
 	cloudillo_core::abac::require_tenant_account(&auth, &id_tag)?;
 	let mode = mfa_mode(&app).await?;
@@ -471,7 +472,7 @@ pub async fn delete_totp(
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
-	Json(req): Json<TotpCodeReq>,
+	JsonBody(req): JsonBody<TotpCodeReq>,
 ) -> ClResult<StatusCode> {
 	cloudillo_core::abac::require_tenant_account(&auth, &id_tag)?;
 	if mfa_mode(&app).await? == "required" {

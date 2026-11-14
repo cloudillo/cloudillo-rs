@@ -23,9 +23,10 @@
 
 use axum::{
 	Json,
-	extract::{ConnectInfo, Path, Query, State},
+	extract::{ConnectInfo, Path, State},
 	http::StatusCode,
 };
+use cloudillo_types::extract::{JsonBody, Query};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
@@ -380,7 +381,7 @@ pub async fn create_ref(
 	tn_id: TnId,
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
-	Json(create_req): Json<CreateRefRequest>,
+	JsonBody(create_req): JsonBody<CreateRefRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<RefResponse>>)> {
 	info!(
 		tn_id = ?tn_id,
@@ -637,7 +638,7 @@ pub async fn update_ref(
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
 	Path(ref_id): Path<String>,
-	Json(req): Json<UpdateRefRequest>,
+	JsonBody(req): JsonBody<UpdateRefRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<RefResponse>>)> {
 	info!(
 		tn_id = ?tn_id,

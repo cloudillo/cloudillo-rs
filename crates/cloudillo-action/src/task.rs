@@ -771,11 +771,8 @@ impl Task<App> for ActionCreatorTask {
 		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
-		serde_json::to_string(self).unwrap_or_else(|e| {
-			error!("Failed to serialize ActionCreatorTask: {}", e);
-			"{}".to_string()
-		})
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -1191,11 +1188,8 @@ impl Task<App> for DraftPublishTask {
 		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
-		serde_json::to_string(self).unwrap_or_else(|e| {
-			error!("Failed to serialize DraftPublishTask: {}", e);
-			"{}".to_string()
-		})
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -1276,12 +1270,27 @@ pub struct ActionVerifierTask {
 	tn_id: TnId,
 	token: Box<str>,
 	/// Optional client IP address for rate limiting (stored as string for serialization)
+	#[serde(default)]
 	client_address: Option<Box<str>>,
 }
 
 impl ActionVerifierTask {
 	pub fn new(tn_id: TnId, token: Box<str>, client_address: Option<Box<str>>) -> Arc<Self> {
 		Arc::new(Self { tn_id, token, client_address })
+	}
+
+	// Pre-JSON input of rows queued before the upgrade; drop at 1.0.
+	// Format: "tn_id,token" or "tn_id,token,client_address"
+	fn build_legacy(ctx: &str) -> ClResult<Self> {
+		let parts: Vec<&str> = ctx.splitn(3, ',').collect();
+		let (Some(tn_id), Some(token)) = (parts.first(), parts.get(1)) else {
+			return Err(Error::Internal("invalid ActionVerifier context format".into()));
+		};
+		Ok(Self {
+			tn_id: TnId(tn_id.parse()?),
+			token: (*token).into(),
+			client_address: parts.get(2).map(|&s| s.into()),
+		})
 	}
 }
 
@@ -1295,23 +1304,16 @@ impl Task<App> for ActionVerifierTask {
 	}
 
 	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
-		// Format: "tn_id,token" or "tn_id,token,client_address"
-		let parts: Vec<&str> = ctx.splitn(3, ',').collect();
-		if parts.len() < 2 {
-			return Err(Error::Internal("invalid ActionVerifier context format".into()));
-		}
-		let tn_id = TnId(parts[0].parse()?);
-		let token = parts[1].into();
-		let client_address = parts.get(2).map(|&s| s.into());
-		let task = ActionVerifierTask::new(tn_id, token, client_address);
-		Ok(task)
+		let task = if ctx.trim_start().starts_with('{') {
+			serde_json::from_str::<Self>(ctx)?
+		} else {
+			Self::build_legacy(ctx)?
+		};
+		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
-		match &self.client_address {
-			Some(addr) => format!("{},{},{}", self.tn_id.0, self.token, addr),
-			None => format!("{},{}", self.tn_id.0, self.token),
-		}
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -1371,6 +1373,20 @@ fn is_aprv_reply_to_issuer(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn test_action_verifier_build_legacy() {
+		let ctx = "1,tok.en,10.0.0.1";
+		assert_eq!(ActionVerifierTask::build(0, ctx).unwrap().kind_of(), "action.verify");
+
+		let task = ActionVerifierTask::build_legacy(ctx).unwrap();
+		assert_eq!(task.tn_id, TnId(1));
+		assert_eq!(&*task.token, "tok.en");
+		assert_eq!(task.client_address.as_deref(), Some("10.0.0.1"));
+
+		let task = ActionVerifierTask::build_legacy("1,tok.en").unwrap();
+		assert_eq!(task.client_address, None);
+	}
 
 	#[test]
 	fn aprv_reply_needs_subject_addressed_to_us_from_recipient() {

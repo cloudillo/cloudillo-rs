@@ -16,9 +16,10 @@
 
 use axum::{
 	Json,
-	extract::{ConnectInfo, Path, Query, State},
+	extract::{ConnectInfo, Path, State},
 	http::StatusCode,
 };
+use cloudillo_types::extract::{JsonBody, Query};
 use serde::Deserialize;
 use serde_json::json;
 use std::net::SocketAddr;
@@ -146,7 +147,7 @@ pub async fn create_share(
 	IdTag(tenant_id_tag): IdTag,
 	tn_id: TnId,
 	Path(file_id): Path<String>,
-	Json(mut input): Json<CreateShareEntry>,
+	JsonBody(mut input): JsonBody<CreateShareEntry>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ShareEntry>>)> {
 	// Authorization before body validation, per the ordering convention in
 	// `cloudillo_core::share_access`.
@@ -376,7 +377,7 @@ pub async fn update_share(
 	IdTag(tenant_id_tag): IdTag,
 	tn_id: TnId,
 	Path((file_id, share_id)): Path<(String, i64)>,
-	Json(req): Json<UpdateShareRequest>,
+	JsonBody(req): JsonBody<UpdateShareRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ShareEntry>>)> {
 	let authority = require_share_manager(&app, tn_id, &file_id, &auth, &tenant_id_tag).await?;
 	file_access::require_entry_or_content_id(&authority.access.file_view, &file_id)?;

@@ -294,6 +294,7 @@ fn handler_serde_items_are_camel_case() {
 		("crates/cloudillo-profile/src/partners.rs", "PartnerSyncTask"),
 		("crates/cloudillo-auth/src/webauthn.rs", "RegChallengeToken"),
 		("crates/cloudillo-auth/src/webauthn.rs", "LoginChallengeToken"),
+		("crates/cloudillo-file/src/export.rs", "ExportTask"),
 	];
 	check_allow("handler_serde_items_are_camel_case", &["struct", "enum"], ALLOW);
 	let squash = |s: &str| s.replace(' ', "");
@@ -384,6 +385,60 @@ fn error_codes_only_in_registry() {
 		}
 	}
 	fail("\"E-… literal outside error.rs (use cloudillo_types::error::codes)", &hits);
+}
+
+/// REST handlers take `Query` / JSON bodies through the cloudillo wrappers, which map
+/// rejections to the structured error codes. Only `extract.rs` may name the axum ones.
+#[test]
+fn rest_extractors_use_cloudillo_wrappers() {
+	/// Whether a `use axum…;` statement imports `Query` or `Json` from `axum::extract`.
+	fn imports_raw(stmt: &str) -> bool {
+		stmt.match_indices("extract::").any(|(at, m)| {
+			let rest = &stmt[at + m.len()..];
+			let names = match rest.strip_prefix('{') {
+				Some(inner) => {
+					let mut depth = 1;
+					let end = inner
+						.char_indices()
+						.find(|&(_, c)| {
+							depth += match c {
+								'{' => 1,
+								'}' => -1,
+								_ => 0,
+							};
+							depth == 0
+						})
+						.map_or(inner.len(), |(i, _)| i);
+					&inner[..end]
+				}
+				None => rest,
+			};
+			names
+				.split(|c: char| !c.is_alphanumeric() && c != '_')
+				.any(|w| w == "Query" || w == "Json")
+		})
+	}
+	let mut hits = Vec::new();
+	for (rel, lines) in sources() {
+		if rel == "crates/cloudillo-types/src/extract.rs" {
+			continue;
+		}
+		for (i, line) in lines.iter().enumerate() {
+			let path =
+				line.contains("axum::extract::Query") || line.contains("axum::extract::Json");
+			let import = line.trim_start().starts_with("use axum") && {
+				let end = lines[i..]
+					.iter()
+					.position(|l| l.contains(';'))
+					.map_or(lines.len(), |p| i + p + 1);
+				imports_raw(&lines[i..end].join(" "))
+			};
+			if path || import {
+				hits.push(format!("{rel}:{} {}", i + 1, line.trim()));
+			}
+		}
+	}
+	fail("raw axum Query/Json extractor (use cloudillo_types::extract::{Query, JsonBody})", &hits);
 }
 
 /// Rule 5: no route puts a literal segment where a sibling route of the same length has a

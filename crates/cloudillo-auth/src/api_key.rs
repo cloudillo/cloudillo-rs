@@ -8,6 +8,7 @@ use axum::{
 	extract::{ConnectInfo, Path, State},
 	http::StatusCode,
 };
+use cloudillo_types::extract::JsonBody;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::net::SocketAddr;
@@ -206,7 +207,7 @@ pub async fn create_api_key(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
-	Json(req): Json<CreateApiKeyReq>,
+	JsonBody(req): JsonBody<CreateApiKeyReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<CreateApiKeyRes>>)> {
 	info!("Creating API key for tenant {}", auth.id_tag);
 
@@ -299,7 +300,7 @@ pub async fn update_api_key(
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
 	Path(key_id): Path<i64>,
-	Json(req): Json<UpdateApiKeyReq>,
+	JsonBody(req): JsonBody<UpdateApiKeyReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ApiKeyListItem>>)> {
 	info!("Updating API key {} for tenant {}", key_id, auth.id_tag);
 

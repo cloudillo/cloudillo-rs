@@ -438,6 +438,20 @@ impl ImageResizerTask {
 	) -> Arc<Self> {
 		Arc::new(Self { tn_id, f_id, path: path.into(), format, variant: variant.into(), res })
 	}
+
+	// Pre-JSON input of rows queued before the upgrade; drop at 1.0.
+	fn build_legacy(ctx: &str) -> ClResult<Self> {
+		let (tn_id, f_id, format, variant, x_res, y_res, path) =
+			ctx.split(',').collect_tuple().ok_or(Error::Parse)?;
+		Ok(Self {
+			tn_id: TnId(tn_id.parse()?),
+			f_id: f_id.parse()?,
+			path: Box::from(Path::new(path)),
+			variant: variant.into(),
+			format: format.parse()?,
+			res: (x_res.parse()?, y_res.parse()?),
+		})
+	}
 }
 
 #[async_trait]
@@ -450,33 +464,16 @@ impl Task<App> for ImageResizerTask {
 	}
 
 	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
-		let (tn_id, f_id, format, variant, x_res, y_res, path) =
-			ctx.split(',').collect_tuple().ok_or(Error::Parse)?;
-		let format: ImageFormat = format.parse()?;
-		let task = ImageResizerTask::new(
-			TnId(tn_id.parse()?),
-			f_id.parse()?,
-			Box::from(Path::new(path)),
-			variant,
-			format,
-			(x_res.parse()?, y_res.parse()?),
-		);
-		Ok(task)
+		let task = if ctx.trim_start().starts_with('{') {
+			serde_json::from_str::<Self>(ctx)?
+		} else {
+			Self::build_legacy(ctx)?
+		};
+		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
-		let format: &str = self.format.as_ref();
-
-		format!(
-			"{},{},{},{},{},{},{}",
-			self.tn_id,
-			self.f_id,
-			format,
-			self.variant,
-			self.res.0,
-			self.res.1,
-			self.path.to_string_lossy()
-		)
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -528,6 +525,51 @@ impl Task<App> for ImageResizerTask {
 			)
 			.await?;
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_image_resizer_serialize_deserialize() {
+		let task = ImageResizerTask::new(
+			TnId(1),
+			42,
+			Path::new("/tmp/test.png"),
+			"vis.sd",
+			ImageFormat::Webp,
+			(720, 480),
+		);
+
+		let serialized = Task::<App>::serialize(task.as_ref()).unwrap();
+		assert!(serialized.starts_with('{'));
+
+		let decoded: ImageResizerTask = serde_json::from_str(&serialized).unwrap();
+		assert_eq!(decoded.tn_id, task.tn_id);
+		assert_eq!(decoded.f_id, task.f_id);
+		assert_eq!(decoded.variant, task.variant);
+		assert_eq!(decoded.format.as_ref(), "webp");
+		assert_eq!(decoded.path, task.path);
+		assert_eq!(decoded.res, task.res);
+
+		let rebuilt = ImageResizerTask::build(0, &serialized).unwrap();
+		assert_eq!(rebuilt.kind_of(), "image.resize");
+	}
+
+	#[test]
+	fn test_image_resizer_build_legacy() {
+		let ctx = "1,42,webp,vis.sd,720,480,/tmp/test.png";
+		assert_eq!(ImageResizerTask::build(0, ctx).unwrap().kind_of(), "image.resize");
+
+		let task = ImageResizerTask::build_legacy(ctx).unwrap();
+		assert_eq!(task.tn_id, TnId(1));
+		assert_eq!(task.f_id, 42);
+		assert_eq!(&*task.variant, "vis.sd");
+		assert_eq!(task.format.as_ref(), "webp");
+		assert_eq!(&*task.path, Path::new("/tmp/test.png"));
+		assert_eq!(task.res, (720, 480));
 	}
 }
 

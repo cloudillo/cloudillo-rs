@@ -4,6 +4,7 @@
 //! Admin invite endpoint for community profile creation
 
 use axum::{Json, extract::State, http::StatusCode};
+use cloudillo_types::extract::JsonBody;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
@@ -41,7 +42,7 @@ pub struct InviteCommunityResponse {
 pub async fn post_invite_community(
 	State(app): State<App>,
 	Auth(auth): Auth,
-	Json(req): Json<InviteCommunityRequest>,
+	JsonBody(req): JsonBody<InviteCommunityRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<InviteCommunityResponse>>)> {
 	let admin_tn_id = auth.tn_id;
 	let admin_id_tag = &auth.id_tag;

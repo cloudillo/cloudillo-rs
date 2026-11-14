@@ -258,12 +258,8 @@ impl Task<App> for PartnerSyncTask {
 		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
-		// `TnId(i64)` cannot fail to serialize; the fallback only satisfies the signature.
-		serde_json::to_string(self).unwrap_or_else(|e| {
-			error!("Failed to serialize PartnerSyncTask: {}", e);
-			"{}".to_string()
-		})
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {

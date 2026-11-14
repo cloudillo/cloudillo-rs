@@ -31,8 +31,8 @@ impl Task<App> for TrashPurgeTask {
 		Ok(Arc::new(TrashPurgeTask))
 	}
 
-	fn serialize(&self) -> String {
-		String::new()
+	fn serialize(&self) -> ClResult<String> {
+		Ok(String::new())
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {

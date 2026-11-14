@@ -9,6 +9,7 @@ use axum::{
 	http::StatusCode,
 	response::{IntoResponse, Response},
 };
+use cloudillo_types::extract::JsonBody;
 use serde::{Deserialize, Serialize};
 
 use std::sync::Arc;
@@ -43,7 +44,7 @@ pub struct TestEmailResponse {
 pub async fn send_test_email(
 	State(app): State<App>,
 	Auth(auth_ctx): Auth,
-	Json(request): Json<TestEmailRequest>,
+	JsonBody(request): JsonBody<TestEmailRequest>,
 ) -> ClResult<Response> {
 	let tn_id = auth_ctx.tn_id;
 

@@ -1928,16 +1928,6 @@ fn apkg_definition() -> ActionDefinition {
 						},
 					);
 					props.insert(
-						"minPlatformVersion".to_string(),
-						SchemaField {
-							field_type: FieldType::String,
-							min_length: None,
-							max_length: Some(50),
-							r#enum: None,
-							items: None,
-						},
-					);
-					props.insert(
 						"tags".to_string(),
 						SchemaField {
 							field_type: FieldType::Array,

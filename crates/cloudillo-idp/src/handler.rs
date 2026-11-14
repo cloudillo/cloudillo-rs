@@ -6,9 +6,10 @@
 use axum::{
 	Json,
 	body::Bytes,
-	extract::{ConnectInfo, Path, Query, State},
+	extract::{ConnectInfo, Path, State},
 	http::StatusCode,
 };
+use cloudillo_types::extract::{JsonBody, Query};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
@@ -391,7 +392,7 @@ pub async fn create_identity(
 	tn_id: TnId,
 	IdTag(idp_domain): IdTag,
 	Auth(auth): Auth,
-	Json(create_req): Json<CreateIdentityRequest>,
+	JsonBody(create_req): JsonBody<CreateIdentityRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<IdentityResponse>>)> {
 	info!(
 		identity_id = %create_req.id_tag,
@@ -820,7 +821,7 @@ pub async fn update_identity_settings(
 	IdTag(idp_domain): IdTag,
 	Auth(auth): Auth,
 	Path(identity_id): Path<String>,
-	Json(update_req): Json<UpdateIdentitySettingsRequest>,
+	JsonBody(update_req): JsonBody<UpdateIdentitySettingsRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<IdentityResponse>>)> {
 	info!(
 		identity_id = %identity_id,
@@ -1256,7 +1257,7 @@ pub struct ActivateIdentityRequest {
 pub async fn activate_identity(
 	State(app): State<App>,
 	tn_id: TnId,
-	Json(activate_req): Json<ActivateIdentityRequest>,
+	JsonBody(activate_req): JsonBody<ActivateIdentityRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<IdentityResponse>>)> {
 	info!(
 		ref_id = %activate_req.ref_id,

@@ -28,7 +28,7 @@ server = [
 
 [dependencies]
 async-trait = "0.1.92"
-axum = { version = "0.8.9", default-features = false, features = ["json"] }
+axum = { version = "0.8.9", default-features = false, features = ["json", "query"] }
 base64 = "0.23.1"
 chrono = "0.4"
 flume = { version = "0.12.0", features = ["async"] }

@@ -4,10 +4,11 @@
 use axum::{
 	Json,
 	body::{Body, to_bytes},
-	extract::{self, Extension, Query, State},
+	extract::{self, Extension, State},
 	http::{HeaderMap, StatusCode, header},
 	response,
 };
+use cloudillo_types::extract::{JsonBody, Query};
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -397,6 +398,10 @@ pub async fn get_file_list(
 	// Default 30, hard max 200; the adapter reads `opts.limit` and fetches one extra row.
 	opts.limit = Some(opts.limit.unwrap_or(30).clamp(1, 200));
 	opts.apply_include();
+	// An unknown status word matches nothing (fail closed).
+	if opts.status_unknown {
+		return Ok((StatusCode::OK, Json(ApiResponse::with_next(Vec::new(), None))));
+	}
 	if opts.with_path
 		&& opts.file_id.is_none()
 		&& opts.limit.unwrap_or(30) as usize > MAX_BULK_WITHPATH_LIMIT
@@ -800,7 +805,7 @@ pub async fn get_file_variant_file_id(
 	extract::ConnectInfo(addr): extract::ConnectInfo<SocketAddr>,
 	OptionalAuth(maybe_auth): OptionalAuth,
 	tn_id: TnId,
-	extract::Query(selector): extract::Query<GetFileVariantSelector>,
+	Query(selector): Query<GetFileVariantSelector>,
 	Extension(ResolvedEntry(entry)): Extension<ResolvedEntry>,
 	headers: HeaderMap,
 ) -> ClResult<impl response::IntoResponse> {
@@ -1660,7 +1665,7 @@ pub async fn post_file(
 	tn_id: TnId,
 	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
-	extract::Json(req): extract::Json<PostFileRequest>,
+	JsonBody(req): JsonBody<PostFileRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<meta_adapter::FileView>>)> {
 	info!("POST /api/files - Creating file with fileTp={}", req.file_tp);
 
@@ -2282,7 +2287,7 @@ pub async fn post_file_blob(
 	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
 	extract::Path(preset_name): extract::Path<String>,
-	query: Query<PostFileQuery>,
+	Query(query): Query<PostFileQuery>,
 	header: axum::http::HeaderMap,
 	body: Body,
 ) -> ClResult<(StatusCode, Json<ApiResponse<UploadResponse>>)> {

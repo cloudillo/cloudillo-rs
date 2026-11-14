@@ -10,10 +10,11 @@
 use axum::{
 	Json,
 	body::Body,
-	extract::{Path, Query, State},
+	extract::{Path, State},
 	http::{StatusCode, header},
 	response::Response,
 };
+use cloudillo_types::extract::{JsonBody, Query};
 use serde::{Deserialize, Serialize};
 
 use cloudillo_types::worker::Priority;
@@ -228,6 +229,17 @@ mod tests {
 		assert_eq!(container_csp(AppTrust::Untrusted), Some(UNTRUSTED_APP_CSP));
 		assert_eq!(container_csp(AppTrust::Trusted), None);
 	}
+
+	/// Copy of `APP_SANDBOX` in `cloudillo/libs/core/src/iframe-sandbox.ts`; update both together.
+	const APP_SANDBOX: &str =
+		"allow-scripts allow-forms allow-downloads allow-popups allow-popups-to-escape-sandbox";
+
+	#[test]
+	fn untrusted_csp_matches_fe_sandbox() {
+		let tokens = UNTRUSTED_APP_CSP.strip_prefix("sandbox ");
+		assert_eq!(tokens, Some(APP_SANDBOX));
+		assert!(!UNTRUSTED_APP_CSP.contains("allow-same-origin"));
+	}
 }
 
 // ============================================================================
@@ -301,7 +313,7 @@ pub async fn install_app(
 	State(app): State<App>,
 	tn_id: TnId,
 	Auth(_auth): Auth,
-	Json(req): Json<InstallAppRequest>,
+	JsonBody(req): JsonBody<InstallAppRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<InstalledAppInfo>>)> {
 	// Look up the APKG action
 	let action = app
@@ -328,6 +340,18 @@ pub async fn install_app(
 		.get("version")
 		.and_then(|v| v.as_str())
 		.ok_or_else(|| Error::ValidationError("APKG missing version".into()))?;
+
+	// No shell capabilities exist yet, so any declared requirement is unmet.
+	if content
+		.get("requires")
+		.and_then(|r| r.get("shell"))
+		.and_then(|v| v.as_array())
+		.is_some_and(|a| !a.is_empty())
+	{
+		return Err(Error::ValidationError(
+			"APKG requires shell capabilities; this node supports no capabilities yet".into(),
+		));
+	}
 
 	// Get attachment file_id
 	let file_id = action

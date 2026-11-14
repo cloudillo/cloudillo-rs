@@ -138,9 +138,8 @@ impl Task<App> for EmailSenderTask {
 		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
-		serde_json::to_string(self)
-			.unwrap_or_else(|_| format!("email.send:{}:{}", self.tn_id.0, self.to))
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -335,7 +334,8 @@ mod tests {
 		);
 
 		// Use Task trait's serialize method
-		let serialized = cloudillo_core::scheduler::Task::serialize(&task);
+		let serialized =
+			cloudillo_core::scheduler::Task::serialize(&task).expect("should serialize");
 
 		// Should be valid JSON
 		assert!(serialized.contains("user@example.com"));
@@ -424,7 +424,8 @@ mod tests {
 			throttle_group: Some("direct".to_string()),
 		});
 
-		let serialized = cloudillo_core::scheduler::Task::serialize(&task);
+		let serialized =
+			cloudillo_core::scheduler::Task::serialize(&task).expect("should serialize");
 		let deserialized: EmailSenderTask =
 			serde_json::from_str(&serialized).expect("should deserialize");
 		let guard = deserialized.notify_guard.expect("guard should round-trip");

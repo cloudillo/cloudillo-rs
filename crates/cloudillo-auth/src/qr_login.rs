@@ -6,10 +6,11 @@
 
 use axum::{
 	Json,
-	extract::{ConnectInfo, Path, Query, State},
+	extract::{ConnectInfo, Path, State},
 	http::{HeaderMap, StatusCode, header},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL};
+use cloudillo_types::extract::{JsonBody, Query};
 use dashmap::DashMap;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -360,7 +361,7 @@ pub async fn post_respond(
 	IdTag(id_tag): IdTag,
 	Auth(auth): Auth,
 	Path(session_id): Path<String>,
-	Json(body): Json<RespondRequest>,
+	JsonBody(body): JsonBody<RespondRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<StatusResponse>>)> {
 	let store = app.ext::<QrLoginStore>()?;
 

@@ -257,10 +257,20 @@ pub async fn get_export_download(
 /// Builds one tenant's export ZIP. Queued by [`request_export`], keyed per tenant.
 /// `created_at` names the request it serves: a task left over from an earlier request
 /// must not finish a later one.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ExportTask {
 	tn_id: TnId,
 	created_at: ApiTime,
+}
+
+impl ExportTask {
+	// Pre-JSON input of rows queued before the upgrade; drop at 1.0.
+	fn build_legacy(ctx: &str) -> ClResult<Self> {
+		let (tn_id, ts) = ctx
+			.split_once(':')
+			.ok_or_else(|| Error::ValidationError("invalid export task context".into()))?;
+		Ok(Self { tn_id: TnId(tn_id.parse()?), created_at: ApiTime(ts.parse()?) })
+	}
 }
 
 #[async_trait]
@@ -273,14 +283,16 @@ impl Task<App> for ExportTask {
 	}
 
 	fn build(_id: TaskId, ctx: &str) -> ClResult<Arc<dyn Task<App>>> {
-		let (tn_id, ts) = ctx
-			.split_once(':')
-			.ok_or_else(|| Error::ValidationError("invalid export task context".into()))?;
-		Ok(Arc::new(ExportTask { tn_id: TnId(tn_id.parse()?), created_at: ApiTime(ts.parse()?) }))
+		let task = if ctx.trim_start().starts_with('{') {
+			serde_json::from_str::<Self>(ctx)?
+		} else {
+			Self::build_legacy(ctx)?
+		};
+		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
-		format!("{}:{}", self.tn_id.0, self.created_at.0)
+	fn serialize(&self) -> ClResult<String> {
+		Ok(serde_json::to_string(self)?)
 	}
 
 	/// Failure is reported through the status, not a scheduler retry: the owner sees `failed`
@@ -552,6 +564,15 @@ fn write_files(rt: &Handle, app: &App, tn_id: TnId, zip: &mut Zip) -> ClResult<(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn export_task_builds_from_legacy_input() {
+		assert_eq!(ExportTask::build(0, "1:1700000000").unwrap().kind_of(), "file.export");
+
+		let task = ExportTask::build_legacy("1:1700000000").unwrap();
+		assert_eq!(task.tn_id, TnId(1));
+		assert_eq!(task.created_at, ApiTime(1_700_000_000));
+	}
 
 	#[test]
 	fn entry_paths_follow_folders_and_stay_inside_the_archive() {

@@ -3,11 +3,8 @@
 
 //! Audit trail: auth event helper and the tenant's own audit list (`GET /api/auth/audit`).
 
-use axum::{
-	Json,
-	extract::{Query, State},
-	http::StatusCode,
-};
+use axum::{Json, extract::State, http::StatusCode};
+use cloudillo_types::extract::Query;
 use dashmap::{DashMap, mapref::entry::Entry};
 use serde::Serialize;
 use std::net::SocketAddr;

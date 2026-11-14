@@ -4,6 +4,7 @@
 //! Push notification HTTP handlers
 
 use axum::{Json, extract::State, http::StatusCode};
+use cloudillo_types::extract::JsonBody;
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
@@ -57,7 +58,7 @@ pub struct SubscriptionResponse {
 pub async fn post_subscription(
 	State(app): State<App>,
 	Auth(auth): Auth,
-	Json(body): Json<CreateSubscriptionRequest>,
+	JsonBody(body): JsonBody<CreateSubscriptionRequest>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<SubscriptionResponse>>)> {
 	// Server-wide off switch (`notify.push_allowed`), above any tenant `notify.push` choice.
 	if !app.settings.get_bool(SHARED_TN, "notify.push_allowed").await? {

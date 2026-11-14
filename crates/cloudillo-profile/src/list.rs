@@ -7,9 +7,10 @@ use std::collections::HashSet;
 
 use axum::{
 	Json,
-	extract::{Path, Query, State},
+	extract::{Path, State},
 	http::StatusCode,
 };
+use cloudillo_types::extract::Query;
 use serde::Deserialize;
 
 use crate::prelude::*;

@@ -5,9 +5,10 @@
 
 use axum::{
 	Json,
-	extract::{ConnectInfo, Path, Query, State},
+	extract::{ConnectInfo, Path, State},
 	http::StatusCode,
 };
+use cloudillo_types::extract::{JsonBody, Query};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::net::SocketAddr;
@@ -328,7 +329,7 @@ pub async fn patch_tenant(
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth_ctx): Auth,
 	Path(id_tag): Path<String>,
-	Json(body): Json<PatchTenantBody>,
+	JsonBody(body): JsonBody<PatchTenantBody>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<TenantView>>)> {
 	if body.expires_at.is_undefined() && body.storage_quota_override.is_undefined() {
 		return Err(Error::ValidationError("expiresAt or storageQuotaOverride is required".into()));
@@ -601,7 +602,7 @@ pub async fn purge_tenant_handler(
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth_ctx): Auth,
 	Path(id_tag): Path<String>,
-	Json(body): Json<PurgeTenantBody>,
+	JsonBody(body): JsonBody<PurgeTenantBody>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<PurgeTenantResponse>>)> {
 	if body.confirm_id_tag != id_tag {
 		return Err(Error::ValidationError("confirm_id_tag mismatch".into()));

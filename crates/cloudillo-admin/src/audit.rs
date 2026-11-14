@@ -6,10 +6,11 @@
 
 use axum::{
 	Json,
-	extract::{Query, State},
+	extract::State,
 	http::{HeaderMap, StatusCode, header},
 	response::{IntoResponse, Response},
 };
+use cloudillo_types::extract::Query;
 use serde::Deserialize;
 use std::net::SocketAddr;
 

@@ -237,7 +237,6 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 /// `map.tile_sources`: a JSON array of `{name, url, attribution}` string objects.
 fn tile_sources_validator(v: &SettingValue) -> ClResult<()> {
 	#[derive(serde::Deserialize)]
-	#[serde(deny_unknown_fields)]
 	#[allow(dead_code)]
 	struct TileSource {
 		name: String,

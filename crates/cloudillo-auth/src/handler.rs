@@ -3,9 +3,10 @@
 
 use axum::{
 	Json,
-	extract::{ConnectInfo, Query, State},
+	extract::{ConnectInfo, State},
 	http::{HeaderMap, StatusCode},
 };
+use cloudillo_types::extract::{JsonBody, Query};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_with::skip_serializing_none;
@@ -159,7 +160,7 @@ pub enum LoginRes {
 pub async fn post_login(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
-	Json(login): Json<LoginReq>,
+	JsonBody(login): JsonBody<LoginReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<LoginRes>>)> {
 	let auth = app.auth_adapter.check_tenant_password(&login.id_tag, &login.password).await;
 
@@ -220,7 +221,7 @@ pub struct LoginMfaReq {
 pub async fn post_login_mfa(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
-	Json(req): Json<LoginMfaReq>,
+	JsonBody(req): JsonBody<LoginMfaReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Login>>)> {
 	let store = app.ext::<totp::MfaStore>()?;
 	let Some(pending) = store.take_login(&req.mfa_token) else {
@@ -353,7 +354,7 @@ pub async fn post_logout(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
-	Json(req): Json<LogoutReq>,
+	JsonBody(req): JsonBody<LogoutReq>,
 ) -> ClResult<StatusCode> {
 	// Note: Token invalidation could be implemented with a token blacklist table
 	// For now, tokens remain valid until expiration (short-lived access tokens)
@@ -401,7 +402,7 @@ pub async fn post_password(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	Auth(auth): Auth,
-	Json(req): Json<PasswordReq>,
+	JsonBody(req): JsonBody<PasswordReq>,
 ) -> ClResult<StatusCode> {
 	// Validate new password strength
 	if req.new_password.trim().is_empty() {
@@ -787,11 +788,11 @@ pub async fn post_access_token(
 	id_tag: IdTag,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	OptionalAuth(maybe_auth): OptionalAuth,
-	body: Option<Json<AccessTokenReq>>,
+	body: Option<JsonBody<AccessTokenReq>>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	use tracing::warn;
 
-	let query = body.map(|Json(b)| b).unwrap_or_default();
+	let query = body.map(|JsonBody(b)| b).unwrap_or_default();
 
 	debug!("Got access token request for id_tag={} with scope={:?}", id_tag.0, query.scope);
 
@@ -1406,7 +1407,7 @@ pub async fn post_hat_endorse(
 	tn_id: TnId,
 	id_tag: IdTag,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
-	Json(query): Json<HatEndorseReq>,
+	JsonBody(query): JsonBody<HatEndorseReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<serde_json::Value>>)> {
 	let verify_fn = app.ext::<ActionVerifyFn>()?;
 	let proxy = verify_fn(&app, tn_id, &query.token, Some(&addr.ip()))
@@ -1562,9 +1563,9 @@ pub async fn post_proxy_token(
 	State(app): State<App>,
 	IdTag(own_id_tag): IdTag,
 	Auth(auth): Auth,
-	body: Option<Json<ProxyTokenReq>>,
+	body: Option<JsonBody<ProxyTokenReq>>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ProxyTokenRes>>)> {
-	let query = body.map(|Json(b)| b).unwrap_or_default();
+	let query = body.map(|JsonBody(b)| b).unwrap_or_default();
 	// `scope::scope_permits` already keeps every delegated token off this route. Fail closed
 	// here as well, for both branches: a share-link token must never be able to renew itself
 	// past its link's revocation, and re-deriving roles below would hand it the tenant's own
@@ -1704,7 +1705,7 @@ pub async fn post_set_password(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	IdTag(host_id_tag): IdTag,
-	Json(req): Json<SetPasswordReq>,
+	JsonBody(req): JsonBody<SetPasswordReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<LoginRes>>)> {
 	// Validate new password strength
 	if req.new_password.trim().is_empty() {
@@ -1874,7 +1875,7 @@ pub async fn post_complete_onboarding(
 	State(app): State<App>,
 	IdTag(tenant_id_tag): IdTag,
 	Auth(auth): Auth,
-	Json(req): Json<CompleteOnboardingReq>,
+	JsonBody(req): JsonBody<CompleteOnboardingReq>,
 ) -> ClResult<StatusCode> {
 	// The account itself, SADM excluded: no other session may retire its welcome link.
 	if !cloudillo_core::abac::is_tenant_account(&auth, &tenant_id_tag) {
@@ -1930,7 +1931,7 @@ pub async fn post_forgot_password(
 	State(app): State<App>,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	id_tag_ext: Option<IdTag>,
-	Json(req): Json<ForgotPasswordReq>,
+	JsonBody(req): JsonBody<ForgotPasswordReq>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ForgotPasswordRes>>)> {
 	let email = req.email.trim().to_lowercase();
 

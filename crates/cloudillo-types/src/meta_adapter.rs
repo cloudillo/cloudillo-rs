@@ -375,8 +375,9 @@ pub struct ReaderState {
 /// Partial update of a [`ReaderState`] (`PATCH /api/reader-state/{kind}/{ref}`). Each
 /// [`Patch`] field: absent = unchanged, `null` = reset, value = set. `read_at` is not
 /// nullable (forward-only): absent = unchanged, `null` is a deserialization error.
+/// Unknown fields are ignored.
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct PatchReaderState {
 	#[serde(default, deserialize_with = "deserialize_some")]
 	pub read_at: Option<Timestamp>,
@@ -725,13 +726,15 @@ pub enum ActionCountGroupBy {
 	SubType,
 }
 
-/// Action statuses no listing returns: deleted, inbound-verifying (attachments not yet synced),
-/// permanently failed. The default when `status` is unset, and stripped from an explicit one.
-pub const HIDDEN_ACTION_STATUSES: [&str; 3] = ["D", "V", "F"];
+/// Action statuses a listing may return: active, confirmation-pending, notification, draft,
+/// scheduled, pending. An allowlist, so an unknown or future status ('D' deleted, 'V'
+/// inbound-verifying, 'F' failed, or anything newer) stays hidden. The default when `status`
+/// is unset, and the filter applied to an explicit one.
+pub const VISIBLE_ACTION_STATUSES: &[&str] = &["A", "C", "N", "R", "S", "P"];
 
 /// Options for listing actions
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub struct ListActionOptions {
 	/// Maximum number of items to return (default: 20)
 	pub limit: Option<u32>,
@@ -1267,8 +1270,11 @@ pub struct ShareSetReader {
 ///
 /// By default (when `status` is `None`), deleted files (status 'D') are excluded.
 /// To include deleted files, explicitly set `status` to `FileStatus::Deleted`.
+///
+/// After deserializing from a query, call [`Self::apply_include`]; it resolves the
+/// `status=` word into `status` / `status_unknown`.
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ListFileOptions {
 	/// Maximum number of items to return (default: 30)
@@ -1289,8 +1295,17 @@ pub struct ListFileOptions {
 	pub root_id: Option<String>, // Filter by document tree root
 	pub preset: Option<String>,
 	pub variant: Option<String>,
+	/// Wire `status=` word, resolved into `status` / `status_unknown` by
+	/// [`ListFileOptions::apply_include`].
+	#[serde(default, rename = "status")]
+	pub status_word: Option<String>,
 	/// File status filter. If None, excludes deleted files by default.
+	#[serde(skip)]
 	pub status: Option<FileStatus>,
+	/// The wire `status=` word is unknown (e.g. from a newer client): the list matches
+	/// nothing (fail closed), never a 400.
+	#[serde(skip)]
+	pub status_unknown: bool,
 	#[serde(default, rename = "type", deserialize_with = "deserialize_split")]
 	pub file_type: Option<Vec<String>>,
 	/// Filter by content type pattern (e.g., "image/*", "video/*")
@@ -1411,8 +1426,15 @@ pub struct ListFileOptions {
 }
 
 impl ListFileOptions {
-	/// Turn the wire `include=` list into the expansion flags.
+	/// Turn the wire `include=` list into the expansion flags, and resolve the wire
+	/// `status=` word (empty = no filter; unknown sets `status_unknown`).
 	pub fn apply_include(&mut self) {
+		use serde::de::IntoDeserializer;
+		if let Some(w) = self.status_word.as_deref().map(str::trim).filter(|w| !w.is_empty()) {
+			let de = IntoDeserializer::<serde::de::value::Error>::into_deserializer(w);
+			self.status = FileStatus::deserialize(de).ok();
+			self.status_unknown = self.status.is_none();
+		}
 		let include = self.include.as_deref();
 		self.with_parent = includes(include, "parent");
 		self.with_path = includes(include, "path");
@@ -3774,6 +3796,28 @@ pub trait MetaAdapter: Debug + Send + Sync {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn patch_reader_state_tolerant() {
+		let p: PatchReaderState =
+			serde_json::from_str(r#"{"pinned":true,"futureField":1}"#).expect("tolerant");
+		assert_eq!(p.pinned, Patch::Value(true));
+		assert!(serde_json::from_str::<PatchReaderState>(r#"{"readAt":null}"#).is_err());
+	}
+
+	#[test]
+	fn test_list_file_options_tolerant() {
+		let mut opts: ListFileOptions =
+			serde_urlencoded::from_str("status=archived&futureParam=1").expect("tolerant");
+		opts.apply_include();
+		assert!(opts.status.is_none());
+		assert!(opts.status_unknown);
+		assert!(!opts.sweep_all);
+		let mut opts: ListFileOptions = serde_urlencoded::from_str("status=deleted").expect("ok");
+		opts.apply_include();
+		assert!(matches!(opts.status, Some(FileStatus::Deleted)));
+		assert!(!opts.status_unknown);
+	}
 
 	#[test]
 	fn test_affects_search_index_hidden() {

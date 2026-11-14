@@ -57,7 +57,7 @@ impl Task<App> for StatEmitTask {
 		Ok(Arc::new(task))
 	}
 
-	fn serialize(&self) -> String {
+	fn serialize(&self) -> ClResult<String> {
 		// StatEmitTask only contains primitive / Box<str> fields whose Serialize
 		// impls are infallible. Building the JSON manually removes the
 		// `unwrap_or_else("{}")` fallback that would otherwise poison the task
@@ -68,7 +68,7 @@ impl Task<App> for StatEmitTask {
 		obj.insert("subject_id".into(), self.subject_id.as_ref().into());
 		obj.insert("tenant_tag".into(), self.tenant_tag.as_ref().into());
 		obj.insert("first_scheduled_at".into(), self.first_scheduled_at.into());
-		serde_json::Value::Object(obj).to_string()
+		Ok(serde_json::Value::Object(obj).to_string())
 	}
 
 	async fn run(&self, app: &App) -> ClResult<()> {
@@ -184,7 +184,7 @@ mod tests {
 			tenant_tag: "owner.example".into(),
 			first_scheduled_at: 1_700_000_000,
 		};
-		let json = Task::<App>::serialize(&task);
+		let json = Task::<App>::serialize(&task).expect("serialize");
 		let built = StatEmitTask::build(0, &json).expect("build should succeed");
 		assert_eq!(built.kind_of(), "stat.emit");
 

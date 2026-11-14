@@ -5,8 +5,9 @@
 
 use axum::{
 	Extension, Json,
-	extract::{Path, Query, State},
+	extract::{Path, State},
 };
+use cloudillo_types::extract::Query;
 use serde::Deserialize;
 
 use crate::perm::ResolvedEntry;

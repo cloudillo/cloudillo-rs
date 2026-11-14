@@ -813,6 +813,56 @@ async fn app_uninstall() {
 	assert!(st.is_success(), "owner uninstalls: {st} {b}");
 }
 
+/// An APKG declaring `requires.shell` is refused even for the owner: the node supports no shell
+/// capabilities yet, so any declared requirement is unmet. Nothing is installed.
+#[tokio::test]
+async fn apkg_requiring_shell_is_refused() {
+	use cloudillo::meta_adapter::Action;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let action_id = "a1~zqm-apkg-needs-shell";
+	let content = r#"{"name":"zqm-shell-app","version":"1.0.0","requires":{"shell":["x"]}}"#;
+	fx.app
+		.meta_adapter
+		.create_action(
+			alice,
+			&Action {
+				action_id,
+				typ: "APKG",
+				sub_typ: None,
+				issuer_tag: ALICE,
+				parent_id: None,
+				root_id: None,
+				audience_tag: None,
+				content: Some(content),
+				attachments: Some(vec!["f1~zqm-app"]),
+				subject: None,
+				created_at: cloudillo::types::Timestamp::now(),
+				expires_at: None,
+				visibility: Some('P'),
+				flags: None,
+				x: None,
+				hat_tag: None,
+				channel: None,
+			},
+			None,
+		)
+		.await
+		.unwrap();
+
+	let body = format!(r#"{{"actionId":"{action_id}"}}"#);
+	let (st, b) =
+		send(fx, fx.subject("owner@alice"), Method::POST, "/api/apps/install", &body).await;
+	assert_eq!(st, StatusCode::BAD_REQUEST, "owner installs a shell-requiring apkg: {b}");
+	assert!(b.to_string().contains("shell"), "refused for the shell requirement: {b}");
+	let installed = fx.app.meta_adapter.list_installed_apps(alice, None).await.unwrap();
+	assert!(
+		!installed.iter().any(|a| a.app_name.as_ref() == "zqm-shell-app"),
+		"nothing installed: {installed:?}"
+	);
+}
+
 /// QR login: only the account itself reads a pending session's details or answers it.
 #[tokio::test]
 async fn qr_login_respond() {
@@ -1988,7 +2038,6 @@ async fn data_export_flow() {
 	let owner = fx.subject("owner@trash");
 	let sadm = fx.subject("owner-sadm@admin");
 	let member = fx.subject("m-moderator@trash.test");
-	let tn = fx.tenants.trash.tn_id.0;
 	for (m, uri) in [
 		(Method::POST, "/api/export"),
 		(Method::GET, "/api/export"),
@@ -1998,15 +2047,16 @@ async fn data_export_flow() {
 		assert_eq!(status_class(st), Actual::Deny, "member {m} {uri}: {st} {b}");
 	}
 	let tn_id = fx.tenants.trash.tn_id;
-	let run_ctx = async |ctx: &str| {
-		let task = ExportTask::build(0, ctx).unwrap();
+	let run_ctx = async |created_at: cloudillo::types::ApiTime| {
+		let ctx = serde_json::json!({ "tn_id": tn_id, "created_at": created_at }).to_string();
+		let task = ExportTask::build(0, &ctx).unwrap();
 		task.run(&fx.app).await.unwrap();
 	};
 	// Runs the queued task (the one naming the pending request); returns the final status.
 	let run_task = async || {
 		let raw = tokio::fs::read(fx.app.export_path(tn_id, "json")).await.unwrap();
 		let status: ExportStatus = serde_json::from_slice(&raw).unwrap();
-		run_ctx(&format!("{tn}:{}", status.created_at.0)).await;
+		run_ctx(status.created_at).await;
 		let (st, b) = send(fx, owner, Method::GET, "/api/export", "").await;
 		assert_eq!(st, StatusCode::OK, "export status: {b}");
 		b["data"]["status"].as_str().unwrap_or_default().to_owned()
@@ -2018,7 +2068,7 @@ async fn data_export_flow() {
 	let (st, b) = send(fx, owner, Method::POST, "/api/export", "").await;
 	assert_eq!(st, StatusCode::CONFLICT, "second request while pending: {b}");
 	// A stale task from an earlier request leaves the pending one alone.
-	run_ctx(&format!("{tn}:1")).await;
+	run_ctx(cloudillo::types::ApiTime(1)).await;
 	let (_, b) = send(fx, owner, Method::GET, "/api/export", "").await;
 	assert_eq!(b["data"]["status"], "pending", "a stale task finished the export: {b}");
 	assert!(!fx.app.export_path(tn_id, "zip").exists(), "a stale task wrote a ZIP");
