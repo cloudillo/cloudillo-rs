@@ -10,7 +10,7 @@ use std::sync::Arc;
 use cloudillo_core::abac::VisibilityLevel;
 use cloudillo_core::rate_limit::{PenaltyReason, PowPenaltyReason, RateLimitApi};
 use cloudillo_core::roles::{CONTRIBUTOR_LEVEL, role_level};
-use cloudillo_types::auth_adapter::ActionToken;
+use cloudillo_types::auth_adapter::{ActionToken, AuditCategory, AuditEvent};
 use cloudillo_types::badges::is_badge_type;
 use cloudillo_types::meta_adapter::{self, AttachmentView, ProfileStatus, ProfileType};
 use cloudillo_types::roles::hat_peer;
@@ -25,12 +25,35 @@ use crate::{
 	subject_ref::{SubjectRef, parse_subject_ref},
 };
 
-/// Verify JWT signature with a public key
-fn verify_jwt_signature(token: &str, public_key: &str) -> ClResult<ActionToken> {
-	let public_key_pem =
-		format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----", public_key);
+/// Split a stored public key `ALG:<spki-base64>` into its algorithm and SPKI part.
+/// Unprefixed keys (written before the prefix existed) are ES384. SPKI base64 has no `:`.
+/// An unknown algorithm is `Error::Unsupported`, not a forgery.
+fn split_key_alg(key: &str) -> ClResult<(Algorithm, &str)> {
+	match key.split_once(':') {
+		None => Ok((Algorithm::ES384, key)),
+		Some(("ES384", spki)) => Ok((Algorithm::ES384, spki)),
+		Some((alg, _)) => Err(Error::Unsupported(format!(
+			"key algorithm {}",
+			alg.chars().take(32).collect::<String>()
+		))),
+	}
+}
 
-	let mut validation = Validation::new(Algorithm::ES384);
+/// Verify JWT signature with a public key (`ALG:<spki>` or unprefixed ES384).
+/// The JWS header `alg` must match the key's algorithm, else `Error::Unauthorized`:
+/// the header is attacker-controlled, so a mismatch is a bad signature.
+fn verify_jwt_signature(token: &str, public_key: &str) -> ClResult<ActionToken> {
+	let (alg, spki) = split_key_alg(public_key)?;
+	let header_alg = jwt::decode_header(token)?.alg;
+	if header_alg != alg {
+		warn!("token alg {:?} does not match key alg {:?}", header_alg, alg);
+		return Err(Error::Unauthorized);
+	}
+
+	// Only EC algorithms reach here: `split_key_alg` knows ES384 alone.
+	let public_key_pem = format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----", spki);
+
+	let mut validation = Validation::new(alg);
 	validation.validate_aud = false;
 	validation.set_required_spec_claims(&["iss"]);
 
@@ -45,12 +68,44 @@ fn verify_jwt_signature(token: &str, public_key: &str) -> ClResult<ActionToken> 
 	Ok(action)
 }
 
+/// Failure-cache slot deduping the unsupported-key audit per issuer; not a valid key id.
+const UNSUPPORTED_AUDIT_KEY: &str = "~unsupported-audit";
+
+/// Audit a key or token whose algorithm we do not support (no IP penalty is applied).
+///
+/// One audit row per issuer per failure TTL: the key id is issuer-chosen, so keying the
+/// dedupe on it would let a peer write a row per token.
+async fn audit_unsupported_key(
+	app: &App,
+	key_cache: &KeyFetchCache,
+	tn_id: TnId,
+	issuer: &str,
+	key_id: &str,
+	e: &Error,
+) {
+	warn!("  unsupported key for {}:{}: {}", issuer, key_id, e);
+	if key_cache.check_failure(issuer, UNSUPPORTED_AUDIT_KEY).is_some() {
+		return;
+	}
+	key_cache.record_failure(issuer, UNSUPPORTED_AUDIT_KEY, e);
+	let ev = AuditEvent {
+		tn_id: Some(tn_id),
+		details: Some(serde_json::json!({
+			"issuer": issuer,
+			"keyId": key_id,
+			"error": e.to_string(),
+		})),
+		..AuditEvent::new(AuditCategory::Admin, "federation.key.unsupported", "fail")
+	};
+	cloudillo_core::audit::record(app, ev).await;
+}
+
 /// Try verifying with the SQLite-cached key.
 ///
 /// Returns:
 /// - `Some(Ok(action))` — cache hit and signature valid (caller should return this).
-/// - `Some(Err(e))` — terminal cache error that should propagate (currently unused;
-///   reserved for future use).
+/// - `Some(Err(e))` — `Error::Unsupported` (unknown stored key algorithm): a `/me`
+///   refetch would not help, so it propagates.
 /// - `None` — fall through to HTTP fetch (cache miss, expired, DB error, **or**
 ///   stale-key signature failure). When the entry was present but the signature
 ///   failed, the cached key bytes are returned via `stale_key_out` so the caller
@@ -79,6 +134,7 @@ async fn try_cached_key_verify(
 					info!("← VERIFIED: type={} from={}", action.t, action.iss);
 					Some(Ok(action))
 				}
+				Err(e @ Error::Unsupported(_)) => Some(Err(e)),
 				Err(e) => {
 					// Stale-cache hypothesis: cached key may have been overwritten
 					// by a key rotation. Fall through to HTTP fetch for an
@@ -166,6 +222,10 @@ pub async fn verify_action_token(
 	// 2. Check SQLite key cache - use if we have a cached key
 	let mut stale_key: Option<Box<str>> = None;
 	if let Some(result) = try_cached_key_verify(app, token, issuer, key_id, &mut stale_key).await {
+		// Only a stored unknown-prefix key gets here; the fetch path never stores one.
+		if let Err(e @ Error::Unsupported(_)) = &result {
+			audit_unsupported_key(app, key_cache, tn_id, issuer, key_id, e).await;
+		}
 		return result;
 	}
 
@@ -183,6 +243,14 @@ pub async fn verify_action_token(
 
 			if let Some(key) = key {
 				let public_key = &key.public_key;
+
+				// An unknown key algorithm is unsupported, not a forgery: no penalty, and
+				// checked before the stale-key branch below, which penalises unverified.
+				if let Err(e) = split_key_alg(public_key) {
+					key_cache.record_failure(issuer, key_id, &e);
+					audit_unsupported_key(app, key_cache, tn_id, issuer, key_id, &e).await;
+					return Err(e);
+				}
 
 				// If we just refetched after a stale-cache failure and the bytes
 				// are identical, the second verify will fail for the same reason —
@@ -789,7 +857,9 @@ async fn verify_and_handle_failure(
 	match verify_action_token(app, tn_id, token, client_ip).await {
 		Ok(action) => Ok(action),
 		Err(e) => {
+			// An unsupported key algorithm is not a signature failure: no PoW penalty either.
 			if is_conn_action
+				&& !matches!(e, Error::Unsupported(_))
 				&& let Some(ip) = client_ip
 				&& let Err(pen_err) = app
 					.rate_limiter
@@ -2335,6 +2405,16 @@ mod tests {
 	use super::*;
 
 	const US: &str = "host.example";
+
+	#[test]
+	fn key_alg_prefix() {
+		assert_eq!(split_key_alg("MHYw").ok(), Some((Algorithm::ES384, "MHYw")));
+		assert_eq!(split_key_alg("ES384:MHYw").ok(), Some((Algorithm::ES384, "MHYw")));
+		assert!(matches!(split_key_alg("ED25519:MCow"), Err(Error::Unsupported(_))));
+		// A token whose header `alg` differs from the key's is a bad signature.
+		let hs256 = "eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJhIn0.c2ln";
+		assert!(matches!(verify_jwt_signature(hs256, "ES384:MHYw"), Err(Error::Unauthorized)));
+	}
 
 	#[test]
 	fn inbound_channel_host_mirror_restamp() {

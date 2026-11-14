@@ -1162,6 +1162,16 @@ async fn inbound_edges() {
 	)
 	.unwrap();
 	check(&mut rep, "IB-66", &r, Deny, deliver(fx, ALICE, &hs).await);
+	// A stored key of an unknown algorithm. The fixture has no remote `/me`, so the fetched
+	// unknown-prefix path (failure-cached, see `key_cache` tests) is unreachable; this drives
+	// the cached-key path instead.
+	let r = issuer(fx, ALICE, Relation::Connected, "", "ie-unknown-alg").await;
+	meta.add_profile_public_key(&r.id_tag, &r.key_id, &format!("FOO:{}", r.spki_b64), None)
+		.await
+		.unwrap();
+	let mut t = claims(&r, "POST");
+	t.c = text();
+	check(&mut rep, "IB-187", &r, Deny, deliver(fx, ALICE, &sign(&r, &t)).await);
 	let r = issuer(fx, ALICE, Relation::Connected, "", "ie-bad-kid").await;
 	let mut t = claims(&r, "POST");
 	t.k = "k9".into();
@@ -1452,6 +1462,88 @@ async fn federation_peers_allowlist() {
 	// Back to `open` (the default): the refused peer is processed.
 	let got = deliver(fx, ALICE, &sign(&other, &post(&other))).await;
 	check(&mut rep, "IB-86", &other, Allow, got);
+	rep.finish();
+}
+
+/// Forward compat on the key and peer-policy paths. A cached key with an algorithm prefix this
+/// node does not know (`ED25519:`) refuses the token as unsupported (IB-179/180), without a
+/// `/me` refetch (IB-181) and without an IP ban or a CONN PoW debt, however often it is sent
+/// (IB-182/183); `ES384:`-prefixed and unprefixed keys both verify (IB-184/185). An undecodable
+/// shared `federation.peers` fails closed for a remote issuer (IB-186). The uncached path (key
+/// fetched from the issuer's `/me`) needs a reachable remote peer, which the fixture has none
+/// of; it is covered by the `key_alg_prefix` unit test in `cloudillo-action` only.
+#[tokio::test]
+async fn inbound_key_alg_and_peer_policy() {
+	use Actual::{Allow, Deny};
+	use cloudillo_core::federation_policy::PEERS_SETTING;
+	use cloudillo_core::rate_limit::RateLimitApi;
+	use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+	use std::sync::Arc;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let meta = &fx.app.meta_adapter;
+	let mut rep = Report::new("inbound-key-alg");
+	// A remote issuer, Connected on alice, whose key is cached as `key`.
+	let seeded = |name: &'static str, key: fn(&str) -> String| async move {
+		let r = crate::fixture::remote(name);
+		let k = key(&r.spki_b64);
+		meta.add_profile_public_key(&r.id_tag, &r.key_id, &k, Some(Timestamp::from_now(3600)))
+			.await
+			.unwrap();
+		let mut f = prof(ProfileType::Person);
+		f.following = Patch::Value(true);
+		f.connected = Patch::Value(cloudillo::meta_adapter::ProfileConnectionStatus::Connected);
+		meta.upsert_profile(alice, &r.id_tag, &f).await.unwrap();
+		r
+	};
+	let post = |r: &RemoteId| {
+		let mut t = claims(r, "POST");
+		t.c = Some(json!(format!("{MARK} key alg")));
+		sign(r, &t)
+	};
+	// Its own /64: the inbound-edges test leaves a PoW debt on fd00:fffe:64::/64.
+	let ip = IpAddr::V6(Ipv6Addr::new(0xfd00, 0xfffe, 0x65, 0, 0, 0, 0, 1));
+	let from_ip = |token: String| async move {
+		let body = Body::from(json!({ "token": token }).to_string());
+		let mut r = req(ALICE, Method::POST, "/api/inbox/sync", None, body);
+		r.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::new(ip, 443)));
+		call(&fx.api, r).await
+	};
+
+	let ed = seeded("ka-ed25519", |k| format!("ED25519:{k}")).await;
+	check(&mut rep, "IB-179", &ed, Deny, unsupported(from_ip(post(&ed)).await));
+	let mut t = claims(&ed, "CONN");
+	t.aud = Some(ALICE.into());
+	let conn = sign(&ed, &t);
+	check(&mut rep, "IB-180", &ed, Deny, unsupported(from_ip(conn.clone()).await));
+	let cache = fx.app.ext::<Arc<cloudillo::action::KeyFetchCache>>().unwrap();
+	let refetched = cache.check_failure(&ed.id_tag, &ed.key_id).is_some();
+	check(&mut rep, "IB-181", &ed, Deny, if refetched { Allow } else { Deny });
+	for _ in 0..4 {
+		from_ip(post(&ed)).await;
+		from_ip(conn.clone()).await;
+	}
+	let banned = fx.app.rate_limiter.is_banned(&ip);
+	check(&mut rep, "IB-182", &ed, Deny, if banned { Allow } else { Deny });
+	let pow = fx.app.rate_limiter.get_pow_requirement(&ip);
+	check(&mut rep, "IB-183", &ed, Deny, if pow > 0 { Allow } else { Deny });
+	let es = seeded("ka-es384", |k| format!("ES384:{k}")).await;
+	check(&mut rep, "IB-184", &es, Allow, deliver(fx, ALICE, &post(&es)).await);
+	let bare = seeded("ka-bare", str::to_string).await;
+	check(&mut rep, "IB-185", &bare, Allow, deliver(fx, ALICE, &post(&bare)).await);
+
+	// Written past `peers_validator`, as a newer node's or a corrupt value would be. Deleting
+	// alice's own (absent) row drops the cached policy for the key on every tenant.
+	let shared = cloudillo::types::SHARED_TN;
+	meta.update_setting(shared, PEERS_SETTING, Some(json!({"mode": "zqm"})))
+		.await
+		.unwrap();
+	fx.app.settings.delete(alice, PEERS_SETTING).await.unwrap();
+	let peer = seeded("ka-peer", str::to_string).await;
+	let got = deliver(fx, ALICE, &post(&peer)).await;
+	fx.app.settings.delete(shared, PEERS_SETTING).await.unwrap();
+	check(&mut rep, "IB-186", &peer, Deny, got);
 	rep.finish();
 }
 

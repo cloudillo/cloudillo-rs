@@ -93,12 +93,16 @@ fn generate_key_sync() -> ClResult<KeyPair> {
 		.filter(|s| !s.starts_with('-'))
 		.map(str::trim)
 		.collect();
-	let public_key: Box<str> = public
-		.to_public_key_pem(LineEnding::LF)
-		.map_err(|_| Error::PermissionDenied)?
-		.lines()
-		.filter(|s| !s.starts_with('-'))
-		.map(str::trim)
+	// Algorithm prefix (`ALG:<spki-base64>`), read by `cloudillo_action::process::split_key_alg`.
+	let public_key: Box<str> = std::iter::once("ES384:")
+		.chain(
+			public
+				.to_public_key_pem(LineEnding::LF)
+				.map_err(|_| Error::PermissionDenied)?
+				.lines()
+				.filter(|s| !s.starts_with('-'))
+				.map(str::trim),
+		)
 		.collect();
 
 	Ok(KeyPair { private_key, public_key })

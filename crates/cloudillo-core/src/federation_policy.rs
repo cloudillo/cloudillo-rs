@@ -8,12 +8,14 @@
 //! URL. Inbound, `cloudillo_action::process::verify_action_token` checks the issuer before
 //! the key fetch. ACME and DNS lookups are not federation and are not covered.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use serde::Deserialize;
 
 use crate::prelude::*;
 use crate::settings::SettingValue;
 use crate::settings::service::SettingsService;
-use cloudillo_types::auth_adapter::AuthAdapter;
+use cloudillo_types::auth_adapter::{AuditCategory, AuditEvent, AuthAdapter};
 use cloudillo_types::types::SHARED_TN;
 use cloudillo_types::validation::canonicalize_dns_host;
 
@@ -29,8 +31,8 @@ pub enum PeerMode {
 }
 
 /// `{"mode": "open"|"allowlist"|"off", "allow": ["id.tag", "*.domain"]}`
+/// Unknown fields are ignored; an unknown `mode` fails to decode (and [`check_peer`] denies).
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PeerPolicy {
 	pub mode: PeerMode,
 	#[serde(default)]
@@ -68,7 +70,11 @@ pub fn peers_validator(v: &SettingValue) -> ClResult<()> {
 	Ok(())
 }
 
+/// Set once `federation.peers.invalid` has been audited in this process.
+static PEERS_INVALID_AUDITED: AtomicBool = AtomicBool::new(false);
+
 /// Refuse a federation peer the instance policy does not admit (`PermissionDenied`).
+/// An undecodable policy (bad JSON, unknown `mode`) denies every peer and is audited.
 ///
 /// Tenants hosted on this instance are not federation peers: their traffic still goes over
 /// HTTPS and through `verify_action_token`, so they always pass, whatever the mode.
@@ -78,8 +84,28 @@ pub async fn check_peer(
 	id_tag: &str,
 ) -> ClResult<()> {
 	let json = settings.get_json(SHARED_TN, PEERS_SETTING).await?;
-	let policy: PeerPolicy = serde_json::from_value(json)
-		.map_err(|e| Error::ConfigError(format!("invalid federation.peers: {e}")))?;
+	let policy = match serde_json::from_value::<PeerPolicy>(json) {
+		Ok(policy) => policy,
+		Err(e) => {
+			// Fail closed: the setting's default is `open`, so falling back to it would widen
+			// access. Deny every federation peer until the setting is fixed.
+			warn!(error = %e, "invalid federation.peers, refusing all federation peers");
+			// Audited once per process (avoids a row per request); warn! logs every hit.
+			// Set only once the row is stored, so a failed write is retried on the next hit;
+			// concurrent first hits may store a duplicate.
+			if !PEERS_INVALID_AUDITED.load(Ordering::Relaxed) {
+				let ev = AuditEvent {
+					details: Some(serde_json::json!({ "error": e.to_string() })),
+					..AuditEvent::new(AuditCategory::Admin, "federation.peers.invalid", "fail")
+				};
+				match auth_adapter.append_audit_event(&ev).await {
+					Ok(()) => PEERS_INVALID_AUDITED.store(true, Ordering::Relaxed),
+					Err(e) => warn!(error = %e, "audit: failed to store federation.peers.invalid"),
+				}
+			}
+			PeerPolicy { mode: PeerMode::Off, allow: Vec::new() }
+		}
+	};
 	if peer_allowed(&policy, id_tag) || auth_adapter.read_tn_id(id_tag).await.is_ok() {
 		return Ok(());
 	}
@@ -128,7 +154,8 @@ mod tests {
 		assert!(ok(serde_json::json!({"mode": "allowlist", "allow": ["a.hu", "*.example.hu"]})));
 		assert!(!ok(serde_json::json!({"mode": "closed"})));
 		assert!(!ok(serde_json::json!({"allow": []})));
-		assert!(!ok(serde_json::json!({"mode": "open", "extra": 1})));
+		// Unknown fields are tolerated (forward compatibility); unknown modes are not.
+		assert!(ok(serde_json::json!({"mode": "open", "extra": 1})));
 		assert!(!ok(serde_json::json!({"mode": "allowlist", "allow": ["*example.hu"]})));
 		assert!(!ok(serde_json::json!({"mode": "allowlist", "allow": ["a/b"]})));
 		assert!(!ok(serde_json::json!({"mode": "allowlist", "allow": ["Upper.hu"]})));

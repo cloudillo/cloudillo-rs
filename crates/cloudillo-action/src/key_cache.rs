@@ -50,7 +50,7 @@ impl FailureType {
 		match error {
 			Error::NotFound => Self::NotFound,
 			Error::PermissionDenied | Error::Unauthorized => Self::Unauthorized,
-			Error::Parse => Self::ParseError,
+			Error::Parse | Error::Unsupported(_) => Self::ParseError,
 			// Default to NetworkError for unknown errors (shorter TTL)
 			_ => Self::NetworkError,
 		}
@@ -181,6 +181,14 @@ impl Default for KeyFetchCache {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn unsupported_key_is_persistent_failure() {
+		assert_eq!(
+			FailureType::from_error(&Error::Unsupported("x".into())),
+			FailureType::ParseError
+		);
+	}
 
 	#[test]
 	fn test_failure_type_ttl() {
