@@ -1,0 +1,6 @@
+{
+  "name": "POST+unprefixed-key",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiay1iYXJlIiwidCI6IlBPU1QiLCJpYXQiOjE3OTQ0MDU4MDUsImMiOiJiYXJlIn0.ld49c6oXpBPulWyLHN6rGxpZPtdpUiqR_bQGA8eiAyypD70ANhAZFHAgbgxEeUeLuVmsE9uiWcZoGiAIfJinkicsmaCok5vXoouRJbcwiwBVtJN4DpkGeokpc5crgw2b",
+  "expect": "accept",
+  "publicKey": "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

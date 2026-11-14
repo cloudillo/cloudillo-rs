@@ -1,0 +1,6 @@
+{
+  "name": "neg-crit-field",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiazEiLCJ0IjoiUE9TVDpMRE9DIiwiaWF0IjoxNzk0NDA1ODA1LCJjIjp7ImRvYyI6ImEudGVzdDpmMX54IiwiY29udGVudFR5cGUiOiJ4In0sImNyaXQiOlsienFtIl19.bayrZpflBiMspfjF1w0hSkZlXFZnjX6B9fnac-yMr_WCPO_AboXbnrU2MPsYrW1nxCjjlThkucr2wmdf2-kwYZPs9sTf5ysbd3Tv9e3i6L8AmFCejZn4g0gcQzAKiQoe",
+  "expect": "unsupported",
+  "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

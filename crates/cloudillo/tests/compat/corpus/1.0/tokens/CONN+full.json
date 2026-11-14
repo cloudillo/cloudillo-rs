@@ -1,0 +1,6 @@
+{
+  "name": "CONN+full",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiazEiLCJ0IjoiQ09OTiIsImlhdCI6MTc5NDQwNTgwNSwiYXVkIjoiYWxpY2UudGVzdCIsImMiOnsibXNnIjoiaGVsbG8iLCJyb2xlcyI6Int9In19.fCBlLSTy37SGVrzodk_myilPS45AGBlRlQzq2C_PCAKT7O6o97f1B7T9GNFK1xUnRnTpleWfqktplRqqRAkDybBAwCCgAdBhqr0wv-YSsLasdXJVTV7A7VjVJ-x_9AQe",
+  "expect": "accept",
+  "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

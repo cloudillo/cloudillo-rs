@@ -1,0 +1,6 @@
+{
+  "name": "FLLW+full",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiazEiLCJ0IjoiRkxMVyIsImlhdCI6MTc5NDQwNTgwNSwiYXVkIjoiYWxpY2UudGVzdCIsImMiOiJoZWxsbyJ9.0br530ol3NMJGvk6pGv6I0uErlIiksesh3r2WB17zKKpb_CEqQ_uti1iV4r5jMzIt4NOlqUMSU_lbu_ufgPWxk65d5yf7JNc-WBm7bIJsmm-ptnOT2MRPk6O3-w0OcoS",
+  "expect": "accept",
+  "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

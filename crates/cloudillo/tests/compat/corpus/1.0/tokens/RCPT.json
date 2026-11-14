@@ -1,0 +1,6 @@
+{
+  "name": "RCPT",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiazEiLCJ0IjoiUkNQVCIsImlhdCI6MTc5NDQwNTgwNSwiYXVkIjoiYWxpY2UudGVzdCIsImMiOjF9.ukcOnrg9Onu3wUh5nrT_mIUnxqPxr2IfCfHPVSvuT9u0uU1dDdwStuBw9nxGMK3ztUY6e27kmcxi5B3Y-FP8C2Zya7ewj1MPwntB2esd2WB2wG6A55PFa5OjHBd8j5WY",
+  "expect": "accept",
+  "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

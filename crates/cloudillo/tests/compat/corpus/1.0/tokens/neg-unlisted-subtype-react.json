@@ -1,0 +1,6 @@
+{
+  "name": "neg-unlisted-subtype-react",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiazEiLCJ0IjoiUkVBQ1Q6TkVXIiwiaWF0IjoxNzk0NDA1ODA1LCJzdWIiOiJhMX56cW0teCJ9.HloDdSIKMiBIvqpTkPiw3cfi3oHIj0LQYPvJ_oiVY9-D3H8oDBBpQd7-ur9FiKLs03pW0kZHEJzcUjWEm89_flMAXR9UM-OJ71fRO5S-QPZIBXebKB2mbgpZD8QG6KJp",
+  "expect": "unsupported",
+  "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

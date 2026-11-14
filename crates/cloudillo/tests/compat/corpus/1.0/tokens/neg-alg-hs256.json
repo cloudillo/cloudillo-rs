@@ -1,0 +1,6 @@
+{
+  "name": "neg-alg-hs256",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiazEiLCJ0IjoiUE9TVCIsImlhdCI6MTc5NDQwNTgwNSwiYyI6ImdvbGRlbiJ9.bEk1gBSAOuBg4HQLw7jfz5xVOuDrrdr7fPmWl2wFOEg",
+  "expect": "reject",
+  "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

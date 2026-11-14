@@ -1,0 +1,22 @@
+{
+  "data": [
+    {
+      "id": "wvvcrY9eUcROuWov4WfSUI8O",
+      "contentId": "f1~zqm-snapshot-file",
+      "owner": {
+        "idTag": "alice.test",
+        "name": "Alice",
+        "type": "person",
+        "profilePic": ""
+      },
+      "contentType": "text/plain",
+      "fileName": "snapshot.txt",
+      "fileType": "BLOB",
+      "createdAt": "2026-11-11T14:09:10Z",
+      "status": "active",
+      "visibility": "public",
+      "hidden": false,
+      "accessLevel": "admin"
+    }
+  ]
+}

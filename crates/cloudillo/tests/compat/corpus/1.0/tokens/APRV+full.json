@@ -1,0 +1,6 @@
+{
+  "name": "APRV+full",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiazEiLCJ0IjoiQVBSViIsImlhdCI6MTc5NDQwNTgwNSwiYXVkIjoiYWxpY2UudGVzdCIsInN1YiI6ImExfnpxbS1nb2xkZW4tcG9zdCIsImMiOnsiciI6ImdvbGRlbiJ9fQ.BlhCuUEwj_YOr3gsAfacAcmFjLeK94KySKl2uEX2RcAJNzt8UKbuzl-xI1NMKC5nYnOoxXFWrekpo_Sp97h6bMBfzYvBF3Scp3usvNUCUO5O5AfBeNEN3EUsuMuvaMzV",
+  "expect": "accept",
+  "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

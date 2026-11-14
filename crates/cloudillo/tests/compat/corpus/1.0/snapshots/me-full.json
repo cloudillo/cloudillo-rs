@@ -1,0 +1,14 @@
+{
+  "data": {
+    "idTag": "alice.test",
+    "name": "Alice",
+    "type": "person",
+    "keys": [
+      {
+        "keyId": "261111140910",
+        "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEZ981TE3Yq1NuNoc3kXPlp7+mHw3EmYqiLSIPXd1ZHRlXh9Fqcu6vVgW/WuQNqWl9K8QJxD2bTpuZ4nRm8Jf3VxVXw00jS/7V75eYw9bihNZRxraygYkIjGxrB1Ymioo/"
+      }
+    ],
+    "protocolVersion": 1
+  }
+}

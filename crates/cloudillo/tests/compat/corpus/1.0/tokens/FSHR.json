@@ -1,0 +1,6 @@
+{
+  "name": "FSHR",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiazEiLCJ0IjoiRlNIUiIsImlhdCI6MTc5NDQwNTgwNSwiYXVkIjoiYWxpY2UudGVzdCIsInN1YiI6ImYxfnpxbS1nb2xkZW4tZmlsZSIsImMiOnsiY29udGVudFR5cGUiOiJ0ZXh0L3BsYWluIiwiZmlsZU5hbWUiOiJnb2xkZW4udHh0IiwiZmlsZVRwIjoiQkxPQiJ9fQ.v6mKPX_npl33qZ3-qdlfHoq8ZrHnHLq-pMhyRoe5L-erOrz0nGWnMOzjmJFlt-prbxJjHDDgwtf8qIKmc3I_GphfQn3rflCl5GozzbYKPKh6UxxLjWhYjqRfBZSQNNMy",
+  "expect": "accept",
+  "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

@@ -1,0 +1,6 @@
+{
+  "name": "SUBS+full",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiazEiLCJ0IjoiU1VCUyIsImlhdCI6MTc5NDQwNTgwNSwiYXVkIjoiYWxpY2UudGVzdCIsInN1YiI6ImExfnpxbS1nb2xkZW4tY29udiIsImMiOnsiaW52aXRlZEJ5IjoiYWxpY2UudGVzdCIsIm1lc3NhZ2UiOiJnb2xkZW4ifX0.BlAOeSG0Guss4WIvsC67PiMmemLYBfWUwDcT4WdAGkttIZ0ntmpXvh1rdIQQ2tzZcKGaA_efI-5ZSUpHbDrhnZ_t-OYH-kdAC35Z2KlAeknk_PHKKce0TJk149Wele74",
+  "expect": "accept",
+  "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

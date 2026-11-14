@@ -1,0 +1,6 @@
+{
+  "name": "POST+crit",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiazEiLCJ0IjoiUE9TVCIsImlhdCI6MTc5NDQwNTgwNSwiYyI6ImdvbGRlbiBwb3N0IiwiY3JpdCI6WyIkaWF0IiwiJGY6UiJdfQ.DxSkK9Jux37zpDIcUR73ItotjlI-AVz7rM68JsJ-S-3QYyA3pOz10uERdgd56AUplxi1zBfYLltpcQe26QmjH8evR2My4EGiufOaIlwlwlEgZ80mf-r5sJwrsVWAZSLF",
+  "expect": "accept",
+  "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

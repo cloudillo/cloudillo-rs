@@ -1,0 +1,6 @@
+{
+  "name": "neg-key-prefix",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiay14eXoiLCJ0IjoiUE9TVCIsImlhdCI6MTc5NDQwNTgwNSwiYyI6ImdvbGRlbiJ9.bq5x1QHlfnejcJxaeYQp0GYnohwneBgY71k5H4BQokGKZpsP02GxhBcL9UkIXUtWS7YKM83UJaAZbRKscv9AEv0BXadoPPR46TIZEihLjTzTkEVTLyMS557k6MNosQu-",
+  "expect": "unsupported",
+  "publicKey": "XYZ:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

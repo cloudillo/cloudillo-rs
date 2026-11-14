@@ -1,0 +1,6 @@
+{
+  "name": "neg-unlisted-subtype-conn",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiazEiLCJ0IjoiQ09OTjpYWVoiLCJpYXQiOjE3OTQ0MDU4MDUsImF1ZCI6ImFsaWNlLnRlc3QifQ.8s1Gaen-IwF1IrSDrA14RvBTvKKN6Z-7MXumEDeYAyah3idVrj0p93WjsIOFgs3a3PEkwWHyJsst2Gra5FPQjuTYZj6Fu49smjozJ4UrdO3LCQKOGwCQ15lXFYaZekIn",
+  "expect": "unsupported",
+  "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

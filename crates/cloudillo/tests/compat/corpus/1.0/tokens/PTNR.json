@@ -1,0 +1,6 @@
+{
+  "name": "PTNR",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiazEiLCJ0IjoiUFROUiIsImlhdCI6MTc5NDQwNTgwNSwic3ViIjoiQHpxbS1wYXJ0bmVyLnRlc3QifQ.P-Ib9Tv0KaXnB5vp8CGgMz4CwH7D5m0Q3iXx34EtTdXMsBMZOgA_0v5ympyLFyj6CmozfV2LkVB86mka10nyZ6S9__omoZHzm8xd1MY9yhiFD0e-P-UOUv52QpwPxy4J",
+  "expect": "accept",
+  "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

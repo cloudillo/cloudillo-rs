@@ -1,0 +1,6 @@
+{
+  "name": "neg-crit-claim",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiazEiLCJ0IjoiUE9TVCIsImlhdCI6MTc5NDQwNTgwNSwiYyI6ImdvbGRlbiIsImNyaXQiOlsiJHpxbSJdfQ.mMQ-K39FY2YXVXRrOdSfDwuhf4-DPzlPFRH_XX_uYA482VMkxVKT4Y0KCmwgeGICnWI_EKzYHiA28SwADbGM1d80nuoXjI9Ohhd7uP4gOUBoCHTNe-2TdaJrzxBx7ggF",
+  "expect": "unsupported",
+  "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

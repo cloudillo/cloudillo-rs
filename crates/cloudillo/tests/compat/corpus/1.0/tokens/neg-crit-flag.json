@@ -1,0 +1,6 @@
+{
+  "name": "neg-crit-flag",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiazEiLCJ0IjoiUE9TVCIsImlhdCI6MTc5NDQwNTgwNSwiYyI6ImdvbGRlbiIsImNyaXQiOlsiJGY6WiJdfQ.M7JOvzhv42Fn5lKImRKSeb4x1BfrEsqBZEJSCk491zuYHiETw3BjgOuPYB__0KbZfvPf5S7oCzvh7XAbl3NLLTtY3Wbt_6TBeWOZmpa6-TdHo6z283z9oiHjxacGaQSL",
+  "expect": "unsupported",
+  "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

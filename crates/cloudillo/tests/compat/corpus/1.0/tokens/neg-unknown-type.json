@@ -1,0 +1,6 @@
+{
+  "name": "neg-unknown-type",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiazEiLCJ0IjoiWFlaIiwiaWF0IjoxNzk0NDA1ODA1LCJjIjoiZ29sZGVuIn0.P9e1Dtz4e1J6eLd9S1fQLZEV314vgVYTgzNCnZEJfQNG5r9UxIPhIo8uSAnHdx6oe3v2v34sb4cdGjZ7ndQuBVY6DkxrhOEdCgi3GqUm0ENdF4mtRdaSJQH10z-1g2Eu",
+  "expect": "unsupported",
+  "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

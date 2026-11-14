@@ -1,0 +1,14 @@
+{
+  "data": [
+    {
+      "idTag": "alice.test",
+      "name": "Alice",
+      "type": "person"
+    },
+    {
+      "idTag": "snapshot-peer.test",
+      "name": "snapshot-peer.test",
+      "type": "person"
+    }
+  ]
+}

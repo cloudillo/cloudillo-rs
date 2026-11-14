@@ -1,0 +1,6 @@
+{
+  "name": "MSG:DEL",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtcGVyc29uLnRlc3QiLCJrIjoiazEiLCJ0IjoiTVNHOkRFTCIsImlhdCI6MTc5NDQwNTgwNSwiYXVkIjoiYWxpY2UudGVzdCIsInN1YiI6ImExfnpxbS1nb2xkZW4tbXNnIn0.qoQ7oRnxAdwwXTQ8jjF38_iTn-qmEdD0q3JGan_dMa1sNtbNVZWiHLoeZVITSAr-LZUsHVhK7F_h7Vvtz5SpRA_tubgchQwih3gteUEHxaweiVKkEBR0y-QzZ6tAbPSd",
+  "expect": "accept",
+  "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}

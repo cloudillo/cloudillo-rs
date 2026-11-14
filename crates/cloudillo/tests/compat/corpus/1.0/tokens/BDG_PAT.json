@@ -1,0 +1,6 @@
+{
+  "name": "BDG:PAT",
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJjb3JwdXMtY29tbXVuaXR5LnRlc3QiLCJrIjoiazEiLCJ0IjoiQkRHOlBBVCIsImlhdCI6MTc5NDQwNTgwNSwiYXVkIjoiYWxpY2UudGVzdCIsInYiOiJDIiwiZXhwIjoxODI1OTQxODA1LCJjIjp7ImIiOiJnb2xkIn19.z98wzv3YedAjdJU2_Iqx2FtMQgvXddlJkkBqzjsYsJbnp6OrReuwz3h-daq2gKBWI9aSx_5wEjxKAvj6hFenxbjiNPsKCqAAWk-ZGJ0Nbe7253taR6BMT-lNWLShUQGk",
+  "expect": "accept",
+  "publicKey": "ES384:MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEelbVmJTKQMdqn8ottVr4OGJAyJLXxLov2w00x7Q1VZCUbNJkatiqR0RIKXQbSghwEWCAJwDcJLEDcYmSndgK7lud5L+0FIlClMaFNxfqUbaQSENTy9njngFBMvnExEL2"
+}
