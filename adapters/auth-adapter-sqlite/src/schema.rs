@@ -11,25 +11,31 @@
 //! decodes the SNI name to it before looking a cert up by domain. `tenants.name` is NOT
 //! an id_tag and stays byte-exact.
 
+use cloudillo_types::prelude::error;
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
-/// Get the current database version from vars table
-async fn get_db_version(tx: &mut Transaction<'_, Sqlite>) -> i64 {
-	sqlx::query_scalar::<_, String>("SELECT value FROM vars WHERE key = 'db_version'")
-		.fetch_optional(&mut **tx)
-		.await
-		.ok()
-		.flatten()
-		.and_then(|v| v.parse().ok())
-		.unwrap_or(0)
+/// The database version from the vars table: `None` when there is no row (a fresh DB), `Err`
+/// when it can't be read or parsed — never "fresh", which would skip every migration.
+async fn get_db_version(tx: &mut Transaction<'_, Sqlite>) -> Result<Option<i64>, sqlx::Error> {
+	let Some(v) =
+		sqlx::query_scalar::<_, String>("SELECT value FROM vars WHERE key = 'db_version'")
+			.fetch_optional(&mut **tx)
+			.await?
+	else {
+		return Ok(None);
+	};
+	v.parse()
+		.map(Some)
+		.map_err(|e| sqlx::Error::Protocol(format!("unreadable db_version {v:?}: {e}")))
 }
 
 /// Set the database version in vars table
-async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
-	let _ = sqlx::query("INSERT OR REPLACE INTO vars (key, value) VALUES ('db_version', ?)")
+async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) -> Result<(), sqlx::Error> {
+	sqlx::query("INSERT OR REPLACE INTO vars (key, value) VALUES ('db_version', ?)")
 		.bind(version.to_string())
 		.execute(&mut **tx)
-		.await;
+		.await?;
+	Ok(())
 }
 
 // Current schema version - update this when adding new migrations
@@ -52,7 +58,20 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	.execute(&mut *tx)
 	.await?;
 
-	let mut version = get_db_version(&mut tx).await;
+	let mut version = get_db_version(&mut tx)
+		.await
+		.inspect_err(|e| error!("auth DB: {e}"))?
+		.unwrap_or(0);
+	// Refuse before any DDL below touches a schema this binary doesn't know. `new()` flattens
+	// the error to `DbError`, so the log line is where the text survives.
+	if version > CURRENT_DB_VERSION {
+		let msg = format!(
+			"auth DB schema v{version} is newer than this binary (v{CURRENT_DB_VERSION}); \
+			 restore a backup or upgrade"
+		);
+		error!("{msg}");
+		return Err(sqlx::Error::Protocol(msg));
+	}
 
 	// Schema creation - safe to run every time (uses IF NOT EXISTS)
 
@@ -391,7 +410,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 
 	// Fresh database: skip migrations (schema already has all columns)
 	if version == 0 {
-		set_db_version(&mut tx, CURRENT_DB_VERSION).await;
+		set_db_version(&mut tx, CURRENT_DB_VERSION).await?;
 		#[allow(unused_assignments)]
 		{
 			version = CURRENT_DB_VERSION;
@@ -404,7 +423,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// the proxy_type column that version 4 would add via ALTER TABLE
 	if version > 0 && version < 3 {
 		// Table was already created above with IF NOT EXISTS (including proxy_type), just bump version
-		set_db_version(&mut tx, 4).await;
+		set_db_version(&mut tx, 4).await?;
 		version = 4;
 	}
 
@@ -413,7 +432,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		sqlx::query("ALTER TABLE proxy_sites ADD COLUMN proxy_type TEXT NOT NULL DEFAULT 'basic'")
 			.execute(&mut *tx)
 			.await?;
-		set_db_version(&mut tx, 4).await;
+		set_db_version(&mut tx, 4).await?;
 		version = 4;
 	}
 
@@ -422,7 +441,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		sqlx::query("UPDATE proxy_sites SET status = 'A' WHERE status = 'P'")
 			.execute(&mut *tx)
 			.await?;
-		set_db_version(&mut tx, 5).await;
+		set_db_version(&mut tx, 5).await?;
 		version = 5;
 	}
 
@@ -440,13 +459,13 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		sqlx::query("ALTER TABLE certs ADD COLUMN notified_at INTEGER")
 			.execute(&mut *tx)
 			.await?;
-		set_db_version(&mut tx, 6).await;
+		set_db_version(&mut tx, 6).await?;
 		version = 6;
 	}
 
 	// Version 7: audit_event table (created above with IF NOT EXISTS), just bump version
 	if version == 6 {
-		set_db_version(&mut tx, 7).await;
+		set_db_version(&mut tx, 7).await?;
 		version = 7;
 	}
 
@@ -458,7 +477,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		sqlx::query("ALTER TABLE tenants ADD COLUMN totp_last_step INTEGER")
 			.execute(&mut *tx)
 			.await?;
-		set_db_version(&mut tx, 8).await;
+		set_db_version(&mut tx, 8).await?;
 		version = 8;
 	}
 
@@ -470,7 +489,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		sqlx::query("ALTER TABLE tenants ADD COLUMN expires_at INTEGER")
 			.execute(&mut *tx)
 			.await?;
-		set_db_version(&mut tx, 9).await;
+		set_db_version(&mut tx, 9).await?;
 		version = 9;
 	}
 
@@ -479,7 +498,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		sqlx::query("ALTER TABLE api_keys ADD COLUMN auth_time INTEGER")
 			.execute(&mut *tx)
 			.await?;
-		set_db_version(&mut tx, 10).await;
+		set_db_version(&mut tx, 10).await?;
 		version = 10;
 	}
 
@@ -499,7 +518,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 				sqlx::query(alter).execute(&mut *tx).await?;
 			}
 		}
-		set_db_version(&mut tx, 11).await;
+		set_db_version(&mut tx, 11).await?;
 		#[allow(unused_assignments)]
 		{
 			version = 11;
@@ -554,5 +573,23 @@ mod tests {
 		] {
 			sqlx::query(sql).fetch_all(&db).await.unwrap();
 		}
+	}
+
+	/// A DB stamped by a newer binary is refused, not downgraded.
+	#[tokio::test]
+	async fn newer_db_version_refused() {
+		let db = SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect("sqlite::memory:")
+			.await
+			.unwrap();
+		init_db(&db).await.unwrap();
+		sqlx::query("UPDATE vars SET value = ? WHERE key = 'db_version'")
+			.bind((CURRENT_DB_VERSION + 1).to_string())
+			.execute(&db)
+			.await
+			.unwrap();
+		let err = init_db(&db).await.err().map(|e| e.to_string()).unwrap_or_default();
+		assert!(err.contains("newer than this binary"), "got {err:?}");
 	}
 }

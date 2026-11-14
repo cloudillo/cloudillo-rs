@@ -90,9 +90,48 @@ mod tables {
 	/// Total key size: 1 + 24 + 1 + 8 = 34 bytes
 	pub const TABLE_UPDATES: TableDefinition<&[u8], &[u8]> =
 		TableDefinition::new("crdt_updates_v2");
+
+	/// One row: key [`super::SCHEMA_VERSION_KEY`], value `[version:u8]`.
+	/// Same key/value types as `TABLE_UPDATES` so both share the snapshot copy loop.
+	pub const TABLE_SCHEMA_VERSION: TableDefinition<&[u8], &[u8]> =
+		TableDefinition::new("schema_version");
 }
 
-use tables::TABLE_UPDATES;
+use tables::{TABLE_SCHEMA_VERSION, TABLE_UPDATES};
+
+/// Row key in [`TABLE_SCHEMA_VERSION`]
+const SCHEMA_VERSION_KEY: &[u8] = b"version";
+/// File schema version this binary reads and writes
+const SCHEMA_VERSION: u8 = 1;
+
+/// Refuse a file written by a newer schema; stamp an unversioned (new or pre-versioning) one.
+fn ensure_schema_version(tx: &redb::WriteTransaction) -> ClResult<()> {
+	let db_err =
+		|e: redb::Error| ClError::from(Error::DbError(format!("crdt schema_version table: {}", e)));
+	let mut table = tx.open_table(TABLE_SCHEMA_VERSION).map_err(|e| db_err(e.into()))?;
+	let stored = table
+		.get(SCHEMA_VERSION_KEY)
+		.map_err(|e| db_err(e.into()))?
+		.map(|v| v.value().to_vec());
+	match stored.as_deref() {
+		None => {
+			table
+				.insert(SCHEMA_VERSION_KEY, [SCHEMA_VERSION].as_slice())
+				.map_err(|e| db_err(e.into()))?;
+		}
+		Some([v]) if *v <= SCHEMA_VERSION => {}
+		Some(v) => {
+			let msg = format!(
+				"crdt redb file schema {:?} is newer than this binary (v{}); \
+				restore a backup or upgrade",
+				v, SCHEMA_VERSION
+			);
+			tracing::error!("{}", msg);
+			return Err(ClError::from(Error::DbError(msg)));
+		}
+	}
+	Ok(())
+}
 
 /// Record types for binary keys
 mod record_type {
@@ -403,6 +442,7 @@ impl CrdtAdapterRedb {
 						)))
 					})?;
 					let _ = tx.open_table(TABLE_UPDATES);
+					ensure_schema_version(&tx)?;
 					tx.commit().map_err(|e| {
 						ClError::from(Error::DbError(format!(
 							"Failed to commit table creation: {}",
@@ -1066,7 +1106,7 @@ impl CrdtAdapter for CrdtAdapterRedb {
 					let rtx = db.begin_read()?;
 					let target = redb::Database::create(&out)?;
 					let wtx = target.begin_write()?;
-					for def in [TABLE_UPDATES] {
+					for def in [TABLE_UPDATES, TABLE_SCHEMA_VERSION] {
 						let src = rtx.open_table(def)?;
 						let mut dst = wtx.open_table(def)?;
 						for item in src.iter()? {

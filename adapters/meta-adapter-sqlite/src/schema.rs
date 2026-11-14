@@ -81,15 +81,19 @@ const READER_STATE_DDL: [&str; 2] = [
 	"CREATE INDEX IF NOT EXISTS idx_reader_state_last ON reader_state(tn_id, kind, last_at DESC)",
 ];
 
-/// Get the current database version from vars table
-async fn get_db_version(tx: &mut Transaction<'_, Sqlite>) -> i64 {
-	sqlx::query_scalar::<_, String>("SELECT value FROM vars WHERE key = 'db_version'")
-		.fetch_optional(&mut **tx)
-		.await
-		.ok()
-		.flatten()
-		.and_then(|v| v.parse().ok())
-		.unwrap_or(0)
+/// The database version from the vars table: `None` when there is no row (a fresh DB), `Err`
+/// when it can't be read or parsed — never "fresh", which would skip every migration.
+async fn get_db_version(tx: &mut Transaction<'_, Sqlite>) -> Result<Option<i64>, sqlx::Error> {
+	let Some(v) =
+		sqlx::query_scalar::<_, String>("SELECT value FROM vars WHERE key = 'db_version'")
+			.fetch_optional(&mut **tx)
+			.await?
+	else {
+		return Ok(None);
+	};
+	v.parse()
+		.map(Some)
+		.map_err(|e| sqlx::Error::Protocol(format!("unreadable db_version {v:?}: {e}")))
 }
 
 /// Column list shared by every `search_docs` writer below.
@@ -108,11 +112,73 @@ pub(crate) const SEARCH_UPSERT: &str = "ON CONFLICT(tn_id, obj_tp, obj_id, part_
 	 obj_hash = excluded.obj_hash";
 
 /// Set the database version in vars table
-async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) {
-	let _ = sqlx::query("INSERT OR REPLACE INTO vars (key, value) VALUES ('db_version', ?)")
+async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) -> Result<(), sqlx::Error> {
+	sqlx::query("INSERT OR REPLACE INTO vars (key, value) VALUES ('db_version', ?)")
 		.bind(version.to_string())
 		.execute(&mut **tx)
-		.await;
+		.await?;
+	Ok(())
+}
+
+/// Frozen copy of `cloudillo_types::utils::random_id` for migrations: 24 characters of
+/// `[0-9a-zA-Z]`. Drawn from SQLite's `random()` because this crate has no `rand` dependency;
+/// the high bit is masked so the modulo never sees a negative value.
+async fn migration_random_id(tx: &mut Transaction<'_, Sqlite>) -> Result<String, sqlx::Error> {
+	sqlx::query_scalar(
+		"WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 24) \
+		 SELECT group_concat(substr(\
+		 '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ', \
+		 ((random() & 9223372036854775807) % 62) + 1, 1), '') FROM c",
+	)
+	.fetch_one(&mut **tx)
+	.await
+}
+
+/// Frozen copy of `cloudillo_types::meta_adapter::MANAGED_PARENT_ID`, as the v27 and v58
+/// migrations wrote it.
+const MIGRATION_MANAGED_PARENT_ID: &str = "__managed__";
+
+/// Frozen copy of `reader_state::unread_update!` as of v61 (binds: tn_id, kind, ref).
+macro_rules! v61_unread_update {
+	($cond:literal) => {
+		concat!(
+			"UPDATE reader_state SET unread = (SELECT count(*) FROM actions m \
+			 WHERE m.tn_id = reader_state.tn_id AND ",
+			$cond,
+			" AND coalesce(m.sub_type, '') NOT IN ('DEL', 'UPD') \
+			 AND coalesce(m.status, 'A') <> 'D' \
+			 AND json_extract(m.x, '$.deletedBy') IS NULL \
+			 AND min(m.created_at, coalesce(m.received_at, m.created_at)) \
+			 > coalesce(reader_state.read_at, 0)), \
+			 updated_at = unixepoch() \
+			 WHERE tn_id = ? AND kind = ? AND ref = ?"
+		)
+	};
+}
+
+/// Frozen copy of `reader_state::recompute`'s `P:MSG` and `A:CONV` arms as of v61 — the only
+/// kinds the v61 migration recomputes.
+async fn v61_recompute(
+	tx: &mut Transaction<'_, Sqlite>,
+	tn_id: u32,
+	kind: &str,
+	ref_: &str,
+) -> Result<(), sqlx::Error> {
+	let sql = match kind {
+		"P:MSG" => v61_unread_update!(
+			"m.type = 'MSG' AND m.parent_id IS NULL AND m.issuer_tag = reader_state.ref \
+			 AND m.audience = \
+			 (SELECT t.id_tag FROM tenants t WHERE t.tn_id = reader_state.tn_id)"
+		),
+		"A:CONV" => v61_unread_update!(
+			"m.type = 'MSG' AND m.parent_id = reader_state.ref \
+			 AND m.issuer_tag <> \
+			 (SELECT t.id_tag FROM tenants t WHERE t.tn_id = reader_state.tn_id)"
+		),
+		_ => return Ok(()),
+	};
+	sqlx::query(sql).bind(tn_id).bind(kind).bind(ref_).execute(&mut **tx).await?;
+	Ok(())
 }
 
 /// The FTS5 virtual tables backing full-text search, and the triggers that
@@ -209,8 +275,7 @@ async fn migrate_v58_entries(tx: &mut Transaction<'_, Sqlite>) -> Result<(), sql
 		.fetch_all(&mut **tx)
 		.await?;
 	for e_id in content {
-		let entry_id = cloudillo_types::utils::random_id()
-			.map_err(|e| sqlx::Error::Protocol(format!("random_id: {e}")))?;
+		let entry_id = migration_random_id(tx).await?;
 		sqlx::query("UPDATE entries SET entry_id = ? WHERE e_id = ?")
 			.bind(entry_id)
 			.bind(e_id)
@@ -252,8 +317,7 @@ async fn migrate_v58_entries(tx: &mut Transaction<'_, Sqlite>) -> Result<(), sql
 	.fetch_all(&mut **tx)
 	.await?;
 	for (e_id, tn_id, old_id) in remote_folders {
-		let entry_id = cloudillo_types::utils::random_id()
-			.map_err(|e| sqlx::Error::Protocol(format!("random_id: {e}")))?;
+		let entry_id = migration_random_id(tx).await?;
 		sqlx::query(
 			"UPDATE entries SET entry_id = ?1, ref_file_id = entry_id, ref_file_tp = 'FLDR', \
 			   ref_content_type = (SELECT content_type FROM files WHERE f_id = ?2) \
@@ -326,7 +390,7 @@ async fn migrate_v58_entries(tx: &mut Transaction<'_, Sqlite>) -> Result<(), sql
 		    WHERE {ITEM_MATCH} ORDER BY s.a_id DESC LIMIT 1) \
 		 WHERE parent_id = ? AND action_id IS NULL AND f_id IS NOT NULL"
 	)))
-	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+	.bind(MIGRATION_MANAGED_PARENT_ID)
 	.execute(&mut **tx)
 	.await?;
 	let extra: Vec<(i64, Box<str>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -334,12 +398,11 @@ async fn migrate_v58_entries(tx: &mut Transaction<'_, Sqlite>) -> Result<(), sql
 		   JOIN files f ON f.f_id = entries.f_id JOIN split s ON {ITEM_MATCH} \
 		 WHERE entries.parent_id = ? AND entries.action_id IS NOT s.action_id"
 	)))
-	.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+	.bind(MIGRATION_MANAGED_PARENT_ID)
 	.fetch_all(&mut **tx)
 	.await?;
 	for (e_id, action_id) in extra {
-		let entry_id = cloudillo_types::utils::random_id()
-			.map_err(|e| sqlx::Error::Protocol(format!("random_id: {e}")))?;
+		let entry_id = migration_random_id(tx).await?;
 		sqlx::query(
 			"INSERT INTO entries (tn_id, entry_id, f_id, status, owner_tag, file_name, tags, \
 			   visibility, hidden, parent_id, channel, action_id, created_at, updated_at) \
@@ -405,7 +468,20 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	.execute(&mut *tx)
 	.await?;
 
-	let mut version = get_db_version(&mut tx).await;
+	let mut version = get_db_version(&mut tx)
+		.await
+		.inspect_err(|e| error!("meta DB: {e}"))?
+		.unwrap_or(0);
+	// Refuse before any DDL below touches a schema this binary doesn't know. `new()` flattens
+	// the error to `DbError`, so the log line is where the text survives.
+	if version > CURRENT_DB_VERSION {
+		let msg = format!(
+			"meta DB schema v{version} is newer than this binary (v{CURRENT_DB_VERSION}); \
+			 restore a backup or upgrade"
+		);
+		error!("{msg}");
+		return Err(sqlx::Error::Protocol(msg));
+	}
 
 	// Schema creation - safe to run every time (uses IF NOT EXISTS)
 	// New tables, indexes, triggers are added here
@@ -1782,7 +1858,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, CURRENT_DB_VERSION).await;
+		set_db_version(&mut tx, CURRENT_DB_VERSION).await?;
 		version = CURRENT_DB_VERSION;
 	}
 
@@ -1828,7 +1904,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, 2).await;
+		set_db_version(&mut tx, 2).await?;
 	}
 
 	// Version 3: Share link support - add resource_id and access_level to refs
@@ -1855,7 +1931,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 
-		set_db_version(&mut tx, 3).await;
+		set_db_version(&mut tx, 3).await?;
 	}
 
 	// Version 4: Folder hierarchy
@@ -1873,7 +1949,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 
-		set_db_version(&mut tx, 4).await;
+		set_db_version(&mut tx, 4).await?;
 	}
 
 	// Version 5: Add flags column to actions table for action flags (R/C/O)
@@ -1884,7 +1960,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 
-		set_db_version(&mut tx, 5).await;
+		set_db_version(&mut tx, 5).await?;
 	}
 
 	// Version 6: Add x JSON column for extensible metadata
@@ -1901,7 +1977,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, 6).await;
+		set_db_version(&mut tx, 6).await?;
 	}
 
 	// Version 7: Add global activity timestamps to files table
@@ -1916,7 +1992,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 
-		set_db_version(&mut tx, 7).await;
+		set_db_version(&mut tx, 7).await?;
 	}
 
 	// Version 8: Convert roles from JSON array to bare string
@@ -1930,7 +2006,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, 8).await;
+		set_db_version(&mut tx, 8).await?;
 	}
 
 	// Version 9: Add creator_tag column to files table
@@ -1949,7 +2025,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, 9).await;
+		set_db_version(&mut tx, 9).await?;
 	}
 
 	// Version 10: Document tree root_id on files
@@ -1964,7 +2040,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, 10).await;
+		set_db_version(&mut tx, 10).await?;
 	}
 
 	// Version 11: Share entries table
@@ -2012,7 +2088,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, 11).await;
+		set_db_version(&mut tx, 11).await?;
 	}
 
 	// Version 12: Migrate existing FSHR actions into share_entries (sender side only)
@@ -2037,7 +2113,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, 12).await;
+		set_db_version(&mut tx, 12).await?;
 	}
 
 	// Version 13: Installed apps table + drop orphaned action_outbox_queue
@@ -2087,7 +2163,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, 13).await;
+		set_db_version(&mut tx, 13).await?;
 	}
 
 	// Version 14: Convert reactions column from integer to text (per-type counts)
@@ -2112,14 +2188,14 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, 14).await;
+		set_db_version(&mut tx, 14).await?;
 	}
 
 	// Version 15: Add params column to refs for share link launch params
 	if version < 15 {
 		sqlx::query("ALTER TABLE refs ADD COLUMN params TEXT").execute(&mut *tx).await?;
 
-		set_db_version(&mut tx, 15).await;
+		set_db_version(&mut tx, 15).await?;
 	}
 
 	// Version 16: Add trust column to profiles for per-profile proxy-token preference
@@ -2129,7 +2205,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 
-		set_db_version(&mut tx, 16).await;
+		set_db_version(&mut tx, 16).await?;
 	}
 
 	// Version 17: Contact management with CardDAV sync
@@ -2231,7 +2307,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, 17).await;
+		set_db_version(&mut tx, 17).await?;
 	}
 
 	// Migration v18: calendars + calendar_objects (CalDAV).
@@ -2340,7 +2416,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, 18).await;
+		set_db_version(&mut tx, 18).await?;
 	}
 
 	// Migration v19: fix calendar_objects uniqueness.
@@ -2368,7 +2444,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, 19).await;
+		set_db_version(&mut tx, 19).await?;
 	}
 
 	// Migration v20: add calendar_objects.exdate (CSV of unix seconds).
@@ -2388,7 +2464,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 				.await?;
 		}
 
-		set_db_version(&mut tx, 20).await;
+		set_db_version(&mut tx, 20).await?;
 	}
 
 	// Migration v21: index actions by (tn_id, subject, type).
@@ -2404,7 +2480,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, 21).await;
+		set_db_version(&mut tx, 21).await?;
 	}
 
 	// Migration v22: backfill root_id for existing meta files.
@@ -2419,7 +2495,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, 22).await;
+		set_db_version(&mut tx, 22).await?;
 	}
 
 	// Migration v23: hidden flag for files (attachments, profile pictures)
@@ -2466,7 +2542,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 
-		set_db_version(&mut tx, 23).await;
+		set_db_version(&mut tx, 23).await?;
 	}
 
 	// Version 24: Drop unused collections table
@@ -2475,7 +2551,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	if version < 24 {
 		sqlx::query("DROP TABLE IF EXISTS collections").execute(&mut *tx).await?;
 
-		set_db_version(&mut tx, 24).await;
+		set_db_version(&mut tx, 24).await?;
 	}
 
 	// Version 25: migrate actions.visibility NULL → 'D'.
@@ -2488,7 +2564,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 
-		set_db_version(&mut tx, 25).await;
+		set_db_version(&mut tx, 25).await?;
 	}
 
 	// Version 26: rename `federation.auto_approve` → `profile.auto_approve_actions`.
@@ -2509,7 +2585,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 
-		set_db_version(&mut tx, 26).await;
+		set_db_version(&mut tx, 26).await?;
 	}
 
 	// Version 27: migrate legacy hidden=1 files into the managed folder so the
@@ -2521,11 +2597,11 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			"UPDATE files SET parent_id = ?, hidden = 0
 			  WHERE hidden = 1 AND parent_id IS NULL",
 		)
-		.bind(cloudillo_types::meta_adapter::MANAGED_PARENT_ID)
+		.bind(MIGRATION_MANAGED_PARENT_ID)
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, 27).await;
+		set_db_version(&mut tx, 27).await?;
 	}
 
 	// Version 28: Hand (cross-context file refs) tombstone columns. Cross-tenant
@@ -2540,7 +2616,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 
-		set_db_version(&mut tx, 28).await;
+		set_db_version(&mut tx, 28).await?;
 	}
 
 	// Version 29: per-user persisted access_level for cross-context rows. Written
@@ -2552,7 +2628,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 
-		set_db_version(&mut tx, 29).await;
+		set_db_version(&mut tx, 29).await?;
 	}
 
 	// Version 30: backfill file_user_data.access_level from receiver-side FSHR
@@ -2601,7 +2677,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.execute(&mut *tx)
 		.await?;
 
-		set_db_version(&mut tx, 30).await;
+		set_db_version(&mut tx, 30).await?;
 	}
 
 	if version < 31 {
@@ -2610,7 +2686,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		sqlx::query("UPDATE profiles SET status = NULL WHERE status = 'T'")
 			.execute(&mut *tx)
 			.await?;
-		set_db_version(&mut tx, 31).await;
+		set_db_version(&mut tx, 31).await?;
 	}
 
 	// Version 32: per-subject STAT watermark. Receivers gate inbound STAT
@@ -2622,14 +2698,14 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		sqlx::query("ALTER TABLE actions ADD COLUMN stat_at INTEGER")
 			.execute(&mut *tx)
 			.await?;
-		set_db_version(&mut tx, 32).await;
+		set_db_version(&mut tx, 32).await?;
 	}
 
 	if version < 33 {
 		sqlx::query("ALTER TABLE actions ADD COLUMN reposts integer")
 			.execute(&mut *tx)
 			.await?;
-		set_db_version(&mut tx, 33).await;
+		set_db_version(&mut tx, 33).await?;
 	}
 
 	if version < 34 {
@@ -2656,7 +2732,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		)
 		.execute(&mut *tx)
 		.await?;
-		set_db_version(&mut tx, 34).await;
+		set_db_version(&mut tx, 34).await?;
 	}
 
 	if version < 35 {
@@ -2669,7 +2745,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		)
 		.execute(&mut *tx)
 		.await?;
-		set_db_version(&mut tx, 35).await;
+		set_db_version(&mut tx, 35).await?;
 	}
 
 	if version < 36 {
@@ -2757,7 +2833,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		// Drop the obsolete legacy count column (reader-local, never federated).
 		drop_column_if_exists(&mut tx, "actions", "comments_read").await?;
 
-		set_db_version(&mut tx, 36).await;
+		set_db_version(&mut tx, 36).await?;
 	}
 
 	if version < 37 {
@@ -2786,7 +2862,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			.execute(&mut *tx)
 			.await?;
 		}
-		set_db_version(&mut tx, 37).await;
+		set_db_version(&mut tx, 37).await?;
 	}
 
 	if version < 38 {
@@ -2800,7 +2876,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		//
 		// Backfilling existing files/actions/profiles is the `search-reindex`
 		// scheduler task's job — keeping it out of the startup transaction.
-		set_db_version(&mut tx, 38).await;
+		set_db_version(&mut tx, 38).await?;
 	}
 
 	if version < 39 {
@@ -2820,7 +2896,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		// text, and `doc_format::map_row` reads it with the panicking accessor.
 		add_column_if_missing(&mut tx, "doc_formats", "format_version", "INTEGER").await?;
 		drop_column_if_exists(&mut tx, "doc_formats", "version").await?;
-		set_db_version(&mut tx, 39).await;
+		set_db_version(&mut tx, 39).await?;
 	}
 
 	if version < 40 {
@@ -2831,7 +2907,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		sqlx::query("DROP INDEX IF EXISTS idx_search_docs_obj")
 			.execute(&mut *tx)
 			.await?;
-		set_db_version(&mut tx, 40).await;
+		set_db_version(&mut tx, 40).await?;
 	}
 
 	if version < 47 {
@@ -2846,7 +2922,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		// Nothing is left for this block but the stamp: the descriptor block above adds each
 		// site column explicitly, because it reads them itself and runs ahead of every
 		// migration, so nothing here has to assume a sub-47 database lacks the site tables.
-		set_db_version(&mut tx, 47).await;
+		set_db_version(&mut tx, 47).await?;
 	}
 
 	if version < 48 {
@@ -2859,7 +2935,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		// `CREATE TABLE IF NOT EXISTS` cannot add one to an existing table — hence the
 		// ALTER. Older rows keep a NULL, which `rollback_doc` reads as "no path to restore".
 		add_column_if_missing(&mut tx, "site_docs", "previous_mount_path", "text").await?;
-		set_db_version(&mut tx, 48).await;
+		set_db_version(&mut tx, 48).await?;
 	}
 
 	if version < 52 {
@@ -2931,7 +3007,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		sqlx::query("DROP TRIGGER IF EXISTS profile_settings_insert_at")
 			.execute(&mut *tx)
 			.await?;
-		set_db_version(&mut tx, 52).await;
+		set_db_version(&mut tx, 52).await?;
 	}
 
 	if version < 53 {
@@ -2954,7 +3030,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 				.execute(&mut *tx)
 				.await?;
 		}
-		set_db_version(&mut tx, 53).await;
+		set_db_version(&mut tx, 53).await?;
 	}
 
 	if version < 54 {
@@ -2962,7 +3038,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		add_column_if_missing(&mut tx, "profiles", "hat_roles", "text").await?;
 		add_column_if_missing(&mut tx, "profiles", "peer_hat_roles", "text").await?;
 		add_column_if_missing(&mut tx, "actions", "hat_tag", "text").await?;
-		set_db_version(&mut tx, 54).await;
+		set_db_version(&mut tx, 54).await?;
 	}
 
 	if version < 55 {
@@ -2979,7 +3055,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		)
 		.execute(&mut *tx)
 		.await?;
-		set_db_version(&mut tx, 55).await;
+		set_db_version(&mut tx, 55).await?;
 	}
 
 	if version < 56 {
@@ -2991,13 +3067,13 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 				.execute(&mut *tx)
 				.await?;
 		}
-		set_db_version(&mut tx, 56).await;
+		set_db_version(&mut tx, 56).await?;
 	}
 
 	if version < 57 {
 		// Hats: the viewer's remembered identities at a peer, as a JSON array.
 		add_column_if_missing(&mut tx, "profiles", "hats", "text").await?;
-		set_db_version(&mut tx, 57).await;
+		set_db_version(&mut tx, 57).await?;
 	}
 
 	if version < 58 || legacy_files {
@@ -3016,7 +3092,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		// Search rows gate on the live `entries` / `actions` placement, never on a mirror.
 		drop_column_if_exists(&mut tx, "search_docs", "visibility").await?;
 		drop_column_if_exists(&mut tx, "search_docs", "channel").await?;
-		set_db_version(&mut tx, 58).await;
+		set_db_version(&mut tx, 58).await?;
 	}
 
 	if version < 59 {
@@ -3024,7 +3100,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		// untrusted one is CSP-sandboxed to an opaque origin (`cloudillo_file::apkg`).
 		add_column_if_missing(&mut tx, "installed_apps", "trusted", "INTEGER NOT NULL DEFAULT 0")
 			.await?;
-		set_db_version(&mut tx, 59).await;
+		set_db_version(&mut tx, 59).await?;
 	}
 
 	if version < 60 {
@@ -3072,7 +3148,7 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		drop_column_if_exists(&mut tx, "profiles", "msg_read_at").await?;
 		drop_column_if_exists(&mut tx, "actions", "comments_read_at").await?;
 		drop_column_if_exists(&mut tx, "actions", "sub_level").await?;
-		set_db_version(&mut tx, 60).await;
+		set_db_version(&mut tx, 60).await?;
 	}
 
 	if version < 61 {
@@ -3136,19 +3212,16 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		.fetch_all(&mut *tx)
 		.await?;
 		for (tn_id, kind, ref_) in rows {
-			let tn_id = TnId(u32::try_from(tn_id).unwrap_or_default());
-			crate::reader_state::recompute(&mut *tx, tn_id, &kind, &ref_)
-				.await
-				.map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+			v61_recompute(&mut tx, u32::try_from(tn_id).unwrap_or_default(), &kind, &ref_).await?;
 		}
-		set_db_version(&mut tx, 61).await;
+		set_db_version(&mut tx, 61).await?;
 	}
 
 	if version < 62 {
 		// Sender marker: a directed delivery the recipient refused as unsupported (422
 		// `E-FED-UNSUPPORTED`) sets `delivery_error = 'unsupported'` (`ActionDeliveryTask`).
 		add_column_if_missing(&mut tx, "actions", "delivery_error", "TEXT").await?;
-		set_db_version(&mut tx, 62).await;
+		set_db_version(&mut tx, 62).await?;
 	}
 
 	// Unversioned and idempotent: a DB that reached v58 on a pre-rename build still has
@@ -3173,6 +3246,24 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 #[cfg(test)]
 mod tests {
 	use sqlx::sqlite::SqlitePoolOptions;
+
+	// A DB stamped by a newer binary is refused, not downgraded.
+	#[tokio::test]
+	async fn newer_db_version_refused() {
+		let db = SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect("sqlite::memory:")
+			.await
+			.expect("connect");
+		super::init_db(&db).await.expect("init");
+		// Far past any real version, so the test survives future migrations.
+		sqlx::query("UPDATE vars SET value = '9999' WHERE key = 'db_version'")
+			.execute(&db)
+			.await
+			.expect("stamp");
+		let err = super::init_db(&db).await.err().map(|e| e.to_string()).unwrap_or_default();
+		assert!(err.contains("newer than this binary"), "got {err:?}");
+	}
 
 	// v59 on a DB whose `installed_apps` predates `trusted`: existing apps come out untrusted.
 	#[tokio::test]

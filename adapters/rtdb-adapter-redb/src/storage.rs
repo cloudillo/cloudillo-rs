@@ -15,6 +15,41 @@ pub const TABLE_INDEXES: redb::TableDefinition<&str, &str> = redb::TableDefiniti
 /// Metadata storage table
 pub const TABLE_METADATA: redb::TableDefinition<&str, &str> = redb::TableDefinition::new("meta");
 
+/// `meta` key holding the file's schema version. Unprefixed, so shared-file tenant purges
+/// (which delete `"{tn}/..."`) keep it.
+pub const SCHEMA_VERSION_KEY: &str = "schema_version";
+
+/// File schema version this binary reads and writes (stored as its decimal string)
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// Refuse a file written by a newer schema; stamp an unversioned (new or pre-versioning) one.
+pub fn ensure_schema_version(
+	meta: &mut redb::Table<&str, &str>,
+) -> Result<(), crate::error::Error> {
+	use crate::error::{Error, from_redb_error};
+	use redb::ReadableTable;
+
+	let stored = meta
+		.get(SCHEMA_VERSION_KEY)
+		.map_err(from_redb_error)?
+		.map(|v| v.value().to_string());
+	let Some(stored) = stored else {
+		meta.insert(SCHEMA_VERSION_KEY, SCHEMA_VERSION.to_string().as_str())
+			.map_err(from_redb_error)?;
+		return Ok(());
+	};
+	let msg = match stored.parse::<u32>() {
+		Ok(v) if v <= SCHEMA_VERSION => return Ok(()),
+		Ok(v) => format!(
+			"rtdb redb file schema v{v} is newer than this binary (v{SCHEMA_VERSION}); \
+			restore a backup or upgrade"
+		),
+		Err(_) => format!("rtdb redb file has an unreadable schema_version {stored:?}"),
+	};
+	tracing::error!("{}", msg);
+	Err(Error::StorageError(msg))
+}
+
 /// Get current Unix timestamp
 pub fn now_timestamp() -> u64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()

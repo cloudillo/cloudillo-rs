@@ -207,6 +207,7 @@ impl RtdbAdapterRedb {
 						tx.open_table(storage::TABLE_INDEXES).map_err(error::from_redb_error)?;
 					let mut meta_table =
 						tx.open_table(storage::TABLE_METADATA).map_err(error::from_redb_error)?;
+					storage::ensure_schema_version(&mut meta_table)?;
 
 					for (table_idx, key, value) in tenant_entries {
 						match *table_idx {
@@ -304,8 +305,10 @@ impl RtdbAdapterRedb {
 						tx.open_table(storage::TABLE_DOCUMENTS).map_err(error::from_redb_error)?;
 					let _ =
 						tx.open_table(storage::TABLE_INDEXES).map_err(error::from_redb_error)?;
-					let _ =
+					let mut meta_table =
 						tx.open_table(storage::TABLE_METADATA).map_err(error::from_redb_error)?;
+					storage::ensure_schema_version(&mut meta_table)?;
+					drop(meta_table);
 					tx.commit().map_err(error::from_redb_error)?;
 					Ok(Arc::new(db))
 				})
