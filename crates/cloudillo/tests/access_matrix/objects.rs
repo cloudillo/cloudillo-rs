@@ -266,6 +266,9 @@ pub struct ApiKeys {
 	pub dav_rw: String,
 	/// club's own unscoped key (key 6).
 	pub club: String,
+	/// `device:{alice canonical folder entry}` (key 8), and that scope string.
+	pub device: String,
+	pub device_scope: String,
 }
 
 /// Non-level files the curated rows use (both tenants); `tenant-crdt-d-active` is also the
@@ -484,7 +487,19 @@ pub async fn seed_api_keys(app: &App, t: &Tenants) -> ApiKeys {
 	let dav_rw = app.auth_adapter.create_api_key(tn, opts).await.unwrap();
 	assert_eq!(dav_rw.info.key_id, 7, "alice's read-write DAV key is key 7");
 	let (club, dav_rw) = (club.plaintext_key.to_string(), dav_rw.plaintext_key.to_string());
-	ApiKeys { unscoped, file_read, dav, expired, carddav_r, dav_rw, club }
+	// A native client's device key, rooted at alice's canonical folder (by its entry id).
+	let folder = app.meta_adapter.read_file(tn, &canon_folder(t.alice.id_tag)).await.unwrap();
+	let device_scope = format!("device:{}", folder.unwrap().entry_id);
+	let opts = CreateApiKeyOptions {
+		name: Some("zqmatrix-device"),
+		scopes: Some(&device_scope),
+		expires_at: None,
+		auth_time: None,
+	};
+	let device = app.auth_adapter.create_api_key(tn, opts).await.unwrap();
+	assert_eq!(device.info.key_id, 8, "alice's device key is key 8");
+	let device = device.plaintext_key.to_string();
+	ApiKeys { unscoped, file_read, dav, expired, carddav_r, dav_rw, club, device, device_scope }
 }
 
 /// The one proxy site, which the admin rows aim at (`/api/admin/proxy-sites/1`).

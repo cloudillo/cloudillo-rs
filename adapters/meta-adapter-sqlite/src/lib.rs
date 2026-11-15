@@ -52,13 +52,13 @@ use cloudillo_types::{
 		FinalizeActionOptions, InstallApp, InstalledApp, ListActionOptions,
 		ListCalendarObjectOptions, ListContactOptions, ListFileOptions, ListProfileOptions,
 		ListReaderStateOptions, ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions,
-		MetaAdapter, PartnerEdge, PatchReaderState, Profile, ProfileBadgeRow, ProfileData,
-		ProfileRelation, PublicProfileRow, PublishSiteDoc, PushSubscription, PushSubscriptionData,
-		ReaderState, RefData, SearchObject, SearchOptions, SearchPart, SearchRow, ShareEntry, Site,
-		SiteDoc, SpaceReport, Task, TaskPatch, Tenant, TenantListMeta, UpdateActionDataOptions,
-		UpdateAddressBookData, UpdateCalendarData, UpdateChannelData, UpdateFileOptions,
-		UpdateRefOptions, UpdateShareEntryOptions, UpdateTenantData, UpsertDocFormat,
-		UpsertProfileFields, UpsertResult, UpsertSite,
+		MetaAdapter, NotificationLogEntry, PartnerEdge, PatchReaderState, Profile, ProfileBadgeRow,
+		ProfileData, ProfileRelation, PublicProfileRow, PublishSiteDoc, PushSubscription,
+		PushSubscriptionData, ReaderState, RefData, SearchObject, SearchOptions, SearchPart,
+		SearchRow, ShareEntry, Site, SiteDoc, SpaceReport, Task, TaskPatch, Tenant, TenantListMeta,
+		UpdateActionDataOptions, UpdateAddressBookData, UpdateCalendarData, UpdateChannelData,
+		UpdateFileOptions, UpdateRefOptions, UpdateShareEntryOptions, UpdateTenantData,
+		UpsertDocFormat, UpsertProfileFields, UpsertResult, UpsertSite,
 	},
 	prelude::*,
 	snapshot::SnapshotPart,
@@ -467,6 +467,17 @@ impl MetaAdapter for MetaAdapterSqlite {
 		file::read_file_id_by_variant(&self.dbr, tn_id, variant_id).await
 	}
 
+	async fn find_files_by_orig_blob(
+		&self,
+		tn_id: TnId,
+		parent_id: &str,
+		blob_ids: &[&str],
+		enterable_channels: Option<&[Box<str>]>,
+	) -> ClResult<Vec<(Box<str>, Box<str>)>> {
+		file::find_files_by_orig_blob(&self.dbr, tn_id, parent_id, blob_ids, enterable_channels)
+			.await
+	}
+
 	async fn read_content(&self, tn_id: TnId, file_id: &str) -> ClResult<ContentInfo> {
 		file::read_content(&self.dbr, tn_id, file_id).await
 	}
@@ -856,6 +867,26 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn delete_push_subscription(&self, tn_id: TnId, subscription_id: u64) -> ClResult<()> {
 		push::delete(&self.db, tn_id, subscription_id).await
+	}
+
+	// Notification Log
+	//*****************
+
+	async fn append_notification(&self, tn_id: TnId, payload_json: &str) -> ClResult<u64> {
+		push::append_notification(&self.db, tn_id, payload_json).await
+	}
+
+	async fn list_notifications_since(
+		&self,
+		tn_id: TnId,
+		since: u64,
+		limit: u32,
+	) -> ClResult<Vec<NotificationLogEntry>> {
+		push::list_notifications_since(&self.dbr, tn_id, since, limit).await
+	}
+
+	async fn prune_notifications(&self, older_than: Timestamp) -> ClResult<u64> {
+		push::prune_notifications(&self.db, older_than).await
 	}
 
 	// Share Entry Management

@@ -451,7 +451,7 @@ async fn migrate_v58_entries(tx: &mut Transaction<'_, Sqlite>) -> Result<(), sql
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 62;
+	const CURRENT_DB_VERSION: i64 = 63;
 
 	let mut tx = db.begin().await?;
 
@@ -565,6 +565,19 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	sqlx::query("CREATE INDEX IF NOT EXISTS idx_subscriptions_tnid ON subscriptions(tn_id)")
 		.execute(&mut *tx)
 		.await?;
+
+	// Notification log: every payload handed to push `send_to_tenant`, for catch-up polling
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS notifications (
+			tn_id integer NOT NULL,
+			seq integer NOT NULL,
+			payload json NOT NULL,
+			created_at INTEGER DEFAULT (unixepoch()),
+			PRIMARY KEY(tn_id, seq)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
 
 	// Profiles
 	sqlx::query(
@@ -3222,6 +3235,11 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		// `E-FED-UNSUPPORTED`) sets `delivery_error = 'unsupported'` (`ActionDeliveryTask`).
 		add_column_if_missing(&mut tx, "actions", "delivery_error", "TEXT").await?;
 		set_db_version(&mut tx, 62).await?;
+	}
+
+	if version < 63 {
+		// notifications table (created idempotently in init_db)
+		set_db_version(&mut tx, 63).await?;
 	}
 
 	// Unversioned and idempotent: a DB that reached v58 on a pre-rename build still has

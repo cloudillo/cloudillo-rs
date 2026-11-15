@@ -31,7 +31,9 @@ pub mod settings;
 
 mod prelude;
 
-pub use send::{NotificationPayload, PushResult, send_notification, send_to_tenant};
+pub use send::{
+	NotificationPayload, PushResult, log_notification, send_notification, send_to_tenant,
+};
 
 use crate::prelude::*;
 

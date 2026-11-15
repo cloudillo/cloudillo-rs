@@ -122,12 +122,17 @@ fn extract_token_from_query(query: &str) -> Option<String> {
 /// Capability scopes (`carddav:*` / `caldav:*`) are deliberately not rejected here —
 /// `crate::scope::scope_permits` already constrained them fail-closed in
 /// `require_auth`, and a second rejection would 403 a DAV key on its own routes.
+/// Device keys (`device:*`) pass for the same reason: `scope_permits` confines them
+/// to their own push-subscription routes and `GET /api/notifications` inside this group.
 pub async fn require_leader(
 	Auth(auth_ctx): Auth,
 	req: Request<Body>,
 	next: Next,
 ) -> ClResult<Response<Body>> {
-	if auth_ctx.scope.as_deref().and_then(TokenScope::parse).is_some() {
+	if matches!(
+		auth_ctx.scope.as_deref().and_then(TokenScope::parse),
+		Some(s) if !matches!(s, TokenScope::Device { .. })
+	) {
 		warn!(
 			subject = %auth_ctx.id_tag,
 			scope = ?auth_ctx.scope.as_deref().map(scope_for_log),

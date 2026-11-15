@@ -1583,6 +1583,8 @@ const ADDR_BOOKS: Route = Call("GET", "/api/address-books", "");
 const CALENDARS: Route = Call("GET", "/api/calendars", "");
 const SITES: Route = Call("GET", "/api/site", "");
 const PUSH_SUB: Route = Call("POST", "/api/notifications/subscriptions", "{}");
+const NOTIF_LIST: Route = Call("GET", "/api/notifications", "");
+const BLOB_CHECK: Route = Call("POST", "/api/files/{entry}/blob-check", r#"{"blobIds":[]}"#);
 const REINDEX: Route = Call("POST", "/api/search/reindex", "");
 const API_KEYS: Route = Call("GET", "/api/auth/api-keys", "");
 const API_KEY_MINT: Route = Call("POST", "/api/auth/api-keys", r#"{"name":"zqm-mint"}"#);
@@ -2692,6 +2694,44 @@ pub const MG: &[Row] = &[
 		Call("POST", SHARES_VARIANT, SHARE_U),
 		"404",
 	),
+	// The notification log is the account's own: a community member holding `leader` passes
+	// `require_leader` but not the handler's tenant-self check.
+	("MG-658", "owner@alice", "", NOTIF_LIST, "Allow"),
+	("MG-659", "m_leader@club", "", NOTIF_LIST, "Deny"),
+	("MG-660", "m_contributor@club", "", NOTIF_LIST, "Deny"),
+	// Blob-check probes for hashes: the account itself, or a scope bounded to the folder.
+	// The fixture has no `:W` folder share link (`sharelink-w` is on the doc root), so the
+	// scoped allow path is covered by `device_key_scope_bounds` in `management_flows.rs`.
+	("MG-661", "owner@alice", "folder-blob-d-active@alice", BLOB_CHECK, "Allow"),
+	("MG-662", "stranger@alice", "folder-blob-d-active@alice", BLOB_CHECK, "Deny"),
+	("MG-663", "follower@alice", "folder-blob-d-active@alice", BLOB_CHECK, "Deny"),
+	("MG-664", "g_read@alice", "folder-blob-d-active@alice", BLOB_CHECK, "Deny"),
+	("MG-665", "anon@alice", "folder-blob-d-active@alice", BLOB_CHECK, "Deny"),
+	("MG-666", "sharelink-r@alice", "folder-blob-d-active@alice", BLOB_CHECK, "Deny"),
+	("MG-667", "sharelink-w@alice", "folder-blob-d-active@alice", BLOB_CHECK, "Deny"),
+	("MG-668", "folderlink-r@alice", "folder-blob-d-active@alice", BLOB_CHECK, "Deny"),
+	("MG-669", "idp-ident@alice", "folder-blob-d-active@alice", BLOB_CHECK, "Deny"),
+	("MG-670", "idp-mgmt@alice", "folder-blob-d-active@alice", BLOB_CHECK, "Deny"),
+	("MG-671", "apkg-publish@alice", "folder-blob-d-active@alice", BLOB_CHECK, "Deny"),
+	("MG-672", "m_leader@club", "folder-blob-d-active@club", BLOB_CHECK, "Deny"),
+	// A `device:{root}` key (root = alice's canonical folder): bounded to the root subtree,
+	// refused off its route allow-list.
+	("MG-673", "device@alice", "folder-blob-d-active@alice", BLOB_CHECK, "Allow"),
+	("MG-674", "device@alice", "folder-blob-p-active@alice", BLOB_CHECK, "Deny"),
+	("MG-675", "device@alice", "folder-blob-d-active@club", BLOB_CHECK, "Deny"),
+	("MG-676", "device@alice", FOLDER_CHILD, FileGet, "Allow"),
+	("MG-677", "device@alice", "tenant-blob-d-active@alice", FileGet, "Deny"),
+	("MG-678", "device@alice", "folder-blob-p-active@alice", FileCreate, "Deny"),
+	("MG-679", "device@alice", "", UPLOAD_NO_PARENT, "Deny"),
+	// Without a parentId the listing is the root's own row, never the whole tenant; a
+	// parentId browse inside the root lists its children (MG-685).
+	("MG-680", "device@alice", "folder-blob-d-active@alice", FileListQ(""), "Present"),
+	("MG-681", "device@alice", "tenant-blob-d-active@alice", FileListQ(""), "Absent"),
+	// Deliberate until keys can carry several scopes: the device key reads the whole log.
+	("MG-682", "device@alice", "", NOTIF_LIST, "Allow"),
+	("MG-683", "device@alice", "", Call("POST", "/api/actions", "{}"), "Deny"),
+	("MG-684", "device@alice", "", API_KEYS, "Deny"),
+	("MG-685", "device@alice", FOLDER_CHILD, FileListQ("parentId={parent}"), "Present"),
 ];
 
 const PATCH_QUOTA: Route =
@@ -2701,6 +2741,7 @@ const PATCH_QUOTA_CLEAR: Route =
 const ADMIN_ROTATE: Route =
 	Call("POST", "/api/admin/tenants/trash.test/signing-keys/rotations", "");
 const UPLOAD_RESTORE: Route = Call("POST", "/api/uploads/file?name=restore", "zqm");
+const UPLOAD_NO_PARENT: Route = Call("POST", "/api/uploads/file?name=zqm-dev.txt", "zqm");
 const ACTIVATE_UNKNOWN: Route =
 	Call("POST", "/api/idp/activations", r#"{"refId":"zqref-unknown"}"#);
 
@@ -3027,6 +3068,7 @@ const ACCOUNT_ROUTES: &[(&str, Route)] = &[
 	("MG-386", Get("/api/refs")),
 	("MG-387", APPS_INSTALLED),
 	("MG-388", PUSH_SUB),
+	("MG-657", NOTIF_LIST),
 ];
 /// Not `apikey-dav`: it reads address books and calendars (MG-59, MG-66).
 const ACCOUNT_DENIED: &[&str] = &[

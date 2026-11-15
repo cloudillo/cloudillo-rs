@@ -1648,6 +1648,16 @@ pub struct PushSubscription {
 	pub created_at: ApiTime,
 }
 
+/// One row of the per-tenant notification log (what `send_to_tenant` was asked to push)
+#[derive(Debug, Clone)]
+pub struct NotificationLogEntry {
+	/// Per-tenant sequence number, strictly increasing
+	pub seq: u64,
+	/// The notification payload as JSON, without `seq`
+	pub payload: Box<str>,
+	pub created_at: ApiTime,
+}
+
 // Tasks
 //*******
 pub struct Task {
@@ -2658,7 +2668,7 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// deletes from this table. Returns the number of rows removed, deleted in batches so a
 	/// large backlog does not hold the write connection for one long statement.
 	///
-	/// **Deliberately cross-tenant, and the only such delete.** It takes no `TnId` because
+	/// **Deliberately cross-tenant** (as is `prune_notifications`). It takes no `TnId` because
 	/// `AuthCleanupTask` runs it daily with no tenant in hand; every other DELETE in the
 	/// adapters is tenant-scoped and adding a `tn_id` predicate here would be wrong, not
 	/// safer. Not reachable from any request path.
@@ -2701,6 +2711,18 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	) -> ClResult<FileVariant<Box<str>>>;
 	/// Look up the file_id for a given variant_id
 	async fn read_file_id_by_variant(&self, tn_id: TnId, variant_id: &str) -> ClResult<Box<str>>;
+	/// `(blob_id, entry_id)` of every live entry in `parent_id`'s subtree (the folder itself
+	/// or any folder below it; trashed subtrees fall out) whose `orig` variant is one of
+	/// `blob_ids`. A blob placed several times yields one pair per entry.
+	/// `enterable_channels` (`Some`) keeps only entries outside a room or in one of the listed
+	/// rooms; `None` applies no channel gate.
+	async fn find_files_by_orig_blob(
+		&self,
+		tn_id: TnId,
+		parent_id: &str,
+		blob_ids: &[&str],
+		enterable_channels: Option<&[Box<str>]>,
+	) -> ClResult<Vec<(Box<str>, Box<str>)>>;
 	/// The content row named `file_id`. `NotFound` when absent.
 	async fn read_content(&self, tn_id: TnId, file_id: &str) -> ClResult<ContentInfo>;
 	/// Create a verified sync mirror's content row (`preset = 'sync'`) with **no entry**, or
@@ -3119,6 +3141,25 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// Removes a push subscription. Called when a subscription becomes invalid
 	/// (e.g., 410 Gone response from push service) or when user unsubscribes.
 	async fn delete_push_subscription(&self, tn_id: TnId, subscription_id: u64) -> ClResult<()>;
+
+	// Notification Log
+	//*****************
+
+	/// Append a notification payload (JSON) to the tenant's log; returns its new `seq`
+	async fn append_notification(&self, tn_id: TnId, payload_json: &str) -> ClResult<u64>;
+
+	/// Log entries with `seq > since`, ascending, at most `limit`
+	async fn list_notifications_since(
+		&self,
+		tn_id: TnId,
+		since: u64,
+		limit: u32,
+	) -> ClResult<Vec<NotificationLogEntry>>;
+
+	/// Delete log entries created before `older_than`, keeping each tenant's newest entry
+	/// so its `seq` never restarts. Cross-tenant like `cleanup_orphaned_action_tokens`;
+	/// run only by the nightly maintenance task. Returns the number of rows deleted.
+	async fn prune_notifications(&self, older_than: Timestamp) -> ClResult<u64>;
 
 	// Share Entry Management
 	//***********************

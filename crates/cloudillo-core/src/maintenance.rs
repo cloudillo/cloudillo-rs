@@ -88,6 +88,11 @@ impl Task<App> for DbMaintenanceTask {
 			warn!(error = %e, "db_maintenance: FTS merge failed");
 		}
 
+		match app.meta_adapter.prune_notifications(Timestamp::from_now(-7 * 86400)).await {
+			Ok(n) => debug!(pruned = n, "db_maintenance: notification log pruned"),
+			Err(e) => warn!(error = %e, "db_maintenance: notification log prune failed"),
+		}
+
 		let report = match app.meta_adapter.reclaim_space(min_free_pct).await {
 			Ok(report) => {
 				info!(

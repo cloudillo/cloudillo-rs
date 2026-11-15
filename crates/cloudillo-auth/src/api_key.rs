@@ -202,6 +202,31 @@ pub(crate) async fn mint_remember_key(
 	})
 }
 
+/// A `device:{root_id}` scope must name a live (active, untrashed) folder of this tenant
+async fn check_device_root(app: &App, tn_id: TnId, scopes: Option<&str>) -> ClResult<()> {
+	use cloudillo_core::file_access;
+	use cloudillo_types::{meta_adapter::FileStatus, types::TokenScope};
+	let Some(TokenScope::Device { root_id }) = scopes.and_then(TokenScope::parse) else {
+		return Ok(());
+	};
+	let ok = match file_access::resolve_scope_entry(&app.meta_adapter, tn_id, &root_id).await {
+		Some(view) => {
+			view.file_tp.as_deref() == Some("FLDR")
+				&& matches!(view.status, FileStatus::Active)
+				&& !file_access::in_trash(app, tn_id, &view).await?
+		}
+		None => false,
+	};
+	if ok {
+		Ok(())
+	} else {
+		Err(Error::InvalidField {
+			field: "scopes",
+			message: "device root must be an active folder".into(),
+		})
+	}
+}
+
 /// POST /api/auth/api-keys - Create a new API key
 pub async fn create_api_key(
 	State(app): State<App>,
@@ -212,6 +237,7 @@ pub async fn create_api_key(
 	info!("Creating API key for tenant {}", auth.id_tag);
 
 	let scopes = non_blank(req.scopes);
+	check_device_root(&app, auth.tn_id, scopes.as_deref()).await?;
 	let mut expires_at = req.expires_at.map(Timestamp::from);
 	if scopes.is_none() {
 		if cloudillo_core::middleware::unscoped_key_refused(&app, auth.tn_id).await? {
@@ -311,6 +337,7 @@ pub async fn update_api_key(
 	let name = merge(req.name, current.name.map(String::from));
 	let was_scoped = current.scopes.as_deref().is_some_and(|s| !s.trim().is_empty());
 	let scopes = non_blank(merge(req.scopes, current.scopes.map(String::from)));
+	check_device_root(&app, auth.tn_id, scopes.as_deref()).await?;
 	let mut expires_at =
 		merge(req.expires_at.map(Timestamp::from), current.expires_at.map(Timestamp::from));
 	if scopes.is_none() && was_scoped {

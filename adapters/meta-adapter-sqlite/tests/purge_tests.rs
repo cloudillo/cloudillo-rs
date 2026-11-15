@@ -523,4 +523,24 @@ async fn purging_a_tenant_takes_its_site_with_it() {
 	assert_eq!(adapter.list_site_docs(other_tn_id).await.expect("list site docs").len(), 1);
 }
 
+/// The notification log is tenant-keyed: a purged tenant's rows go, another tenant's stay.
+#[tokio::test]
+async fn purging_a_tenant_takes_its_notification_log_with_it() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let (tn_id, other_tn_id) = (TnId(1), TnId(2));
+	adapter.create_tenant(tn_id, "alice").await.expect("create tenant");
+	adapter.create_tenant(other_tn_id, "bob").await.expect("create other tenant");
+	for tn in [tn_id, other_tn_id] {
+		adapter.append_notification(tn, "{}").await.expect("append notification");
+	}
+
+	adapter.delete_tenant(tn_id).await.expect("delete tenant");
+
+	assert!(
+		adapter.list_notifications_since(tn_id, 0, 100).await.expect("list").is_empty(),
+		"notifications row survived"
+	);
+	assert_eq!(adapter.list_notifications_since(other_tn_id, 0, 100).await.expect("list").len(), 1);
+}
+
 // vim: ts=4

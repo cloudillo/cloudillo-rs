@@ -656,6 +656,10 @@ pub async fn mint_subjects(
 	m.add("apikey-dav-rw@alice", ALICE, Some(keys.dav_rw.clone()), dav_rw);
 	let club_key = SubjectFacts { id_tag: Some(CLUB.into()), ..key_facts(None, None) };
 	m.add("apikey-unscoped@club", CLUB, Some(keys.club.clone()), club_key);
+	// alice's device key (bearer only: it is never exchanged). Curated rows only; the oracle
+	// knows no `device:` scope, so it stays out of LEVEL_SUBJECTS.
+	let device = key_facts(Some(&keys.device_scope), None);
+	m.add("device@alice", ALICE, Some(keys.device.clone()), device);
 
 	edge_mints(&mut m, &r.hatted, keys, &aprv, alice_owner.as_deref()).await;
 

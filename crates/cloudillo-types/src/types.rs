@@ -859,6 +859,9 @@ pub enum TokenScope {
 	File { file_id: String, access: AccessLevel, ref_id: Option<String> },
 	/// APKG publish scope — restricts to package upload and APKG action creation
 	ApkgPublish,
+	/// Device scope (`device:{root_id}`) for a native client's API key: uploads and folder
+	/// creation bounded to the `root_id` folder subtree, plus its push subscription.
+	Device { root_id: String },
 }
 
 impl TokenScope {
@@ -869,11 +872,15 @@ impl TokenScope {
 	/// - "file:{file_id}:C" -> File scope with Comment access
 	/// - "file:{file_id}:W" -> File scope with Write access
 	/// - "file:{file_id}:R:{ref_id}" -> minted from share-link ref `ref_id`
+	/// - "device:{root_id}" -> Device scope bounded to folder `root_id`
 	pub fn parse(s: &str) -> Option<Self> {
 		if s == "apkg:publish" {
 			return Some(Self::ApkgPublish);
 		}
 		let parts: Vec<&str> = s.split(':').collect();
+		if let ["device", root_id] = parts[..] {
+			return (!root_id.is_empty()).then(|| Self::Device { root_id: root_id.to_string() });
+		}
 		if matches!(parts.len(), 3 | 4) && parts[0] == "file" {
 			// Exhaustive on purpose: an unrecognized level char (including `'A'`, which
 			// `to_scope_char` never emits) makes the whole scope unparseable, which callers treat
@@ -893,18 +900,12 @@ impl TokenScope {
 		None
 	}
 
-	/// Get file ID if this is a file scope
-	pub fn file_id(&self) -> Option<&str> {
+	/// The entry this scope grants access under and the level granted: a file share's target, or
+	/// a device key's root folder (as Write). `None` for `apkg:publish`.
+	pub fn file_grant(&self) -> Option<(&str, AccessLevel)> {
 		match self {
-			Self::File { file_id, .. } => Some(file_id),
-			Self::ApkgPublish => None,
-		}
-	}
-
-	/// Get access level if this is a file scope
-	pub fn file_access(&self) -> Option<AccessLevel> {
-		match self {
-			Self::File { access, .. } => Some(*access),
+			Self::File { file_id, access, .. } => Some((file_id, *access)),
+			Self::Device { root_id } => Some((root_id, AccessLevel::Write)),
 			Self::ApkgPublish => None,
 		}
 	}
@@ -1195,6 +1196,28 @@ mod access_level_tests {
 		);
 		assert_eq!(TokenScope::parse("file:f1~abc:C:"), None);
 		assert_eq!(TokenScope::parse("file:f1~abc:C:r:x"), None);
+	}
+
+	#[test]
+	fn device_scope_parse_and_file_grant() {
+		let device = TokenScope::parse("device:abc");
+		assert_eq!(device, Some(TokenScope::Device { root_id: "abc".to_string() }));
+		for bad in ["device", "device:", "device:a:b", "Device:a"] {
+			assert_eq!(TokenScope::parse(bad), None, "{bad}");
+		}
+		assert_eq!(
+			device.and_then(|d| d.file_grant().map(|(id, a)| (id.to_string(), a))),
+			Some(("abc".to_string(), AccessLevel::Write))
+		);
+		let file = TokenScope::parse("file:f1~abc:R");
+		assert_eq!(
+			file.as_ref().and_then(TokenScope::file_grant),
+			Some(("f1~abc", AccessLevel::Read))
+		);
+		assert_eq!(
+			TokenScope::parse("apkg:publish").as_ref().and_then(TokenScope::file_grant),
+			None
+		);
 	}
 }
 

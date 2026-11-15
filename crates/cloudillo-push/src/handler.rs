@@ -8,9 +8,12 @@ use cloudillo_types::extract::JsonBody;
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
-use cloudillo_core::extract::Auth;
+use crate::send::NotificationPayload;
+use cloudillo_core::abac;
+use cloudillo_core::extract::{Auth, IdTag};
+use cloudillo_types::extract::Query;
 use cloudillo_types::meta_adapter::{PushSubscriptionData, PushSubscriptionKeys};
-use cloudillo_types::types::{ApiResponse, SHARED_TN};
+use cloudillo_types::types::{ApiResponse, ApiTime, SHARED_TN, TokenScope};
 
 /// Request body for creating a push subscription
 #[derive(Debug, Deserialize)]
@@ -144,6 +147,75 @@ pub async fn get_vapid_public_key(
 	};
 
 	Ok(Json(ApiResponse::new(VapidPublicKeyResponse { vapid_public_key: public_key.into() })))
+}
+
+/// Query of `GET /api/notifications`
+#[derive(Debug, Deserialize)]
+pub struct ListNotificationsQuery {
+	/// Return entries with `seq` greater than this (default 0)
+	pub since: Option<u64>,
+	/// Page size, clamped to 1..=100 (default 100)
+	pub limit: Option<u32>,
+}
+
+/// One notification log entry: the pushed payload (with `seq`) plus its creation time
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationItem {
+	#[serde(flatten)]
+	pub payload: NotificationPayload,
+	pub created_at: ApiTime,
+}
+
+/// Response of `GET /api/notifications`
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListNotificationsResponse {
+	pub items: Vec<NotificationItem>,
+	/// Highest `seq` fetched (unparseable rows included), or `since` when there are none
+	pub last_seq: u64,
+}
+
+/// GET /api/notifications?since=<seq>&limit=<n>
+///
+/// The tenant's notification log after `since`, ascending — the catch-up path for clients
+/// that may have missed pushes. Entries are the same payloads `send_to_tenant` pushed.
+pub async fn list_notifications(
+	State(app): State<App>,
+	tn_id: TnId,
+	IdTag(tenant_id_tag): IdTag,
+	Auth(auth): Auth,
+	Query(q): Query<ListNotificationsQuery>,
+) -> ClResult<Json<ApiResponse<ListNotificationsResponse>>> {
+	// The account itself, or its device key (minted only by the owner, never via access-token).
+	// A community member holding `leader` passes `require_leader` but must not read the log.
+	let is_device = matches!(
+		auth.scope.as_deref().and_then(TokenScope::parse),
+		Some(TokenScope::Device { .. })
+	);
+	if !is_device {
+		abac::require_tenant_self(&auth, &tenant_id_tag, "notifications")?;
+	}
+	let since = q.since.unwrap_or(0);
+	let limit = q.limit.unwrap_or(100).clamp(1, 100);
+	let entries = app.meta_adapter.list_notifications_since(tn_id, since, limit).await?;
+
+	// Skipped rows still advance `last_seq`, so one bad row cannot wedge the client.
+	let last_seq = entries.iter().map(|e| e.seq).max().unwrap_or(since);
+	let mut items = Vec::with_capacity(entries.len());
+	for entry in entries {
+		let mut payload: NotificationPayload = match serde_json::from_str(&entry.payload) {
+			Ok(p) => p,
+			Err(error) => {
+				warn!(?tn_id, seq = entry.seq, %error, "Skipping invalid notification");
+				continue;
+			}
+		};
+		payload.seq = Some(entry.seq);
+		items.push(NotificationItem { payload, created_at: entry.created_at });
+	}
+
+	Ok(Json(ApiResponse::new(ListNotificationsResponse { items, last_seq })))
 }
 
 // vim: ts=4

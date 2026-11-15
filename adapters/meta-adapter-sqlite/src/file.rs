@@ -1155,6 +1155,40 @@ pub(crate) async fn read_file_id_by_variant(
 	map_res(res, |row| row.try_get("file_id"))
 }
 
+/// See `MetaAdapter::find_files_by_orig_blob`.
+pub(crate) async fn find_files_by_orig_blob(
+	db: &SqlitePool,
+	tn_id: TnId,
+	parent_id: &str,
+	blob_ids: &[&str],
+	enterable_channels: Option<&[Box<str>]>,
+) -> ClResult<Vec<(Box<str>, Box<str>)>> {
+	if blob_ids.is_empty() {
+		return Ok(Vec::new());
+	}
+	let mut q = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+		"SELECT fv.variant_id, e.entry_id FROM file_variants fv \
+		 JOIN entries e ON e.tn_id=fv.tn_id AND e.f_id=fv.f_id \
+		 WHERE fv.variant='orig' AND e.status='A' AND fv.tn_id=",
+	);
+	q.push_bind(tn_id.0).push(" AND fv.variant_id IN (");
+	let mut sep = q.separated(", ");
+	for id in blob_ids {
+		sep.push_bind(*id);
+	}
+	sep.push_unseparated(") AND e.parent_id IN ");
+	// A trashed folder is re-parented to `__trash__`, so its contents leave the walk.
+	push_descendant_ids(&mut q, tn_id, true, |q| {
+		q.push_bind(parent_id).push(", 0");
+	});
+	if let Some(rooms) = enterable_channels {
+		q.push(" AND ");
+		crate::utils::push_channel_in(&mut q, "e.channel", rooms);
+	}
+	let rows: Vec<(String, String)> = q.build_query_as().fetch_all(db).await.db()?;
+	Ok(rows.into_iter().map(|(b, e)| (b.into(), e.into())).collect())
+}
+
 /// See `MetaAdapter::read_content`.
 pub(crate) async fn read_content(
 	db: &SqlitePool,
@@ -3056,5 +3090,61 @@ mod tests {
 		// No room: the main drive (fa) and friend's own row; never the mirror.
 		assert_eq!(names(&s.db, &reader(Some(Vec::new()))).await, ["fa", "ff"]);
 		assert_eq!(names(&s.db, &reader(None)).await, ["fa", "ff", "fo"]);
+	}
+
+	#[tokio::test]
+	async fn orig_blob_lookup_stays_in_subtree() {
+		let s = seed().await;
+		// fa (A), fb (A/B), fc (root), fts (trash) share blob b1~x; fa also has a non-orig b1~v.
+		for (name, blob, variant) in [
+			("fa", "b1~x", "orig"),
+			("fa", "b1~v", "vis.sd"),
+			("fb", "b1~y", "orig"),
+			("fc", "b1~x", "orig"),
+			("fts", "b1~x", "orig"),
+		] {
+			sqlx::query(
+				"INSERT INTO file_variants (tn_id, f_id, variant_id, variant) \
+				 SELECT 1, f_id, ?, ? FROM entries WHERE file_name=?",
+			)
+			.bind(blob)
+			.bind(variant)
+			.bind(name)
+			.execute(&s.db)
+			.await
+			.expect("variant");
+		}
+		let find_in = |parent: &'static str, rooms: Option<Vec<Box<str>>>| {
+			let db = s.db.clone();
+			async move {
+				let ids = ["b1~x", "b1~y", "b1~v"];
+				let mut v =
+					super::find_files_by_orig_blob(&db, TnId(1), parent, &ids, rooms.as_deref())
+						.await
+						.expect("find");
+				v.sort();
+				v
+			}
+		};
+		let find = |parent: &'static str| find_in(parent, None);
+		let hit = |b: &str, e: &str| (Box::<str>::from(b), Box::<str>::from(e));
+		assert_eq!(find("A").await, [hit("b1~x", &s.fa), hit("b1~y", &s.fb)]);
+		assert_eq!(find("B").await, [hit("b1~y", &s.fb)]);
+
+		// Channel gate: fb sits in a room; only a caller who may enter it sees the hit.
+		sqlx::query("UPDATE entries SET channel='@owner.test~room' WHERE file_name='fb'")
+			.execute(&s.db)
+			.await
+			.expect("set channel");
+		assert_eq!(find_in("A", Some(Vec::new())).await, [hit("b1~x", &s.fa)]);
+		let room = vec![Box::<str>::from("@owner.test~room")];
+		assert_eq!(find_in("A", Some(room)).await, [hit("b1~x", &s.fa), hit("b1~y", &s.fb)]);
+		assert_eq!(find("A").await, [hit("b1~x", &s.fa), hit("b1~y", &s.fb)]);
+		assert!(
+			super::find_files_by_orig_blob(&s.db, TnId(1), "A", &[], None)
+				.await
+				.expect("empty")
+				.is_empty()
+		);
 	}
 }

@@ -743,6 +743,12 @@ async fn validated_scope(
 			}
 			Ok(Some(requested.to_string()))
 		}
+		// A device scope lives only on a tenant API key, which is itself the bearer; no access
+		// token is ever minted carrying it.
+		TokenScope::Device { .. } => {
+			warn!("device scope denied for access-token mint by {}", caller_id_tag);
+			Err(Error::PermissionDenied)
+		}
 	}
 }
 
@@ -1252,6 +1258,17 @@ pub async fn post_access_token(
 		{
 			warn!("API key exchange refused: capability (DAV) key");
 			return Err(Error::PermissionDenied);
+		}
+		// A device key is itself the bearer; it is never exchanged for an access token.
+		{
+			use cloudillo_types::types::TokenScope;
+			if matches!(
+				validation.scopes.as_deref().and_then(TokenScope::parse),
+				Some(TokenScope::Device { .. })
+			) {
+				warn!("API key exchange refused: device key");
+				return Err(Error::PermissionDenied);
+			}
 		}
 
 		debug!(

@@ -699,6 +699,7 @@ async fn identity_level(
 
 /// The scope rung: what a `file:{file_id}:{R|C|W}` scope grants on `file`. `None` on a mismatch,
 /// an `ApkgPublish` scope, or an unparseable one — the caller then falls to the visibility rung.
+/// A `device:{root_id}` scope grants like a `file:{root_id}:W` folder share.
 ///
 /// Matches, in order: the scoped file itself; a child in its document tree (`root_id`); a file
 /// linked from it by an `'F'` share entry, capped at that entry; a descendant of a scoped folder.
@@ -708,12 +709,10 @@ async fn scope_grant(
 	file: &FileRef<'_>,
 	scope: &str,
 ) -> Option<AccessLevel> {
-	let Some(TokenScope::File { file_id: scope_file_id, access, .. }) = TokenScope::parse(scope)
-	else {
-		return None;
-	};
+	let token_scope = TokenScope::parse(scope)?;
+	let (scope_file_id, access) = token_scope.file_grant()?;
 	let entry_id = file.entry_id;
-	let scope_view = resolve_scope_entry(&app.meta_adapter, tn_id, &scope_file_id).await?;
+	let scope_view = resolve_scope_entry(&app.meta_adapter, tn_id, scope_file_id).await?;
 	// Direct match, or document tree (depth-1: root_id always points to a top-level file) in the
 	// scoped entry's drive: another drive's placement of a tree part is not under this scope.
 	if *scope_view.entry_id == *entry_id
@@ -1125,7 +1124,9 @@ pub async fn check_scope_allows_file(
 			}
 			ScopeCheck::Denied
 		}
-		TokenScope::ApkgPublish => ScopeCheck::Denied,
+		// Not a user-data scope. A device key reads its root subtree through `scope_grant`
+		// (Write, via `file_grant()`); only this path refuses it.
+		TokenScope::ApkgPublish | TokenScope::Device { .. } => ScopeCheck::Denied,
 	}
 }
 
@@ -1156,35 +1157,38 @@ pub async fn check_scope_allows_create_in(
 	let Some(token_scope) = TokenScope::parse(scope_str) else {
 		return Err(Error::PermissionDenied);
 	};
-	match &token_scope {
-		TokenScope::File { file_id: scope_file_id, access, .. } => {
-			if !access.can_write() {
-				return Err(Error::PermissionDenied);
-			}
-			// The scope names an entry; `root_id` names content. Resolve the scope target.
-			let Some(target) = resolve_scope_entry(meta, tn_id, scope_file_id).await else {
-				return Err(Error::PermissionDenied);
-			};
-			let scope_file_id = &*target.entry_id;
-			// Document-tree rule: new file is a child in the scoped document tree.
-			if root_id.is_some_and(|r| Some(r) == target.file_id.as_deref()) {
-				return Ok(());
-			}
-			// Folder-subtree rule: new file's parent is the scoped folder or nested
-			// under it. Only applies when the scoped target is actually a folder, so
-			// a document/file share link can't authorize creation across its
-			// parent_id siblings.
-			if let Some(parent) = parent_id
-				&& scope_target_is_folder(meta, cache, tn_id, scope_file_id).await?
-				&& (parent == scope_file_id
-					|| is_descendant_of(meta, cache, tn_id, parent, scope_file_id).await?)
-			{
-				return Ok(());
-			}
-			Err(Error::PermissionDenied)
-		}
-		TokenScope::ApkgPublish => Ok(()), // Middleware already restricts to /api/files/apkg/
+	// Middleware already restricts `apkg:publish` to /api/files/apkg/
+	if token_scope == TokenScope::ApkgPublish {
+		return Ok(());
 	}
+	// A device scope bounds creation exactly like a `file:{root_id}:W` folder share.
+	let Some((scope_file_id, access)) = token_scope.file_grant() else {
+		return Err(Error::PermissionDenied);
+	};
+	if !access.can_write() {
+		return Err(Error::PermissionDenied);
+	}
+	// The scope names an entry; `root_id` names content. Resolve the scope target.
+	let Some(target) = resolve_scope_entry(meta, tn_id, scope_file_id).await else {
+		return Err(Error::PermissionDenied);
+	};
+	let scope_file_id = &*target.entry_id;
+	// Document-tree rule: new file is a child in the scoped document tree.
+	if root_id.is_some_and(|r| Some(r) == target.file_id.as_deref()) {
+		return Ok(());
+	}
+	// Folder-subtree rule: new file's parent is the scoped folder or nested
+	// under it. Only applies when the scoped target is actually a folder, so
+	// a document/file share link can't authorize creation across its
+	// parent_id siblings.
+	if let Some(parent) = parent_id
+		&& scope_target_is_folder(meta, cache, tn_id, scope_file_id).await?
+		&& (parent == scope_file_id
+			|| is_descendant_of(meta, cache, tn_id, parent, scope_file_id).await?)
+	{
+		return Ok(());
+	}
+	Err(Error::PermissionDenied)
 }
 
 /// The scope char a token mint may stamp for a caller who asked for `requested` and
@@ -1209,7 +1213,8 @@ pub fn scope_grants_collection_op(scope: Option<&str>, resource_type: &str, acti
 	let Some(scope) = scope else { return false };
 	// `Write` is the top of the scope vocabulary — `AccessLevel::to_scope_char` caps `Admin` at
 	// `'W'` and `TokenScope::parse` refuses any other char, so `Admin` is unreachable here.
-	matches!(TokenScope::parse(scope), Some(TokenScope::File { access: AccessLevel::Write, .. }))
+	TokenScope::parse(scope)
+		.is_some_and(|ts| matches!(ts.file_grant(), Some((_, AccessLevel::Write))))
 		&& resource_type == "file"
 		&& action == "create"
 }
@@ -1243,9 +1248,50 @@ mod tests {
 		);
 	}
 
+	#[tokio::test]
+	#[allow(clippy::unwrap_used)]
+	async fn device_scope_bounds_create_to_its_root_subtree() {
+		use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
+		use cloudillo_types::meta_adapter::{CreateFile, FileStatus, MetaAdapter as _};
+
+		let temp = tempfile::TempDir::new().unwrap();
+		let pool = Arc::new(cloudillo_types::worker::WorkerPool::new(1, 1, 1));
+		let adapter = MetaAdapterSqlite::new(pool, temp.path()).await.unwrap();
+		let tn_id = TnId(1);
+		adapter.create_tenant(tn_id, "owner").await.ok();
+		for (id, parent) in [("PB", None), ("PB1", Some("PB")), ("OTHER", None)] {
+			let opts = CreateFile {
+				file_id: Some(id.into()),
+				parent_id: parent.map(Into::into),
+				content_type: "application/x-folder".into(),
+				file_name: id.into(),
+				file_tp: Some("FLDR".into()),
+				status: Some(FileStatus::Active),
+				..Default::default()
+			};
+			adapter.create_file(tn_id, opts).await.unwrap();
+		}
+		let meta: Arc<dyn meta_adapter::MetaAdapter> = Arc::new(adapter);
+		let cache = DirCache::new(64);
+
+		for (scope, parent, allowed) in [
+			("device:PB", Some("PB"), true),
+			("device:PB", Some("PB1"), true),
+			("device:PB", Some("OTHER"), false),
+			("device:PB", None, false),
+			("device:PB1", Some("PB"), false),
+			("device:MISSING", Some("PB"), false),
+		] {
+			let r =
+				check_scope_allows_create_in(&meta, &cache, tn_id, Some(scope), parent, None).await;
+			assert_eq!(r.is_ok(), allowed, "{scope} into {parent:?}");
+		}
+	}
+
 	#[test]
 	fn folder_write_scope_grants_file_create() {
 		assert!(scope_grants_collection_op(Some("file:f1~abc:W"), "file", "create"));
+		assert!(scope_grants_collection_op(Some("device:f1~abc"), "file", "create"));
 	}
 
 	#[test]

@@ -9,6 +9,7 @@
 //! | Path | GET | POST | PUT | PATCH | DELETE |
 //! |---|---|---|---|---|---|
 //! | `/api/files`                          | `list_public()` ᴳ | `create()` ᶜ | | | |
+//! | `/api/files/{id}/blob-check`          | | `create()` ᶜ | | | |
 //! | `/api/uploads/{preset}`               | | `create()` ᶜ ᴮ | | | |
 //! | `/api/files/{id}`                     | `read()` ᴬ | | | `write()` ᶜ | `write()` ᶜ |
 //! | `/api/files/{id}/descriptor`          | `read()` ᴬ | | | | |
@@ -66,6 +67,8 @@ pub(crate) fn data_export() -> Router<App> {
 pub(crate) fn create() -> Router<App> {
 	Router::new()
 		.route("/api/files", post(handler::post_file))
+		// Read-only, but only a would-be uploader needs it; the handler bounds the caller.
+		.route("/api/files/{id}/blob-check", post(handler::post_blob_check))
 		// Streaming upload: reads the raw `Body` and enforces its own
 		// per-tenant size cap, so opt out of the global buffering limit.
 		.route(

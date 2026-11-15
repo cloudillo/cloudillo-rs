@@ -16,6 +16,7 @@
 //! | `/api/refs/{id}`                      | `ref_public()` ᴾ | | | `refs()` ᴱ | `refs()` ᴱ |
 //! | `/api/refs/{refId}/idp-status`        | `ref_idp_status()` ᴳ | | | | |
 //! | `/api/refs/{refId}/idp/resend`        | | `ref_resend_activation()` ᴿ | | | |
+//! | `/api/notifications`                  | `push_subscriptions()` ᴸ | | | | |
 //! | `/api/notifications/subscriptions`    | | `push_subscriptions()` ᴸ | | | |
 //! | `/api/notifications/subscriptions/{id}` | | | | | `push_subscriptions()` ᴸ |
 //!
@@ -50,6 +51,7 @@ use cloudillo_profile::idp_status;
 /// [`super::auth::session`].
 pub(crate) fn push_subscriptions() -> Router<App> {
 	Router::new()
+		.route("/api/notifications", get(push::handler::list_notifications))
 		.route("/api/notifications/subscriptions", post(push::handler::post_subscription))
 		.route("/api/notifications/subscriptions/{id}", delete(push::handler::delete_subscription))
 }

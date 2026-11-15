@@ -1827,6 +1827,179 @@ async fn push_subscription_refused_when_disallowed() {
 	assert_eq!(st, StatusCode::FORBIDDEN, "subscribe with push disallowed: {b}");
 }
 
+/// A device key (`device:{root_id}`) manages its own push subscription through the leader
+/// group (`scope_permits` allows it, `require_leader` must not re-refuse it), and is still
+/// refused on the group's other routes.
+#[tokio::test]
+async fn device_key_manages_push_subscription() {
+	use cloudillo::auth_adapter::CreateApiKeyOptions;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let opts = CreateApiKeyOptions {
+		name: Some("zqm-device"),
+		scopes: Some("device:zqm-root"),
+		expires_at: None,
+		auth_time: None,
+	};
+	let created = fx.app.auth_adapter.create_api_key(alice, opts).await.unwrap();
+	let key = &*created.plaintext_key;
+	let call_key = |m: Method, uri: &str, body: &'static str| {
+		call(&fx.api, req(ALICE, m, uri, Some(key), Body::from(body)))
+	};
+	let body = r#"{"subscription":{"endpoint":"https://push.zqm.test/dev",
+		"keys":{"p256dh":"zqm","auth":"zqm"}}}"#;
+	let (sub_st, sub_b) = call_key(Method::POST, "/api/notifications/subscriptions", body).await;
+	let del = sub_b["data"]["id"]
+		.as_str()
+		.map(|id| format!("/api/notifications/subscriptions/{id}"));
+	let del_res = match &del {
+		Some(uri) => Some(call_key(Method::DELETE, uri, "").await),
+		None => None,
+	};
+	let (contacts_st, contacts_b) = call_key(Method::GET, "/api/contacts", "").await;
+	fx.app.auth_adapter.delete_api_key(alice, created.info.key_id).await.unwrap();
+	assert!(sub_st.is_success(), "device key subscribes: {sub_st} {sub_b}");
+	let (st, b) = del_res.unwrap_or_else(|| panic!("id: {sub_b}"));
+	assert!(st.is_success(), "device key drops its subscription: {st} {b}");
+	assert_eq!(
+		status_class(contacts_st),
+		Actual::Deny,
+		"device key on GET /api/contacts: {contacts_st} {contacts_b}"
+	);
+}
+
+/// Device-key edges the curated rows (MG-673…684) cannot express: it is never an access-token
+/// scope (owner mint or `?apiKey=` exchange), it never edits its own root, and an off-list
+/// `optional_auth` route (`/api/search`) serves it as anonymous.
+#[tokio::test]
+async fn device_key_scope_bounds() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let dev = fx.subject("device@alice");
+	let key = bearer(dev);
+	let scope = dev.facts.scope.clone().unwrap_or_default();
+	let root = scope.strip_prefix("device:").unwrap_or_default();
+
+	let uri = format!("/api/files/{root}");
+	let (st, b) = call(&fx.api, req(ALICE, Method::PATCH, &uri, key, Body::from("{}"))).await;
+	assert_eq!(status_class(st), Actual::Deny, "device key PATCH on its root: {st} {b}");
+
+	// `/api/search` is `optional_auth`: a scope it refuses is served as anonymous, never more.
+	let search = "/api/search?q=zqm";
+	let (dev_st, dev_b) = call(&fx.api, req(ALICE, Method::GET, search, key, Body::empty())).await;
+	let (anon_st, anon_b) =
+		call(&fx.api, req(ALICE, Method::GET, search, None, Body::empty())).await;
+	assert_eq!((dev_st, &dev_b["data"]), (anon_st, &anon_b["data"]), "device search = anon");
+
+	// The owner cannot mint an access token carrying a device scope.
+	let owner = fx.subject("owner@alice");
+	let mint = format!("/api/auth/access-token?scope={scope}");
+	let (st, b) = call(&fx.api, post_q(ALICE, &mint, bearer(owner))).await;
+	assert_eq!(status_class(st), Actual::Deny, "device scope mint: {st} {b}");
+
+	// Nor is the device key itself ever exchanged for one.
+	let xchg = format!("/api/auth/access-token?apiKey={}", key.unwrap_or_default());
+	let (st, b) = call(&fx.api, post_q(ALICE, &xchg, None)).await;
+	assert_eq!(status_class(st), Actual::Deny, "device key exchange: {st} {b}");
+}
+
+/// Minting or re-scoping a device key needs a live folder root: a missing id, a non-folder and
+/// a trashed folder are refused; alice's canonical folder is accepted.
+#[tokio::test]
+async fn device_key_mint_validates_root() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let owner = fx.subject("owner@alice");
+	let entry = |name: &str| {
+		fx.objs
+			.iter()
+			.find_map(|o| match o {
+				crate::objects::Obj::File(f) if f.spec.tn == ALICE && f.spec.name == name => {
+					Some(f.entry_id.clone())
+				}
+				_ => None,
+			})
+			.unwrap_or_else(|| panic!("{name}@alice"))
+	};
+	let mint = |root: String| async move {
+		let body =
+			serde_json::json!({ "name": "zqm-dev-mint", "scopes": format!("device:{root}") });
+		send(fx, owner, Method::POST, "/api/auth/api-keys", &body.to_string()).await
+	};
+	for (what, root) in [
+		("missing", "f1~zqm-dev-missing".to_owned()),
+		("non-folder", entry("tenant-blob-d-active")),
+		("trashed", entry("folder-blob-p-trashed")),
+	] {
+		let (st, b) = mint(root).await;
+		assert_eq!(st, StatusCode::BAD_REQUEST, "{what} device root: {b}");
+	}
+
+	let (st, b) = mint(entry("folder-blob-d-active")).await;
+	assert!(st.is_success(), "folder device root: {st} {b}");
+	let key_id: i64 = b["data"]["id"].as_str().and_then(|s| s.parse().ok()).unwrap_or_default();
+	// Re-scoping the key onto a non-folder is refused like minting it.
+	let body = serde_json::json!({ "scopes": format!("device:{}", entry("tenant-blob-d-active")) });
+	let uri = format!("/api/auth/api-keys/{key_id}");
+	let (patch_st, patch_b) = send(fx, owner, Method::PATCH, &uri, &body.to_string()).await;
+	fx.app.auth_adapter.delete_api_key(alice, key_id).await.unwrap();
+	assert_eq!(patch_st, StatusCode::BAD_REQUEST, "re-scope onto a non-folder: {patch_b}");
+}
+
+/// Blob-check and notification-list edges: the id cap, hit/miss for the unscoped owner, the
+/// `limit` clamp, and a corrupt log row that is skipped while `lastSeq` moves past it.
+#[tokio::test]
+async fn blob_check_and_notification_edges() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let owner = fx.subject("owner@alice");
+	let file = |name: &str| {
+		fx.objs
+			.iter()
+			.find_map(|o| match o {
+				crate::objects::Obj::File(f) if f.spec.tn == ALICE && f.spec.name == name => {
+					Some(f)
+				}
+				_ => None,
+			})
+			.unwrap_or_else(|| panic!("{name}@alice"))
+	};
+	let folder = file("folder-blob-d-active");
+	let child = file("folderchild-blob-d-active");
+	let uri = format!("/api/files/{}/blob-check", folder.entry_id);
+
+	let many: Vec<String> = (0..501).map(|i| format!("b1~zqm{i}")).collect();
+	let body = serde_json::json!({ "blobIds": many }).to_string();
+	let (st, b) = send(fx, owner, Method::POST, &uri, &body).await;
+	assert_eq!(st, StatusCode::BAD_REQUEST, "501 blobIds: {b}");
+
+	let blob = child.blob_id.clone().unwrap_or_default();
+	let body = serde_json::json!({ "blobIds": [blob, "b1~zqm-unknown"] }).to_string();
+	let (st, b) = send(fx, owner, Method::POST, &uri, &body).await;
+	assert!(st.is_success(), "blob-check: {st} {b}");
+	let known = b["data"]["known"].as_array().cloned().unwrap_or_default();
+	assert_eq!(known.len(), 1, "only the stored blob is known: {b}");
+	assert_eq!(known[0]["blobId"].as_str(), Some(blob.as_str()), "{b}");
+
+	// No rows past a far-future `since`: `lastSeq` echoes it, at either clamp end.
+	for limit in [0, 1000] {
+		let uri = format!("/api/notifications?since=999999&limit={limit}");
+		let (st, b) = send(fx, owner, Method::GET, &uri, "").await;
+		assert!(st.is_success(), "limit {limit}: {st} {b}");
+		assert_eq!(b["data"]["lastSeq"].as_u64(), Some(999_999), "limit {limit}: {b}");
+	}
+
+	let seq = fx.app.meta_adapter.append_notification(alice, "not json").await.unwrap();
+	let uri = format!("/api/notifications?since={}", seq - 1);
+	let (st, b) = send(fx, owner, Method::GET, &uri, "").await;
+	assert!(st.is_success(), "corrupt row: {st} {b}");
+	assert_eq!(b["data"]["items"].as_array().map(Vec::len), Some(0), "row skipped: {b}");
+	assert_eq!(b["data"]["lastSeq"].as_u64(), Some(seq), "lastSeq moves past it: {b}");
+}
+
 /// `limits.max_storage_gb = 0`: a blob upload with a body is refused with 413 before anything
 /// is stored, and so is one without a Content-Length (chunked), whose pre-check sees 0 bytes
 /// and whose post-read check refuses. The chunked case runs on admin, which stores nothing

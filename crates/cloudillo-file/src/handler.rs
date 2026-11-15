@@ -449,11 +449,11 @@ pub async fn get_file_list(
 	// ancestor names above the share root are not disclosed (set in every folder
 	// branch below).
 	let mut folder_scope_root: Option<String> = None;
-	if let Some((scope_fid, scope_access)) =
-		scope.and_then(TokenScope::parse).and_then(|ts| match ts {
-			TokenScope::File { file_id, access, .. } => Some((file_id, access)),
-			TokenScope::ApkgPublish => None,
-		}) {
+	// A device key browses its root's subtree like a `file:{root_id}:W` folder share.
+	if let Some((scope_fid, scope_access)) = scope
+		.and_then(TokenScope::parse)
+		.and_then(|ts| ts.file_grant().map(|(id, access)| (id.to_string(), access)))
+	{
 		// The list filter matches entries. An unknown id, or a BLOB content id (bound to no
 		// entry), stays as given and matches nothing.
 		let scope_fid =
@@ -2236,6 +2236,101 @@ pub struct UploadResponse {
 	pub thumbnail_variant_id: Option<String>,
 	#[serde(skip_serializing_if = "std::ops::Not::not")]
 	pub existed: bool,
+}
+
+/// Most blob ids one `POST /api/files/{id}/blob-check` may ask about.
+const BLOB_CHECK_MAX_IDS: usize = 500;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobCheckRequest {
+	blob_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobCheckHit {
+	blob_id: Box<str>,
+	file_id: Box<str>,
+}
+
+#[derive(Serialize)]
+pub struct BlobCheckResponse {
+	known: Vec<BlobCheckHit>,
+}
+
+/// `POST /api/files/{id}/blob-check`: which of `blobIds` already exist (as an `orig` variant)
+/// somewhere in folder `id`'s subtree, so a client skips re-uploading them.
+///
+/// Scoped callers (device key, folder share link) are bounded to their scope like an
+/// upload; unscoped ones must be the tenant itself, so visitors cannot probe for hashes.
+pub async fn post_blob_check(
+	State(app): State<App>,
+	tn_id: TnId,
+	IdTag(tenant_id_tag): IdTag,
+	Auth(auth): Auth,
+	extract::Path(parent_id): extract::Path<String>,
+	JsonBody(req): JsonBody<BlobCheckRequest>,
+) -> ClResult<Json<ApiResponse<BlobCheckResponse>>> {
+	if req.blob_ids.len() > BLOB_CHECK_MAX_IDS {
+		return Err(Error::InvalidField {
+			field: "blobIds",
+			message: format!("at most {BLOB_CHECK_MAX_IDS} ids per request"),
+		});
+	}
+	if auth.scope.is_none() {
+		abac::require_tenant_self(&auth, &tenant_id_tag, "blob-check")?;
+	}
+	let dir_cache = app.ext::<DirCache>()?;
+	file_access::check_scope_allows_create_in(
+		&app.meta_adapter,
+		dir_cache,
+		tn_id,
+		auth.scope.as_deref(),
+		Some(&parent_id),
+		None,
+	)
+	.await?;
+
+	// Channel gate like a recursive scoped listing: rooms the caller may enter, plus the
+	// browsed folder's own room. The unscoped tenant itself is never gated.
+	let rooms = if auth.scope.is_some() {
+		let rooms = cloudillo_core::channels::reader_enterable_channels(
+			&app,
+			tn_id,
+			&tenant_id_tag,
+			Some(&auth),
+			&auth.id_tag,
+			&auth.roles,
+		)
+		.await?;
+		match rooms {
+			Some(mut rooms) => {
+				// An id naming several entries has no single room to let through.
+				let parent = match app.meta_adapter.read_file(tn_id, &parent_id).await {
+					Err(Error::Conflict(_)) => None,
+					r => r?,
+				};
+				if let Some(channel) = parent.and_then(|f| f.channel) {
+					rooms.push(channel);
+				}
+				Some(rooms)
+			}
+			None => None,
+		}
+	} else {
+		None
+	};
+
+	let ids: Vec<&str> = req.blob_ids.iter().map(String::as_str).collect();
+	let known = app
+		.meta_adapter
+		.find_files_by_orig_blob(tn_id, &parent_id, &ids, rooms.as_deref())
+		.await?
+		.into_iter()
+		.map(|(blob_id, file_id)| BlobCheckHit { blob_id, file_id })
+		.collect();
+	Ok(Json(ApiResponse::new(BlobCheckResponse { known })))
 }
 
 async fn build_dedup_response(

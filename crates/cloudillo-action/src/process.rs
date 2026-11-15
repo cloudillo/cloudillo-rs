@@ -2075,7 +2075,7 @@ pub(crate) async fn send_push_notification(
 	effects: Effects,
 ) {
 	use crate::forward::{get_push_setting_key, notification_path, should_push_notify};
-	use cloudillo_push::{NotificationPayload, send_to_tenant};
+	use cloudillo_push::{NotificationPayload, log_notification, send_to_tenant};
 
 	if !effects.notify {
 		return;
@@ -2091,20 +2091,12 @@ pub(crate) async fn send_push_notification(
 		return;
 	}
 
-	let master_enabled = app.settings.get_bool(tn_id, "notify.push").await.unwrap_or(true);
-	if !master_enabled {
-		debug!(
-			action_id = %action_id,
-			"Push notifications disabled (master switch)"
-		);
-		return;
-	}
-
-	// Conversation mute decides MSG, and a mention switches to the mention toggle
+	// Conversation mute decides MSG (muted events are not even logged), and a mention
+	// switches to the mention toggle
 	let setting_key = if action_type == "MSG" {
 		match msg_notify_gate(app, tn_id, issuer, parent_id, content).await {
 			MsgNotify::Suppress => {
-				debug!(action_id = %action_id, "Push suppressed by conversation mute");
+				debug!(action_id = %action_id, "Notification suppressed by conversation mute");
 				return;
 			}
 			MsgNotify::Mention => "notify.push.mention",
@@ -2113,18 +2105,6 @@ pub(crate) async fn send_push_notification(
 	} else {
 		get_push_setting_key(action_type)
 	};
-
-	// Check if user has push notifications enabled for this action type
-	let push_enabled = app.settings.get_bool(tn_id, setting_key).await.unwrap_or(true);
-	if !push_enabled {
-		debug!(
-			action_id = %action_id,
-			action_type = %action_type,
-			setting_key = %setting_key,
-			"Push notifications disabled for this action type"
-		);
-		return;
-	}
 
 	// Build notification payload
 	let title = match action_type {
@@ -2146,9 +2126,25 @@ pub(crate) async fn send_push_notification(
 		path: Some(notification_path(action_type, action_id, issuer, parent_id)),
 		image: None,
 		tag: Some(action_type.to_string()),
+		seq: None,
 	};
 
-	// Send to all subscriptions for this tenant
+	// The push toggles only stop the outbound push; the event is still logged
+	let master_enabled = app.settings.get_bool(tn_id, "notify.push").await.unwrap_or(true);
+	let push = master_enabled && app.settings.get_bool(tn_id, setting_key).await.unwrap_or(true);
+	if !push {
+		debug!(
+			action_id = %action_id,
+			action_type = %action_type,
+			setting_key = %setting_key,
+			master_enabled,
+			"Push disabled, logging notification only"
+		);
+		log_notification(app, tn_id, &payload).await;
+		return;
+	}
+
+	// Log, then send to all subscriptions for this tenant
 	match send_to_tenant(app, tn_id, &payload).await {
 		Ok(count) => {
 			info!(

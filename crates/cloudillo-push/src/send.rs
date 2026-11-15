@@ -35,6 +35,9 @@ pub struct NotificationPayload {
 	/// Tag for grouping notifications (optional)
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub tag: Option<String>,
+	/// Per-tenant notification log sequence number, set by `log_notification`
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub seq: Option<u64>,
 }
 
 /// Result of sending a push notification
@@ -272,14 +275,40 @@ async fn send_push_request(
 	}
 }
 
-/// Send notification to all subscriptions for a tenant
+/// Append a payload to the tenant's notification log (catch-up polling)
+///
+/// Returns the copy to push: any incoming `seq` is dropped, and the new one is set when the
+/// append succeeded. A failed append only costs the `seq`; it never blocks the push.
+pub async fn log_notification(
+	app: &App,
+	tn_id: TnId,
+	payload: &NotificationPayload,
+) -> NotificationPayload {
+	let mut payload = payload.clone();
+	payload.seq = None;
+	match serde_json::to_string(&payload) {
+		Ok(json) => match app.meta_adapter.append_notification(tn_id, &json).await {
+			Ok(seq) => payload.seq = Some(seq),
+			Err(e) => warn!(tn_id = %tn_id.0, error = %e, "Notification log append failed"),
+		},
+		Err(e) => warn!(tn_id = %tn_id.0, error = %e, "Notification serialize failed"),
+	}
+	payload
+}
+
+/// Log the payload, then send it to all subscriptions for a tenant
 ///
 /// Returns the number of successfully sent notifications and removes invalid subscriptions.
+/// The pushed copy carries the log `seq`. Callers that must not push (tenant push toggles
+/// off) call [`log_notification`] alone.
 pub async fn send_to_tenant(
 	app: &App,
 	tn_id: TnId,
 	payload: &NotificationPayload,
 ) -> ClResult<usize> {
+	// Logged before the off switch: the log is local, no outbound traffic.
+	let payload = &log_notification(app, tn_id, payload).await;
+
 	// Server-wide off switch: nothing is sent, whatever the tenant's own `notify.push`.
 	if !app.settings.get_bool(SHARED_TN, "notify.push_allowed").await? {
 		return Ok(0);

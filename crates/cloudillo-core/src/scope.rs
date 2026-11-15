@@ -39,6 +39,11 @@ fn is_read_method(method: &Method) -> bool {
 	matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
 }
 
+/// One non-empty path segment (no `/`), for `{id}`-style route parameters.
+fn one_segment(s: &str) -> bool {
+	!s.is_empty() && !s.contains('/')
+}
+
 /// Whether the capability list `scopes` covers `method` for a `prefix`-family
 /// path. Write methods imply read, mirroring `cloudillo_dav::auth::required_scopes`.
 fn capability_permits(scopes: &str, method: &Method, prefix: &str) -> bool {
@@ -86,6 +91,38 @@ pub fn scope_permits(scope: Option<&str>, method: &Method, path: &str) -> bool {
 		// (`require_leader`), not the publisher's.
 		Some(TokenScope::ApkgPublish) => {
 			path == "/api/uploads/apkg" || (path == "/api/actions" && method == Method::POST)
+		}
+		// A native client's device key: uploads and folder creation (bounded to the root's
+		// subtree by `file_access::check_scope_allows_create_in`), folder lookups (bounded by
+		// `get_file_list` and the `scope_grant` rung), and its own push subscription.
+		// The allow-list is exact per method: anything not matched below is refused.
+		Some(TokenScope::Device { .. }) => {
+			let upload = path
+				.strip_prefix("/api/uploads/")
+				.is_some_and(|preset| one_segment(preset) && preset != "apkg");
+			let blob_check = path
+				.strip_prefix("/api/files/")
+				.and_then(|rest| rest.strip_suffix("/blob-check"))
+				.is_some_and(one_segment);
+			let file_item = path
+				.strip_prefix("/api/files/")
+				.is_some_and(|rest| one_segment(rest.strip_suffix("/metadata").unwrap_or(rest)));
+			match *method {
+				Method::GET => {
+					path == "/api/files"
+						|| file_item || path == "/api/notifications/vapid-key"
+						|| path == "/api/notifications"
+				}
+				Method::POST => {
+					upload
+						|| path == "/api/files"
+						|| blob_check || path == "/api/notifications/subscriptions"
+				}
+				Method::DELETE => {
+					path.strip_prefix("/api/notifications/subscriptions/").is_some_and(one_segment)
+				}
+				_ => false,
+			}
 		}
 		// Not a delegated token — treat it as a capability list.
 		None => {
@@ -178,6 +215,61 @@ mod tests {
 	}
 
 	#[test]
+	fn device_scope_stays_on_its_allow_list() {
+		let s = Some("device:f1~abc");
+		assert!(scope_permits(s, &Method::POST, "/api/uploads/default"));
+		assert!(scope_permits(s, &Method::POST, "/api/files"));
+		assert!(scope_permits(s, &Method::POST, "/api/files/f1/blob-check"));
+		assert!(scope_permits(s, &Method::GET, "/api/files"));
+		assert!(scope_permits(s, &Method::GET, "/api/files/f2~x"));
+		assert!(scope_permits(s, &Method::GET, "/api/files/f2~x/metadata"));
+		assert!(scope_permits(s, &Method::POST, "/api/notifications/subscriptions"));
+		assert!(scope_permits(s, &Method::DELETE, "/api/notifications/subscriptions/7"));
+		assert!(scope_permits(s, &Method::GET, "/api/notifications/vapid-key"));
+		assert!(scope_permits(s, &Method::GET, "/api/notifications"));
+		assert!(!scope_permits(s, &Method::POST, "/api/notifications"));
+		assert!(!scope_permits(s, &Method::GET, "/api/notifications/x"));
+
+		// App packages are the publisher's, never a device's.
+		assert!(!scope_permits(s, &Method::POST, "/api/uploads/apkg"));
+		// Exact routes: no bare collection, no sub-paths, no other methods.
+		assert!(!scope_permits(s, &Method::POST, "/api/uploads"));
+		assert!(!scope_permits(s, &Method::POST, "/api/uploads/"));
+		assert!(!scope_permits(s, &Method::POST, "/api/uploads/default/x"));
+		assert!(!scope_permits(s, &Method::GET, "/api/files/"));
+		assert!(!scope_permits(s, &Method::GET, "/api/files/f2~x/access"));
+		assert!(!scope_permits(s, &Method::GET, "/api/files/f2~x/content/a"));
+		assert!(!scope_permits(s, &Method::GET, "/api/files/f2~x/shares"));
+		assert!(!scope_permits(s, &Method::PATCH, "/api/files/f2~x"));
+		assert!(!scope_permits(s, &Method::DELETE, "/api/files/f2~x"));
+		assert!(!scope_permits(s, &Method::POST, "/api/files/f2~x/duplicate"));
+		assert!(!scope_permits(s, &Method::POST, "/api/files/f1/blob-check/x"));
+		assert!(!scope_permits(s, &Method::POST, "/api/files/a/b/blob-check"));
+		assert!(!scope_permits(s, &Method::PUT, "/api/files/f1/blob-check"));
+		assert!(!scope_permits(s, &Method::POST, "/api/files/f2~x/shares"));
+		assert!(!scope_permits(s, &Method::GET, "/api/notifications/subscriptions"));
+		assert!(!scope_permits(s, &Method::DELETE, "/api/notifications/subscriptions"));
+		assert!(!scope_permits(s, &Method::DELETE, "/api/notifications/subscriptions/7/x"));
+		assert!(!scope_permits(s, &Method::POST, "/api/notifications/vapid-key"));
+
+		// Nothing off the list.
+		for (m, p) in [
+			(Method::GET, "/api/variants/b1~xyz"),
+			(Method::GET, "/api/search"),
+			(Method::GET, "/ws/rtdb/f1~abc"),
+			(Method::GET, "/ws/crdt/f1~abc"),
+			(Method::POST, "/api/auth/access-token"),
+			(Method::GET, "/api/auth/api-keys"),
+			(Method::POST, "/api/actions"),
+			(Method::POST, "/api/trash/empty"),
+			(Method::POST, "/api/idp/identities"),
+			(Method::PUT, "/api/settings/foo"),
+		] {
+			assert!(!scope_permits(s, &m, p), "{m} {p}");
+		}
+	}
+
+	#[test]
 	fn carddav_read_is_read_only_and_carddav_only() {
 		let s = Some("carddav:read");
 		assert!(scope_permits(s, &Method::GET, "/api/address-books"));
@@ -223,7 +315,17 @@ mod tests {
 
 	#[test]
 	fn unrecognised_scope_grants_nothing() {
-		for s in ["admin", "nonsense", "carddav", "read"] {
+		// Malformed device scopes: no id, empty id, extra segment, wrong case.
+		for s in [
+			"admin",
+			"nonsense",
+			"carddav",
+			"read",
+			"device",
+			"device:",
+			"device:a:b",
+			"Device:a",
+		] {
 			for path in [
 				"/api/address-books",
 				"/api/calendars",

@@ -263,6 +263,7 @@ const TENANT_CASCADE_TABLES: &[&str] = &[
 	"channel_members",
 	"partner_edge",
 	"profile_badges",
+	"notifications",
 ];
 
 /// Delete a tenant and all its associated data (cascading delete)
