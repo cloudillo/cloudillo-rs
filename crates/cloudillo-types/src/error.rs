@@ -28,6 +28,8 @@ error_codes! {
 	CORE_GONE = "E-CORE-GONE",
 	CORE_INVALID = "E-CORE-INVALID",
 	CORE_CONFLICT = "E-CORE-CONFLICT",
+	CORE_PRECOND = "E-CORE-PRECOND",
+	CORE_PRECONDREQ = "E-CORE-PRECONDREQ",
 	CORE_DATABASE = "E-CORE-DATABASE",
 	CORE_INTERNAL = "E-CORE-INTERNAL",
 	CORE_UNAVAILABLE = "E-CORE-UNAVAILABLE",
@@ -92,6 +94,11 @@ pub enum Error {
 	/// understand. Terminal for the sender: a later attempt cannot succeed until we upgrade.
 	Unsupported(String),
 	Conflict(String), // 409 - constraint violation (unique, foreign key, etc)
+	/// 412 `E-CORE-PRECOND` - the `If-Match` precondition names a version that is no longer
+	/// current (optimistic concurrency conflict).
+	PreconditionFailed,
+	/// 428 `E-CORE-PRECONDREQ` - the request must carry an `If-Match` precondition.
+	PreconditionRequired,
 	/// 409 `E-CORE-CONFLICT` with `details.fileCount` - a room still holds files.
 	ChannelNotEmpty {
 		file_count: u32,
@@ -207,6 +214,8 @@ impl Error {
 				| Error::NoRoute
 				| Error::RefExpired
 				| Error::RefUsed
+				| Error::PreconditionFailed
+				| Error::PreconditionRequired
 		)
 	}
 
@@ -275,6 +284,16 @@ impl Error {
 			Error::Conflict(msg) => {
 				(StatusCode::CONFLICT, codes::CORE_CONFLICT, format!("Resource conflict: {}", msg))
 			}
+			Error::PreconditionFailed => (
+				StatusCode::PRECONDITION_FAILED,
+				codes::CORE_PRECOND,
+				"Precondition failed: the resource has changed".into(),
+			),
+			Error::PreconditionRequired => (
+				StatusCode::PRECONDITION_REQUIRED,
+				codes::CORE_PRECONDREQ,
+				"Precondition required: send If-Match".into(),
+			),
 			Error::ChannelNotEmpty { file_count } => (
 				StatusCode::CONFLICT,
 				codes::CORE_CONFLICT,

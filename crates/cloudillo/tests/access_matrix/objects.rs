@@ -266,10 +266,29 @@ pub struct ApiKeys {
 	pub dav_rw: String,
 	/// club's own unscoped key (key 6).
 	pub club: String,
-	/// `device:{alice canonical folder entry}` (key 8), and that scope string.
+	/// A native client's key without the log: `file:{alice canonical folder entry}:W,
+	/// notifications:push` (key 8), and that scope string.
 	pub device: String,
 	pub device_scope: String,
+	/// The full native-client key, `file:{folder}:W,notifications:read,notifications:push`
+	/// (key 9), and that scope string.
+	pub device_notif: String,
+	pub device_notif_scope: String,
+	/// `rfile:peer.test:f1~zqm-remote:W` (key 10): bound to a folder on another context, and
+	/// that scope string.
+	pub rfile: String,
+	pub rfile_scope: String,
+	/// Drive scopes (keys 11..13): `file:__root__:W` (the main drive), `file:~close-friends:W`
+	/// (one room), `file:*:R` (every drive alice can enter).
+	pub drive_main: String,
+	pub drive_room: String,
+	pub drive_all: String,
 }
+
+/// Scope strings of keys 11..13 ([`ApiKeys::drive_main`] and on).
+pub const DRIVE_MAIN_SCOPE: &str = "file:__root__:W";
+pub const DRIVE_ROOM_SCOPE: &str = "file:~close-friends:W";
+pub const DRIVE_ALL_SCOPE: &str = "file:*:R";
 
 /// Non-level files the curated rows use (both tenants); `tenant-crdt-d-active` is also the
 /// canonical doc root; `linktarget-crdt-d-active` is the `via-embed` scope target.
@@ -456,10 +475,7 @@ pub async fn seed_api_keys(app: &App, t: &Tenants) -> ApiKeys {
 	] {
 		let k = app
 			.auth_adapter
-			.create_api_key(
-				tn,
-				CreateApiKeyOptions { name: Some(name), scopes, expires_at, auth_time: None },
-			)
+			.create_api_key(tn, CreateApiKeyOptions { name: Some(name), scopes, expires_at })
 			.await
 			.unwrap();
 		if name == "zqmatrix-unscoped" {
@@ -469,37 +485,80 @@ pub async fn seed_api_keys(app: &App, t: &Tenants) -> ApiKeys {
 	}
 	let [unscoped, file_read, dav, expired, carddav_r] = <[String; 5]>::try_from(keys).unwrap();
 	// club's own key, for the leader-on-its-own-keys rows.
-	let opts = CreateApiKeyOptions {
-		name: Some("zqmatrix-club"),
-		scopes: None,
-		expires_at: None,
-		auth_time: None,
-	};
+	let opts = CreateApiKeyOptions { name: Some("zqmatrix-club"), scopes: None, expires_at: None };
 	let club = app.auth_adapter.create_api_key(t.club.tn_id, opts).await.unwrap();
 	assert_eq!(club.info.key_id, 6, "curated rows name club's key as /api/auth/api-keys/6");
 	let scopes = Some("carddav:read,carddav:write,caldav:read,caldav:write");
-	let opts = CreateApiKeyOptions {
-		name: Some("zqmatrix-dav-rw"),
-		scopes,
-		expires_at: None,
-		auth_time: None,
-	};
+	let opts = CreateApiKeyOptions { name: Some("zqmatrix-dav-rw"), scopes, expires_at: None };
 	let dav_rw = app.auth_adapter.create_api_key(tn, opts).await.unwrap();
 	assert_eq!(dav_rw.info.key_id, 7, "alice's read-write DAV key is key 7");
 	let (club, dav_rw) = (club.plaintext_key.to_string(), dav_rw.plaintext_key.to_string());
 	// A native client's device key, rooted at alice's canonical folder (by its entry id).
 	let folder = app.meta_adapter.read_file(tn, &canon_folder(t.alice.id_tag)).await.unwrap();
-	let device_scope = format!("device:{}", folder.unwrap().entry_id);
+	let folder_root = folder.unwrap().entry_id;
+	let device_scope = format!("file:{folder_root}:W,notifications:push");
 	let opts = CreateApiKeyOptions {
 		name: Some("zqmatrix-device"),
 		scopes: Some(&device_scope),
 		expires_at: None,
-		auth_time: None,
 	};
 	let device = app.auth_adapter.create_api_key(tn, opts).await.unwrap();
 	assert_eq!(device.info.key_id, 8, "alice's device key is key 8");
 	let device = device.plaintext_key.to_string();
-	ApiKeys { unscoped, file_read, dav, expired, carddav_r, dav_rw, club, device, device_scope }
+	// The same root plus `notifications:read`: the scope a native client is minted with.
+	let device_notif_scope = format!("file:{folder_root}:W,notifications:read,notifications:push");
+	let opts = CreateApiKeyOptions {
+		name: Some("zqmatrix-device-notif"),
+		scopes: Some(&device_notif_scope),
+		expires_at: None,
+	};
+	let device_notif = app.auth_adapter.create_api_key(tn, opts).await.unwrap();
+	assert_eq!(device_notif.info.key_id, 9, "alice's device+notifications key is key 9");
+	let device_notif = device_notif.plaintext_key.to_string();
+	// Bound to another context: locally it reaches only `POST /api/auth/proxy-token`. Seeded
+	// through the adapter, so `check_file_key_root` (HTTP mint only) does not run.
+	let rfile_scope = "rfile:peer.test:f1~zqm-remote:W".to_owned();
+	let opts = CreateApiKeyOptions {
+		name: Some("zqmatrix-rfile"),
+		scopes: Some(&rfile_scope),
+		expires_at: None,
+	};
+	let rfile = app.auth_adapter.create_api_key(tn, opts).await.unwrap();
+	assert_eq!(rfile.info.key_id, 10, "alice's remote-folder key is key 10");
+	let rfile = rfile.plaintext_key.to_string();
+	// Drive scopes narrow alice's own (full) access to the named drive(s). Seeded through the
+	// adapter like key 10; the HTTP mint (`check_file_key_root`) is driven in
+	// `management_flows::drive_scoped_keys_and_tokens`.
+	let mut drive = Vec::new();
+	for (id, name, scope) in [
+		(11, "zqmatrix-drive-main", DRIVE_MAIN_SCOPE),
+		(12, "zqmatrix-drive-room", DRIVE_ROOM_SCOPE),
+		(13, "zqmatrix-drive-all", DRIVE_ALL_SCOPE),
+	] {
+		let opts = CreateApiKeyOptions { name: Some(name), scopes: Some(scope), expires_at: None };
+		let k = app.auth_adapter.create_api_key(tn, opts).await.unwrap();
+		assert_eq!(k.info.key_id, id, "alice's {name} key is key {id}");
+		drive.push(k.plaintext_key.to_string());
+	}
+	let [drive_main, drive_room, drive_all] = <[String; 3]>::try_from(drive).unwrap();
+	ApiKeys {
+		unscoped,
+		file_read,
+		dav,
+		expired,
+		carddav_r,
+		dav_rw,
+		club,
+		device,
+		device_scope,
+		device_notif,
+		device_notif_scope,
+		rfile,
+		rfile_scope,
+		drive_main,
+		drive_room,
+		drive_all,
+	}
 }
 
 /// The one proxy site, which the admin rows aim at (`/api/admin/proxy-sites/1`).

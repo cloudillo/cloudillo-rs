@@ -480,6 +480,57 @@ async fn a_purged_tree_frees_its_content_for_the_reaper() {
 	assert!(is_active(&adapter, tn_id, "f1~p-shared").await);
 }
 
+/// A purge that removed rows moves the change-feed horizon; an empty purge leaves it alone.
+#[tokio::test]
+async fn a_purge_records_the_change_feed_horizon() {
+	let (adapter, temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice").await.ok();
+	let horizon = async |adapter: &MetaAdapterSqlite| {
+		adapter
+			.list_entry_changes(tn_id, Timestamp(0), None, 1)
+			.await
+			.expect("feed")
+			.purged_at
+	};
+
+	assert_eq!(adapter.purge_tombstones(tn_id).await.expect("purge"), 0);
+	assert!(horizon(&adapter).await.is_none(), "an empty purge set a horizon");
+
+	make_file(&adapter, tn_id, "f1~h-gone", None).await;
+	adapter.delete_file(tn_id, "f1~h-gone").await.expect("delete");
+	// Age the tombstone, so its `updated_at` and the purge time differ. The trigger would
+	// re-stamp the row; this temp db has no further use for it.
+	let pool = sqlx::sqlite::SqlitePoolOptions::new()
+		.connect(&format!("sqlite://{}/meta.db", temp.path().display()))
+		.await
+		.expect("open meta.db");
+	sqlx::query("DROP TRIGGER entries_updated_at")
+		.execute(&pool)
+		.await
+		.expect("drop trigger");
+	sqlx::query("UPDATE entries SET updated_at = updated_at - 1000 WHERE status = 'D'")
+		.execute(&pool)
+		.await
+		.expect("age tombstone");
+	pool.close().await;
+	let changes = adapter
+		.list_entry_changes(tn_id, Timestamp(0), None, 100)
+		.await
+		.expect("feed")
+		.rows;
+	let tombstone = changes
+		.iter()
+		.find(|c| matches!(c.status, FileStatus::Deleted))
+		.expect("tombstone in the feed")
+		.updated_at;
+	assert_eq!(adapter.purge_tombstones(tn_id).await.expect("purge"), 1);
+	// The horizon is the newest purged tombstone, not the purge time: a client that already
+	// saw that tombstone (`since >= horizon`) is not told to re-list.
+	assert_eq!(horizon(&adapter).await, Some(tombstone));
+	assert!(tombstone.0 < Timestamp::now().0 - 500);
+}
+
 /// Every `tn_id`-keyed table takes part in the tenant cascade, and the site tables
 /// are keyed by nothing else. A `site_docs` row left behind is worse than an
 /// orphan: `list_referenced_managed_fids` joins it for GC reachability, so a purged

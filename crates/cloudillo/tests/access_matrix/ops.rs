@@ -382,7 +382,7 @@ fn file_req(op: FileOp, f: &FileObj) -> (Method, String, Body) {
 		F::Duplicate => post(format!("{wbase}/duplicate")),
 		F::CreateBlob => (
 			Method::POST,
-			format!("/api/uploads/file?name=zqm-new.txt&parentId={id}"),
+			format!("/api/uploads/standard?name=zqm-new.txt&parentId={id}"),
 			Body::from(format!("{MARK} new blob")),
 		),
 		F::CreateCrdt | F::CreateRtdb => {

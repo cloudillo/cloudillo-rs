@@ -9,6 +9,7 @@
 //! | Path | GET | POST | PUT | PATCH | DELETE |
 //! |---|---|---|---|---|---|
 //! | `/api/files`                          | `list_public()` ᴳ | `create()` ᶜ | | | |
+//! | `/api/file-changes`                   | `list_public()` ᴳ | | | | |
 //! | `/api/files/{id}/blob-check`          | | `create()` ᶜ | | | |
 //! | `/api/uploads/{preset}`               | | `create()` ᶜ ᴮ | | | |
 //! | `/api/files/{id}`                     | `read()` ᴬ | | | `write()` ᶜ | `write()` ᶜ |
@@ -16,9 +17,13 @@
 //! | `/api/files/{id}/metadata`            | `read()` ᴬ | | | | |
 //! | `/api/files/{id}/access`              | `read()` ᴬ | | | | |
 //! | `/api/variants/{variantId}`           | `read()` ᴬ | | | | |
+//! | `/api/files/{id}/content`             | | | `write()` ᶜ ᴮ | | |
 //! | `/api/files/{id}/content/{*path}`     | `list_public()` ᴳ | | | | |
 //! | `/api/files/{id}/duplicate`           | | `create()` ᶜ | | | |
 //! | `/api/files/{id}/restore`             | | `write()` ᶜ | | | |
+//! | `/api/files/{id}/versions`            | `write()` ᶜ | | | | |
+//! | `/api/files/{id}/versions/{fileId}`   | `write()` ᶜ | | | | |
+//! | `/api/files/{id}/versions/{fileId}/restore` | | `write()` ᶜ | | | |
 //! | `/api/files/{id}/tags/{tag}`          | | | `write()` ᶜ | | `write()` ᶜ |
 //! | `/api/files/{id}/user-data`           | | | | `user_data()` ᴱ | |
 //! | `/api/files/{id}/refresh`             | | `user_data()` ᴱ | | | |
@@ -50,7 +55,7 @@ use axum::{
 	routing::{delete, get, patch, post, put},
 };
 
-use crate::file::{access, apkg, export, handler, management, share, tag};
+use crate::file::{access, apkg, export, handler, management, share, tag, version};
 use crate::prelude::*;
 
 /// Bulk export of the tenant's own data, gated by `require_tenant_self`.
@@ -86,7 +91,16 @@ pub(crate) fn create() -> Router<App> {
 pub(crate) fn write() -> Router<App> {
 	Router::new()
 		.route("/api/files/{id}", patch(management::patch_file).delete(management::delete_file))
+		// Streaming replace: like `/api/uploads`, enforces its own size cap.
+		.route(
+			"/api/files/{id}/content",
+			put(handler::put_file_content).layer(DefaultBodyLimit::disable()),
+		)
 		.route("/api/files/{id}/restore", post(management::restore_file))
+		// Version history needs write access even to read: it may hold removed content.
+		.route("/api/files/{id}/versions", get(version::list_versions))
+		.route("/api/files/{id}/versions/{file_id}", get(version::get_version_content))
+		.route("/api/files/{id}/versions/{file_id}/restore", post(version::restore_version))
 		.route("/api/files/{id}/tags/{tag}", put(tag::put_file_tag).delete(tag::delete_file_tag))
 }
 
@@ -153,6 +167,9 @@ pub(crate) fn read() -> Router<App> {
 pub(crate) fn list_public() -> Router<App> {
 	Router::new()
 		.route("/api/files", get(handler::get_file_list))
+		// Requires auth inside the handler; scoped API keys are confined to their scope root
+		// (`get_file_changes`).
+		.route("/api/file-changes", get(handler::get_file_changes))
 		.route("/api/apps", get(apkg::list_apps))
 		.route("/api/files/{id}/content/{*path}", get(apkg::get_container_content))
 }

@@ -48,8 +48,8 @@ use cloudillo_types::{
 		CalendarObjectExtracted, CalendarObjectSyncEntry, CalendarObjectView, CalendarObjectWrite,
 		Channel, Contact, ContactExtracted, ContactSyncEntry, ContactView, ContentInfo,
 		CreateCalendarData, CreateFile, CreateRefOptions, CreateShareEntry, CreatedFile,
-		DeleteFileResult, DocFormat, FileId, FileResolution, FileUserData, FileVariant, FileView,
-		FinalizeActionOptions, InstallApp, InstalledApp, ListActionOptions,
+		DeleteFileResult, DocFormat, EntryVersion, FileId, FileResolution, FileUserData,
+		FileVariant, FileView, FinalizeActionOptions, InstallApp, InstalledApp, ListActionOptions,
 		ListCalendarObjectOptions, ListContactOptions, ListFileOptions, ListProfileOptions,
 		ListReaderStateOptions, ListRefsOptions, ListTaskOptions, ListTenantsMetaOptions,
 		MetaAdapter, NotificationLogEntry, PartnerEdge, PatchReaderState, Profile, ProfileBadgeRow,
@@ -536,6 +536,85 @@ impl MetaAdapter for MetaAdapterSqlite {
 
 	async fn purge_tombstones(&self, tn_id: TnId) -> ClResult<u64> {
 		file::purge_tombstones(&self.db, tn_id).await
+	}
+
+	async fn list_entry_changes(
+		&self,
+		tn_id: TnId,
+		since: Timestamp,
+		after: Option<&str>,
+		limit: u32,
+	) -> ClResult<cloudillo_types::meta_adapter::EntryChanges> {
+		file::list_entry_changes(&self.dbr, tn_id, since, after, limit).await
+	}
+
+	async fn create_pending_replace(
+		&self,
+		tn_id: TnId,
+		entry_id: &str,
+		expected_file_id: &str,
+		content: CreateFile,
+		replaced_by: Option<&str>,
+		max_history_size: u64,
+	) -> ClResult<u64> {
+		file::create_pending_replace(
+			&self.db,
+			tn_id,
+			entry_id,
+			expected_file_id,
+			content,
+			replaced_by,
+			max_history_size,
+		)
+		.await
+	}
+
+	async fn read_pending_replace(
+		&self,
+		tn_id: TnId,
+		f_id: u64,
+	) -> ClResult<Option<(Option<Box<str>>, Option<Box<str>>)>> {
+		file::read_pending_replace(&self.dbr, tn_id, f_id).await
+	}
+
+	async fn list_entry_versions(
+		&self,
+		tn_id: TnId,
+		entry_id: &str,
+	) -> ClResult<Vec<EntryVersion>> {
+		file::list_entry_versions(&self.dbr, tn_id, entry_id).await
+	}
+
+	async fn restore_entry_version(
+		&self,
+		tn_id: TnId,
+		entry_id: &str,
+		file_id: &str,
+		expected_file_id: Option<&str>,
+		replaced_by: Option<&str>,
+	) -> ClResult<()> {
+		file::restore_entry_version(
+			&self.db,
+			tn_id,
+			entry_id,
+			file_id,
+			expected_file_id,
+			replaced_by,
+		)
+		.await
+	}
+
+	async fn prune_entry_versions(
+		&self,
+		tn_id: TnId,
+		keep_count: u32,
+		older_than: Timestamp,
+	) -> ClResult<u64> {
+		file::prune_entry_versions(&self.db, tn_id, keep_count, older_than).await
+	}
+
+	async fn purge_stale_pending_replaces(&self, tn_id: TnId, before: Timestamp) -> ClResult<u64> {
+		file::purge_stale_pending_replaces(&self.db, tn_id, before).await
 	}
 
 	async fn create_entry_for_content(

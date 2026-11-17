@@ -44,7 +44,7 @@ pub enum Route {
 	FileGet,
 	/// `GET /api/variants/{blob}`.
 	FileVariant,
-	/// `POST /api/uploads/file?name=zqm-new.txt&parentId=` the object (a BLOB upload).
+	/// `POST /api/uploads/standard?name=zqm-new.txt&parentId=` the object (a BLOB upload).
 	FileUpload,
 	ActGet,
 	ActPatch,
@@ -1302,6 +1302,16 @@ pub const WS: &[Row] = &[
 	("WS-42", "apkg-publish@alice", "", WS_BUS, "Deny"),
 	("WS-43", "anon@alice", "", WS_BUS, "Deny"),
 	("WS-44", "tampered@alice", "", WS_BUS, "Deny"),
+	// File-changes admission: a host-tenant `cl_` key (no exp) with a File or Drive scope only.
+	("WS-95", "apikey-file@alice", "", WS_FILE_CHANGES, "Allow"),
+	("WS-96", "apikey-unscoped@alice", "", WS_FILE_CHANGES, "Deny"),
+	("WS-97", "apikey-dav@alice", "", WS_FILE_CHANGES, "Deny"),
+	("WS-98", "idp-key@alice", "", WS_FILE_CHANGES, "Deny"),
+	("WS-99", "sharelink-r@alice", "", WS_FILE_CHANGES, "Deny"),
+	("WS-100", "owner@alice", "", WS_FILE_CHANGES, "Deny"),
+	("WS-101", "stranger@alice", "", WS_FILE_CHANGES, "Deny"),
+	("WS-102", "follower@alice", "", WS_FILE_CHANGES, "Deny"),
+	("WS-103", "anon@alice", "", WS_FILE_CHANGES, "Deny"),
 	// An `s~` store row is created on first connect only by an unscoped contributor or above;
 	// for anyone else the missing row is refused (`store_rows_only_for_creators`).
 	("WS-53", "owner@alice", "s~zqm-store-a", WsRtdb(None), "Allow"),
@@ -1384,6 +1394,7 @@ pub const WS: &[Row] = &[
 ];
 
 const WS_BUS: Route = Call("GET", "/ws/bus", "");
+const WS_FILE_CHANGES: Route = Call("GET", "/ws/file-changes", "");
 
 /// `MSG:UPD` of the row object's MSG (subject-targeted edit).
 const MSG_UPD: Route = Call(
@@ -1588,6 +1599,9 @@ const BLOB_CHECK: Route = Call("POST", "/api/files/{entry}/blob-check", r#"{"blo
 const REINDEX: Route = Call("POST", "/api/search/reindex", "");
 const API_KEYS: Route = Call("GET", "/api/auth/api-keys", "");
 const API_KEY_MINT: Route = Call("POST", "/api/auth/api-keys", r#"{"name":"zqm-mint"}"#);
+/// QR device pairing init (`qr_pair.rs`) and a key's self-revoke.
+const PAIR_INIT: Route = Call("POST", "/api/auth/pair", r#"{"deviceName":"zqm-matrix"}"#);
+const SELF_REVOKE: Route = Call("DELETE", "/api/auth/current-api-key", "");
 const WA_REG: Route = Call("GET", "/api/auth/passkeys", "");
 const PROXY_TOKEN: Route = Call("POST", "/api/auth/proxy-token", "{}");
 const VAPID: Route = Call("GET", "/api/notifications/vapid-key", "");
@@ -2198,12 +2212,13 @@ pub const MG: &[Row] = &[
 		"MG-289",
 		"m_moderator@club",
 		"",
-		Call("POST", "/api/uploads/file?name=zqm-chan.txt&channel=@club.test~closed-w", "zqm"),
+		Call("POST", "/api/uploads/standard?name=zqm-chan.txt&channel=@club.test~closed-w", "zqm"),
 		"Deny",
 	),
 	("MG-290", "owner@alice", "folder-blob-p-trashed@alice", FileUpload, "Deny"),
 	// A scope's write is the document's, not the record's: no delete, no restore.
 	("MG-291", "sharelink-w@alice", "root@alice", FileDelete, "Deny"),
+	// An app doc token never trashes its own doc: a doc root has no "inside".
 	("MG-292", "owner-scoped-w@alice", "root@alice", FileDelete, "Deny"),
 	("MG-293", "owner-scoped-w@alice", "tenant-blob-p-trashed@alice", FileRestore, "Deny"),
 	// Posting as the tenant: its unscoped account; no link, capability key or `idp_` key
@@ -2714,8 +2729,8 @@ pub const MG: &[Row] = &[
 	("MG-670", "idp-mgmt@alice", "folder-blob-d-active@alice", BLOB_CHECK, "Deny"),
 	("MG-671", "apkg-publish@alice", "folder-blob-d-active@alice", BLOB_CHECK, "Deny"),
 	("MG-672", "m_leader@club", "folder-blob-d-active@club", BLOB_CHECK, "Deny"),
-	// A `device:{root}` key (root = alice's canonical folder): bounded to the root subtree,
-	// refused off its route allow-list.
+	// A native-client key (`file:{root}:W,notifications:push`, root = alice's canonical
+	// folder): bounded to the root subtree, refused off its route allow-list.
 	("MG-673", "device@alice", "folder-blob-d-active@alice", BLOB_CHECK, "Allow"),
 	("MG-674", "device@alice", "folder-blob-p-active@alice", BLOB_CHECK, "Deny"),
 	("MG-675", "device@alice", "folder-blob-d-active@club", BLOB_CHECK, "Deny"),
@@ -2727,12 +2742,236 @@ pub const MG: &[Row] = &[
 	// parentId browse inside the root lists its children (MG-685).
 	("MG-680", "device@alice", "folder-blob-d-active@alice", FileListQ(""), "Present"),
 	("MG-681", "device@alice", "tenant-blob-d-active@alice", FileListQ(""), "Absent"),
-	// Deliberate until keys can carry several scopes: the device key reads the whole log.
-	("MG-682", "device@alice", "", NOTIF_LIST, "Allow"),
+	// The notification log needs `notifications:read`; key 8 carries only `notifications:push`.
+	("MG-682", "device@alice", "", NOTIF_LIST, "Deny"),
 	("MG-683", "device@alice", "", Call("POST", "/api/actions", "{}"), "Deny"),
 	("MG-684", "device@alice", "", API_KEYS, "Deny"),
 	("MG-685", "device@alice", FOLDER_CHILD, FileListQ("parentId={parent}"), "Present"),
+	// A multi-scope key (`file:{root}:W,notifications:read,notifications:push`): the capability
+	// adds the log, the `file:` half keeps its root bounds, and neither reaches key management.
+	("MG-686", "device-notif@alice", "", NOTIF_LIST, "Allow"),
+	("MG-687", "device-notif@alice", "folder-blob-d-active@alice", BLOB_CHECK, "Allow"),
+	("MG-688", "device-notif@alice", "folder-blob-p-active@alice", BLOB_CHECK, "Deny"),
+	("MG-689", "device-notif@alice", "", API_KEYS, "Deny"),
+	// A DAV capability is not `notifications:read`.
+	("MG-690", "apikey-carddav-r@alice", "", NOTIF_LIST, "Deny"),
+	// A `notifications:push` key without the endpoint proof deletes no subscription.
+	(
+		"MG-796",
+		"device-notif@alice",
+		"",
+		Call("DELETE", "/api/notifications/subscriptions/1", ""),
+		"Deny",
+	),
+	// Content replace and versions: write access, unscoped. The rows leave the shared objects
+	// untouched: no `If-Match` (428), a version id in no history (404). Real version ids, the
+	// 412s and the swaps are `management_flows::content_replace_and_versions_flow`.
+	("MG-691", "owner@alice", "tenant-blob-d-active@alice", VER_LIST, "Allow"),
+	("MG-692", "owner@alice", "tenant-blob-d-active@alice", VER_PUT, "428"),
+	("MG-693", "owner@alice", "tenant-blob-d-active@alice", VER_GET, "404"),
+	("MG-694", "owner@alice", "tenant-blob-d-active@alice", VER_RESTORE, "404"),
+	("MG-695", "owner@alice", "tenant-blob-d-active@alice", VER_COPY, "404"),
+	("MG-696", "m_contributor@club", VER_CLUB, VER_LIST, "Allow"),
+	("MG-697", "m_contributor@club", VER_CLUB, VER_PUT, "428"),
+	("MG-698", "m_contributor@club", VER_CLUB, VER_RESTORE, "404"),
+	("MG-699", "m_contributor@club", VER_CLUB, VER_COPY, "404"),
+	("MG-700", "m_supporter@club", VER_CLUB, VER_LIST, "Deny"),
+	("MG-701", "m_supporter@club", VER_CLUB, VER_PUT, "Deny"),
+	("MG-702", "m_follower@club", VER_CLUB, VER_LIST, "Deny"),
+	// Duplicate is create-tier: the handler's write check refuses (an allowed caller gets 404).
+	("MG-703", "m_follower@club", VER_CLUB, VER_COPY, "403"),
+	// A W folder key strictly inside its root manages versions and replaces content. The 428 is
+	// past the gate; the real swap is `scoped_lifecycle_inside_root`.
+	("MG-704", "device@alice", FOLDER_CHILD, VER_LIST, "Allow"),
+	("MG-705", "device@alice", FOLDER_CHILD, VER_PUT, "428"),
+	// Change feed: a folder root the caller reads, the main drive, a room drive. The unreadable
+	// and scoped callers on a folder root are the `CHANGES_DENIED` grid; the `gone` markers
+	// (renamed out, trashed, unenterable room) and the 410 are `main::file_change_feed`.
+	("MG-712", "owner@alice", "folder@alice", CHANGES_ENTRY, "Allow"),
+	("MG-713", "g_folder@alice", "folder@alice", CHANGES_ENTRY, "Allow"),
+	("MG-714", "m_contributor@club", "folder@club", CHANGES_ENTRY, "Allow"),
+	("MG-715", "owner@alice", "", CHANGES_MAIN, "Allow"),
+	// `__root__` has no entry gate, but unreadable rows are left out (`main::file_change_feed`).
+	("MG-716", "stranger@alice", "", CHANGES_MAIN, "Allow"),
+	("MG-717", "owner@club", "", CHANGES_ROOM, "Allow"),
+	("MG-718", "m_contributor@club", "", CHANGES_ROOM, "Allow"),
+	("MG-719", "m_supporter@club", "", CHANGES_ROOM, "403"),
+	("MG-720", "m_follower@club", "", CHANGES_ROOM, "403"),
+	// `mods` needs a moderator.
+	("MG-721", "m_contributor@club", "", Get("/api/file-changes?root=~mods&since=0"), "403"),
+	("MG-722", "owner@club", "", Get("/api/file-changes?root=~zqm-nope&since=0"), "404"),
+	// A deleted room.
+	("MG-723", "owner@club", "", Get("/api/file-changes?root=~gone&since=0"), "404"),
+	// A doc root is not a folder; an unknown id is not found.
+	("MG-724", "owner@alice", "root@alice", CHANGES_ENTRY, "400"),
+	("MG-725", "owner@alice", "", Get("/api/file-changes?root=f1~zqm-nope&since=0"), "404"),
+	// No entry gate on `__root__`, so these refusals are the credential's own.
+	("MG-726", "anon@alice", "", CHANGES_MAIN, "403"),
+	("MG-727", "via-embed@alice", "", CHANGES_MAIN, "403"),
+	("MG-728", "sharelink-r@alice", "", CHANGES_MAIN, "403"),
+	("MG-729", "sharelink-w@alice", "", CHANGES_MAIN, "403"),
+	("MG-730", "apikey-file@alice", "", CHANGES_MAIN, "403"),
+	("MG-731", "device@alice", "", CHANGES_MAIN, "403"),
+	("MG-732", "owner-scoped-r@alice", "", CHANGES_MAIN, "403"),
+	("MG-795", "idp-key@alice", "", CHANGES_MAIN, "Deny"),
+	// Lifecycle under a folder scope (`device@alice` = `file:{folder}:W`): the scope root is
+	// never renamed or trashed, nothing outside it is touched, purge and share creation are
+	// refused to every scope. The allowed verbs strictly inside the root mutate, so they run on
+	// fresh entries in `management_flows::scoped_lifecycle_inside_root`, which also has the W
+	// folder share link (the fixture seeds only an R link on the folder).
+	("MG-733", "device@alice", "folder@alice", RENAME, "Deny"),
+	("MG-734", "device@alice", "folder@alice", FileDelete, "Deny"),
+	("MG-735", "device@alice", "tenant-blob-d-active@alice", RENAME, "Deny"),
+	("MG-736", "device@alice", "tenant-blob-d-active@alice", FileDelete, "Deny"),
+	("MG-737", "device@alice", FOLDER_CHILD, MOVE_TO_TOP, "Deny"),
+	("MG-738", "device@alice", FOLDER_CHILD, PURGE, "Deny"),
+	("MG-739", "device@alice", FOLDER_CHILD, Call("POST", SHARES_OBJ, SHARE_U), "Deny"),
+	// Scoped restore-from-trash is unreachable: a trashed row keeps no parent, so it is never
+	// provably inside a root (the guard answers 404); the owner restores.
+	("MG-740", "device@alice", "tenant-blob-p-trashed@alice", FileRestore, "Deny"),
+	// An R folder link renames nothing, inside or the root.
+	("MG-741", "folderlink-r@alice", FOLDER_CHILD, RENAME, "Deny"),
+	("MG-742", "folderlink-r@alice", "folder@alice", RENAME, "Deny"),
+	// Change feed under a folder scope: a folder key follows its root (or a folder inside), a
+	// folder outside it is not readable. A folder share link names no holder and follows nothing.
+	("MG-743", "device@alice", "folder@alice", CHANGES_ENTRY, "Allow"),
+	("MG-744", "device-notif@alice", "folder@alice", CHANGES_ENTRY, "Allow"),
+	("MG-745", "folderlink-r@alice", "folder@alice", CHANGES_ENTRY, "403"),
+	("MG-746", "device@alice", "folder-blob-p-active@alice", CHANGES_ENTRY, "Deny"),
+	("MG-747", "folderlink-r@alice", "folder-blob-p-active@alice", CHANGES_ENTRY, "Deny"),
+	// An `rfile:peer.test:…:W` key: only the proxy token to its binding. The fixture has no
+	// remote peer, so the bound exchange is `Allow*` like MG-367 (it passes every local check,
+	// then the dial to `peer.test` fails); the forced `file:{id}:W` scope is formed in
+	// `remote_file_proxy_token` and is not observable without a peer. Another idTag,
+	// a hat, and every local route are refused; no idTag falls back to the binding (MG-750,
+	// `Allow*` like MG-748). Its `apiKey` exchange is in
+	// `management_flows::remote_file_and_legacy_device_keys`.
+	("MG-748", "rfile@alice", "", PROXY_TO_PEER, "Allow*"),
+	("MG-749", "rfile@alice", "", PROXY_TO_OTHER, "Deny"),
+	("MG-750", "rfile@alice", "", PROXY_TOKEN, "Allow*"),
+	("MG-751", "rfile@alice", "", PROXY_WITH_HAT, "Deny"),
+	("MG-752", "rfile@alice", FOLDER_CHILD, FileGet, "Deny"),
+	("MG-753", "rfile@alice", FOLDER_CHILD, BLOB_CHECK, "Deny"),
+	("MG-754", "rfile@alice", "folder@alice", CHANGES_ENTRY, "Deny"),
+	("MG-755", "rfile@alice", "", API_KEYS, "Deny"),
+	("MG-756", "rfile@alice", "", NOTIF_LIST, "Deny"),
+	// Drive scopes (keys 11..13, `drive-*@alice`) narrow alice's own access to whole drives,
+	// with no fall-through outside them. The mutating allows (rename inside the drive, the
+	// `E-FILE-CROSSROOM` move into a room, the HTTP key mint), malformed drive keys and the
+	// community cases (member, non-member, removed member, contributor escalation) are in
+	// `management_flows::drive_scoped_keys_and_tokens`; the app-token and hatted refusals are
+	// the `scope-drive-*` mint cells in `subjects.rs`.
+	// `file:__root__:W`: the main drive only; purge and share stay refused to every scope; the
+	// porch omits rooms outside the scoped drive.
+	("MG-757", "drive-main@alice", "tenant-blob-d-active@alice", FileListQ(MAIN_ROOT), "Present"),
+	("MG-758", "drive-main@alice", "tenant-blob-d-active@alice", FileGet, "Allow"),
+	("MG-759", "drive-main@alice", CF_FILE, FileGet, "Deny"),
+	("MG-760", "drive-main@alice", CF_FILE, FileMeta, "Deny"),
+	("MG-761", "drive-main@alice", CF_FILE, FileListQ(CF_ROOT), "Absent"),
+	("MG-762", "drive-main@alice", "tenant-blob-d-active@alice", PURGE, "Deny"),
+	(
+		"MG-763",
+		"drive-main@alice",
+		"tenant-blob-d-active@alice",
+		Call("POST", SHARES_OBJ, SHARE_U),
+		"Deny",
+	),
+	("MG-764", "drive-main@alice", "", Get("/api/channels"), "Allow"),
+	("MG-765", "drive-main@alice", "", ChanPorch("close-friends"), "Absent"),
+	// `file:~close-friends:W`: that room only.
+	("MG-766", "drive-room@alice", CF_FILE, FileGet, "Allow"),
+	("MG-767", "drive-room@alice", CF_FILE, FileListQ(CF_ROOT), "Present"),
+	("MG-768", "drive-room@alice", "", ChanUpload("@alice.test~close-friends"), "Allow"),
+	("MG-769", "drive-room@alice", "tenant-blob-d-active@alice", FileGet, "Deny"),
+	("MG-770", "drive-room@alice", "tenant-blob-d-active@alice", FileListQ(MAIN_ROOT), "Absent"),
+	("MG-771", "drive-room@alice", "folder@alice", FileCreate, "Deny"),
+	("MG-772", "drive-room@alice", "", Call("POST", "/api/files", MAIN_CREATE), "Deny"),
+	("MG-773", "drive-room@alice", "", CHANGES_CF, "Allow"),
+	("MG-774", "drive-room@alice", "", CHANGES_MAIN, "Deny"),
+	("MG-775", "drive-room@alice", "", ChanPorch("close-friends"), "in"),
+	// `file:*:R`: every drive alice enters, read only; one feed per drive, so `root=*` is 400.
+	("MG-776", "drive-all@alice", "tenant-blob-d-active@alice", FileGet, "Allow"),
+	("MG-777", "drive-all@alice", CF_FILE, FileGet, "Allow"),
+	("MG-778", "drive-all@alice", "tenant-blob-d-active@alice", RENAME, "Deny"),
+	("MG-779", "drive-all@alice", "tenant-blob-d-active@alice", FileDelete, "Deny"),
+	("MG-780", "drive-all@alice", "", ChanUpload("@alice.test~close-friends"), "Deny"),
+	("MG-781", "drive-all@alice", "folder@alice", FileCreate, "Deny"),
+	("MG-782", "drive-all@alice", "", Get("/api/file-changes?root=*&since=0"), "400"),
+	("MG-783", "drive-all@alice", "", ChanPorch("close-friends"), "in"),
+	// A folder-scoped key never moves an entry into another drive (`E-FILE-CROSSROOM`).
+	("MG-784", "device@alice", FOLDER_CHILD, MOVE_TO_CF, "Deny"),
+	// QR device pairing: init is public, a blank device name is refused, an unknown session's
+	// poll holds nothing. The session-id routes (details, respond, the secret-gated poll) are
+	// `management_flows::qr_pair_gate` / `qr_pair_approve`.
+	("MG-785", "anon@alice", "", PAIR_INIT, "Allow"),
+	("MG-786", "anon@alice", "", Call("POST", "/api/auth/pair", r#"{"deviceName":""}"#), "400"),
+	("MG-787", "anon@alice", "", Get("/api/auth/pair/zqm-nope"), "Deny"),
+	// `DELETE /api/auth/current-api-key`: only a tenant `cl_` key deletes itself. The allows (a
+	// `file:`, an `rfile:` and a DAV key) are in `management_flows::qr_pair_approve`: a static
+	// allow would delete a seeded key.
+	("MG-788", "owner@alice", "", SELF_REVOKE, "Deny"),
+	("MG-789", "owner-scoped-r@alice", "", SELF_REVOKE, "Deny"),
+	("MG-790", "sharelink-r@alice", "", SELF_REVOKE, "Deny"),
+	("MG-791", "idp-key@alice", "", SELF_REVOKE, "Deny"),
+	("MG-792", "sadm-visit@alice", "", SELF_REVOKE, "Deny"),
+	("MG-793", "stranger@alice", "", SELF_REVOKE, "Deny"),
+	("MG-794", "anon@alice", "", SELF_REVOKE, "Deny"),
 ];
+
+/// Lifecycle routes on `{entry}`: a rename, a move to the tenant top level, a permanent delete.
+const RENAME: Route = Call("PATCH", "/api/files/{entry}", r#"{"fileName":"zqm-renamed"}"#);
+const MOVE_TO_TOP: Route = Call("PATCH", "/api/files/{entry}", r#"{"parentId":null}"#);
+const PURGE: Route = Call("DELETE", "/api/files/{entry}?permanent=true", "");
+/// Proxy tokens an `rfile:peer.test:…` key must not get: another node, its node with a hat.
+const PROXY_TO_OTHER: Route =
+	Call("POST", "/api/auth/proxy-token", r#"{"idTag":"zqm-other.test"}"#);
+const PROXY_WITH_HAT: Route =
+	Call("POST", "/api/auth/proxy-token", r#"{"idTag":"peer.test","hat":"club.test"}"#);
+
+/// `GET /api/file-changes` with `{entry}` (a folder) as the root, the main drive, a room.
+const CHANGES_ENTRY: Route = Get("/api/file-changes?root={entry}&since=0");
+const CHANGES_MAIN: Route = Get("/api/file-changes?root=__root__&since=0");
+const CHANGES_ROOM: Route = Get("/api/file-changes?root=~open-contrib&since=0");
+/// The change feed of alice's `close-friends` room drive.
+const CHANGES_CF: Route = Get("/api/file-changes?root=~close-friends&since=0");
+/// `{entry}` moved to the top level of alice's `close-friends` room (another drive).
+const MOVE_TO_CF: Route = Call(
+	"PATCH",
+	"/api/files/{entry}",
+	r#"{"parentId":null,"channel":"@alice.test~close-friends"}"#,
+);
+/// A CRDT created at the main drive's top level (no parent, no channel).
+const MAIN_CREATE: &str =
+	r#"{"fileTp":"CRDT","contentType":"cloudillo/quillo","fileName":"zqm-drive-main"}"#;
+
+/// The change feed on a folder root (`folder@alice`) the credential cannot read, or holds
+/// scoped to something other than that folder (doc link, doc `file:` key, app token), or as a
+/// guest or `idp_` key. Keys and links scoped to the folder itself are MG-743..MG-745.
+const CHANGES_ROUTES: &[(&str, Route)] = &[("MG-711", CHANGES_ENTRY)];
+const CHANGES_DENIED: &[&str] = &[
+	"anon@alice",
+	"stranger@alice",
+	"follower@alice",
+	"g_read@alice",
+	"via-embed@alice",
+	"sharelink-r@alice",
+	"sharelink-w@alice",
+	"owner-scoped-r@alice",
+	"idp-key@alice",
+	"idp-ident@alice",
+	"apikey-file@alice",
+	"apkg-publish@alice",
+];
+
+/// Content replace and version routes; `{entry}` is a BLOB. `f1~zqm-nover` is in no history.
+const VER_LIST: Route = Call("GET", "/api/files/{entry}/versions", "");
+const VER_PUT: Route = Call("PUT", "/api/files/{entry}/content", "zqm");
+const VER_GET: Route = Call("GET", "/api/files/{entry}/versions/f1~zqm-nover", "");
+const VER_RESTORE: Route = Call("POST", "/api/files/{entry}/versions/f1~zqm-nover/restore", "");
+const VER_COPY: Route =
+	Call("POST", "/api/files/{entry}/duplicate", r#"{"fromVersion":"f1~zqm-nover"}"#);
+/// A BLOB in a community folder, which a contributor writes (MG-287).
+const VER_CLUB: &str = "folderchild-blob-d-active@club";
 
 const PATCH_QUOTA: Route =
 	Call("PATCH", "/api/admin/tenants/trash.test", r#"{"storageQuotaOverride":1073741824}"#);
@@ -2740,8 +2979,8 @@ const PATCH_QUOTA_CLEAR: Route =
 	Call("PATCH", "/api/admin/tenants/trash.test", r#"{"storageQuotaOverride":null}"#);
 const ADMIN_ROTATE: Route =
 	Call("POST", "/api/admin/tenants/trash.test/signing-keys/rotations", "");
-const UPLOAD_RESTORE: Route = Call("POST", "/api/uploads/file?name=restore", "zqm");
-const UPLOAD_NO_PARENT: Route = Call("POST", "/api/uploads/file?name=zqm-dev.txt", "zqm");
+const UPLOAD_RESTORE: Route = Call("POST", "/api/uploads/standard?name=restore", "zqm");
+const UPLOAD_NO_PARENT: Route = Call("POST", "/api/uploads/standard?name=zqm-dev.txt", "zqm");
 const ACTIVATE_UNKNOWN: Route =
 	Call("POST", "/api/idp/activations", r#"{"refId":"zqref-unknown"}"#);
 
@@ -3060,6 +3299,30 @@ const SHARE_WRITE_DENIED: &[&str] = &[
 	"sharelink-w@alice",
 ];
 
+/// The version routes refused to every [`VERSION_DENIED`] credential: no write access, or a
+/// scope whose root does not strictly contain the object (doc share link, `idp_` key, doc
+/// `file:` key, app token, the folder-rooted `device@alice` on a BLOB outside its folder).
+const VERSION_ROUTES: &[(&str, Route)] = &[
+	("MG-706", VER_LIST),
+	("MG-707", VER_PUT),
+	("MG-708", VER_GET),
+	("MG-709", VER_RESTORE),
+	("MG-710", VER_COPY),
+];
+const VERSION_DENIED: &[&str] = &[
+	"anon@alice",
+	"stranger@alice",
+	"follower@alice",
+	"g_read@alice",
+	"sharelink-r@alice",
+	"sharelink-w@alice",
+	"idp-ident@alice",
+	"idp-key@alice",
+	"apikey-file@alice",
+	"apkg-publish@alice",
+	"device@alice",
+];
+
 /// The account's own PIM, sites, refs, apps and push: never a link's or an `idp_` key's.
 const ACCOUNT_ROUTES: &[(&str, Route)] = &[
 	("MG-383", ADDR_BOOKS),
@@ -3151,6 +3414,8 @@ const GRIDS: &[(GridRoutes, &[&str], &str)] = &[
 	(ADMIN_SETTINGS_ROUTES, ADMIN_SETTINGS_DENIED, ""),
 	(READABLE_ALL_ROUTES, READABLE_ALL_DENIED, ""),
 	(SHARE_WRITE_ROUTES, SHARE_WRITE_DENIED, "tenant-blob-d-active@alice"),
+	(VERSION_ROUTES, VERSION_DENIED, "tenant-blob-d-active@alice"),
+	(CHANGES_ROUTES, CHANGES_DENIED, "folder@alice"),
 	(CHAN_WRITE_ALICE, CHAN_WRITE_ALICE_DENIED, ""),
 ];
 

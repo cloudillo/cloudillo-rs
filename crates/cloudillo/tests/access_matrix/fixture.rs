@@ -36,7 +36,8 @@ use cloudillo::meta_adapter::{
 use cloudillo::settings::SettingValue;
 use cloudillo::types::{Patch, Timestamp, TnId};
 use cloudillo::websocket::{
-	AccessQuery, WsKind, ws_bus_admission, ws_file_access, ws_prepare_store,
+	AccessQuery, WsKind, ws_bus_admission, ws_file_access, ws_file_changes_admission,
+	ws_prepare_store,
 };
 use cloudillo::{App, AppBuilder, worker};
 use cloudillo_auth_adapter_sqlite::AuthAdapterSqlite;
@@ -326,7 +327,7 @@ pub struct Fixture {
 	pub app: App,
 	pub api: Router,
 	/// ws probe router: `/ws/{crdt|rtdb}/{file_id}` → `{"ok": level}` / `{"deny": "..."}`;
-	/// `/ws/bus` → 200 / 403.
+	/// `/ws/bus`, `/ws/file-changes` → 200 / 403.
 	pub ws: Router,
 	pub tenants: Tenants,
 	pub objs: Vec<Obj>,
@@ -365,10 +366,10 @@ async fn build() -> Fixture {
 	let _ = tracing_subscriber::fmt()
 		// Plain stderr bypasses libtest capture, so the per-family summary always shows.
 		.with_writer(std::io::stderr)
-		.with_env_filter(
-			EnvFilter::try_from_default_env()
-				.unwrap_or_else(|_| EnvFilter::new("off,access_matrix=info")),
-		)
+		// The meta adapter's warnings carry the SQLite error behind a bare `DbError`.
+		.with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+			EnvFilter::new("off,access_matrix=info,cloudillo_meta_adapter_sqlite=warn")
+		}))
 		.try_init();
 
 	let tmp = tempfile::tempdir().unwrap();
@@ -694,6 +695,7 @@ fn ws_probe(app: App) -> Router {
 	Router::new()
 		.route("/ws/{kind}/{id}", get(ws_probe_handler))
 		.route("/ws/bus", get(ws_bus_probe))
+		.route("/ws/file-changes", get(ws_file_changes_probe))
 		.route_layer(axum::middleware::from_fn_with_state(
 			app.clone(),
 			cloudillo_core::middleware::optional_auth,
@@ -704,6 +706,15 @@ fn ws_probe(app: App) -> Router {
 /// `get_ws_bus`'s pre-upgrade decision.
 async fn ws_bus_probe(IdTag(tenant): IdTag, OptionalAuth(auth): OptionalAuth) -> StatusCode {
 	let admitted = auth.as_ref().is_some_and(|a| ws_bus_admission(a, &tenant));
+	if admitted { StatusCode::OK } else { StatusCode::FORBIDDEN }
+}
+
+/// `get_ws_file_changes`'s pre-upgrade decision.
+async fn ws_file_changes_probe(
+	IdTag(tenant): IdTag,
+	OptionalAuth(auth): OptionalAuth,
+) -> StatusCode {
+	let admitted = auth.as_ref().is_some_and(|a| ws_file_changes_admission(a, &tenant));
 	if admitted { StatusCode::OK } else { StatusCode::FORBIDDEN }
 }
 

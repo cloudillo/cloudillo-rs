@@ -13,6 +13,7 @@ readme = "../../README.md"
 
 [dependencies]
 cloudillo-core = { workspace = true }
+cloudillo-file = { workspace = true }
 cloudillo-types = { workspace = true }
 cloudillo-email = { workspace = true }
 cloudillo-ref = { workspace = true }
@@ -40,3 +41,6 @@ webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"]
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "time"] }

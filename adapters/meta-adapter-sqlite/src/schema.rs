@@ -451,7 +451,7 @@ async fn migrate_v58_entries(tx: &mut Transaction<'_, Sqlite>) -> Result<(), sql
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 63;
+	const CURRENT_DB_VERSION: i64 = 65;
 
 	let mut tx = db.begin().await?;
 
@@ -717,6 +717,55 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	)
 	.execute(&mut *tx)
 	.await?;
+	// Change feed cursor (`list_entry_changes`).
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_entries_updated ON entries(tn_id, updated_at)")
+		.execute(&mut *tx)
+		.await?;
+	// Last tombstone hard-purge per tenant: change-feed cursors older than this are stale.
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS entry_purges (
+			tn_id integer PRIMARY KEY,
+			purged_at integer NOT NULL
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	// Entry history: content an entry pointed at before a replace. A GC reference: the orphan
+	// sweep keeps content any row here names. Pruned by the `file.version_*` settings.
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS entry_versions (
+			tn_id integer NOT NULL,
+			e_id integer NOT NULL,		-- entries.e_id
+			f_id integer NOT NULL,		-- files.f_id of the replaced content
+			replaced_at integer NOT NULL DEFAULT (unixepoch()),
+			replaced_by text,			-- id_tag of the caller who replaced it
+			size integer,				-- orig variant size in bytes
+			PRIMARY KEY(tn_id, e_id, f_id)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+	sqlx::query("CREATE INDEX IF NOT EXISTS idx_entry_versions_f ON entry_versions(f_id)")
+		.execute(&mut *tx)
+		.await?;
+
+	// Replace in flight: new content (no entry yet) waiting for `finalize_file` to swap it into
+	// entry `e_id`. A GC reference; rows older than the scratch window are dropped by the GC.
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS pending_replaces (
+			tn_id integer NOT NULL,
+			f_id integer NOT NULL,		-- the new, not yet finalized content
+			e_id integer NOT NULL,
+			expected_f_id integer NOT NULL,
+			replaced_by text,
+			max_history_size integer,	-- bytes; the old content goes to history only up to this
+			created_at integer NOT NULL DEFAULT (unixepoch()),
+			PRIMARY KEY(tn_id, f_id)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
+
 	// Note: idx_files_root is created in migration 10 after the root_id column is added
 	// Do NOT add it here as it would fail for existing databases being migrated
 
@@ -3240,6 +3289,16 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	if version < 63 {
 		// notifications table (created idempotently in init_db)
 		set_db_version(&mut tx, 63).await?;
+	}
+
+	if version < 64 {
+		// entry_versions + pending_replaces tables (created idempotently in init_db)
+		set_db_version(&mut tx, 64).await?;
+	}
+
+	if version < 65 {
+		// idx_entries_updated + entry_purges (created idempotently in init_db)
+		set_db_version(&mut tx, 65).await?;
 	}
 
 	// Unversioned and idempotent: a DB that reached v58 on a pre-rename build still has

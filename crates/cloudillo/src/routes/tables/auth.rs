@@ -16,6 +16,10 @@
 //! | `/api/auth/login/qr/{sessionId}`     | `qr_login_status()` ᴽ | | | |
 //! | `/api/auth/login/qr/{sessionId}/details` | `session()` ᴱ | | | |
 //! | `/api/auth/login/qr/{sessionId}/respond` | | `session()` ᴱ | | |
+//! | `/api/auth/pair`                     | | `public_login()` ᴿ | | |
+//! | `/api/auth/pair/{sessionId}`         | `qr_login_status()` ᴽ | | | |
+//! | `/api/auth/pair/{sessionId}/details` | `session()` ᴱ | | | |
+//! | `/api/auth/pair/{sessionId}/respond` | | `session()` ᴱ | | |
 //! | `/api/auth/session/renew`            | | `public_login()` ᴿ | | |
 //! | `/api/auth/logout`                   | | `session()` ᴱ | | |
 //! | `/api/auth/password`                 | | `session()` ᴱ | | |
@@ -26,6 +30,7 @@
 //! | `/api/auth/passkeys/{passkeyId}`     | | | | `owner_credentials()` ᵀ |
 //! | `/api/auth/api-keys`                 | `owner_credentials()` ᵀ | `owner_credentials()` ᵀ | | |
 //! | `/api/auth/api-keys/{apiKeyId}`      | `owner_credentials()` ᵀ | | `owner_credentials()` ᵀ | `owner_credentials()` ᵀ |
+//! | `/api/auth/current-api-key`          | | | | `session()` ᴱ |
 //! | `/api/auth/signing-keys`             | `owner_credentials()` ᵀ | | | |
 //! | `/api/auth/signing-keys/rotations`   | | `owner_credentials()` ᵀ | | |
 //! | `/api/auth/signing-keys/{keyId}/revoke` | | `owner_credentials()` ᵀ | | |
@@ -55,7 +60,7 @@ use axum::{
 	routing::{delete, get, post},
 };
 
-use crate::auth::{api_key, audit, handler, keys, qr_login, totp, webauthn};
+use crate::auth::{api_key, audit, handler, keys, qr_login, qr_pair, totp, webauthn};
 use crate::prelude::*;
 use crate::push;
 
@@ -83,6 +88,13 @@ pub(crate) fn session() -> Router<App> {
 		.route("/api/onboarding/complete", post(handler::post_complete_onboarding))
 		.route("/api/auth/login/qr/{sessionId}/details", get(qr_login::get_details))
 		.route("/api/auth/login/qr/{sessionId}/respond", post(qr_login::post_respond))
+		// Pairing approval: the handlers require `is_tenant_account` and the session's tenant.
+		.route("/api/auth/pair/{sessionId}/details", get(qr_pair::get_pair_details))
+		.route("/api/auth/pair/{sessionId}/respond", post(qr_pair::post_pair_respond))
+		// A tenant API key deleting itself — any scope may (see `scope_permits`), so not in
+		// `owner_credentials()`, whose `require_tenant_self` refuses scoped callers. The
+		// handler refuses every credential but a `cl_` bearer key.
+		.route("/api/auth/current-api-key", delete(api_key::delete_self_api_key))
 }
 
 /// Credentials that control the tenant itself — gated by `require_tenant_self`.
@@ -132,12 +144,15 @@ pub(crate) fn public_login() -> Router<App> {
 		.route("/api/auth/login/mfa", post(handler::post_login_mfa))
 		.route("/api/auth/session/renew", post(handler::post_session_renew))
 		.route("/api/auth/login/qr", post(qr_login::post_init))
+		.route("/api/auth/pair", post(qr_pair::post_pair_init))
 }
 
-/// QR-login status long-poll. Its own `"qr_poll"` bucket: an idle `/login` tab
-/// polls ~4/min, which in `"auth"` would lock out real logins behind one NAT.
+/// QR-login and QR-pairing status long-polls. Their own `"qr_poll"` bucket: an idle
+/// `/login` tab polls ~4/min, which in `"auth"` would lock out real logins behind one NAT.
 pub(crate) fn qr_login_status() -> Router<App> {
-	Router::new().route("/api/auth/login/qr/{sessionId}", get(qr_login::get_status))
+	Router::new()
+		.route("/api/auth/login/qr/{sessionId}", get(qr_login::get_status))
+		.route("/api/auth/pair/{sessionId}", get(qr_pair::get_pair_status))
 }
 
 /// Server-to-server token exchange. Called in batches during federation, so it

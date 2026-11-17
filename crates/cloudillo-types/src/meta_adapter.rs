@@ -1009,6 +1009,36 @@ pub struct ContentInfo {
 	pub has_entries: bool,
 }
 
+/// One row of an entry's content history ([`MetaAdapter::list_entry_versions`]).
+#[derive(Debug, Clone)]
+pub struct EntryVersion {
+	/// Content id (`files.file_id`) the entry pointed at before it was replaced.
+	pub file_id: Box<str>,
+	pub replaced_at: Timestamp,
+	/// id_tag of the caller who replaced it.
+	pub replaced_by: Option<Box<str>>,
+	/// `orig` variant size in bytes.
+	pub size: Option<u64>,
+}
+
+/// One row of the change feed ([`MetaAdapter::list_entry_changes`]).
+#[derive(Debug, Clone)]
+pub struct EntryChange {
+	pub view: FileView,
+	pub e_id: u64,
+	pub updated_at: Timestamp,
+	/// Same as `view.status`; tombstones ('D') are included.
+	pub status: FileStatus,
+}
+
+/// Result of [`MetaAdapter::list_entry_changes`].
+#[derive(Debug, Clone)]
+pub struct EntryChanges {
+	pub rows: Vec<EntryChange>,
+	/// When the tenant's tombstones were last hard-purged; a cursor older than this is stale.
+	pub purged_at: Option<Timestamp>,
+}
+
 /// Result of [`MetaAdapter::resolve_file`].
 #[derive(Debug)]
 pub enum FileResolution {
@@ -1109,6 +1139,10 @@ pub struct FileView {
 	pub file_name: Box<str>,
 	#[serde(default, rename = "fileType")]
 	pub file_tp: Option<Box<str>>, // 'BLOB', 'CRDT', 'RTDB', 'FLDR'
+	/// Bytes of the current `orig` content; `None` for folders, references, CRDT/RTDB and pending
+	/// uploads.
+	#[serde(default)]
+	pub size: Option<u64>,
 	pub created_at: ApiTime,
 	#[serde(default)]
 	pub accessed_at: Option<ApiTime>, // Global: when anyone last accessed
@@ -2753,6 +2787,12 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// `upstream_tag`), the entry is repointed to it, the pending row's variants move over where
 	/// the existing content lacks an available one, and the pending `files` row stays as a
 	/// `merged_into` redirect.
+	///
+	/// Content made by [`Self::create_pending_replace`] is swapped into its entry in the same
+	/// transaction (the merged-into content when deduped): the old content goes to history when
+	/// the entry still points at the expected content. Otherwise (another replace won, or the
+	/// entry was trashed) the new content goes into the same entry's history, leaving its
+	/// current content alone; a tombstoned entry keeps nothing. No new entry is ever created.
 	async fn finalize_file(&self, tn_id: TnId, f_id: u64, file_id: &str) -> ClResult<()>;
 
 	/// `(e_id, f_id)` of entries whose `parent_id` (an **entry** id, e.g. the sentinel
@@ -2804,15 +2844,31 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	/// for the caller to reindex. `None` when absent.
 	async fn hard_delete_file(&self, tn_id: TnId, e_id: u64) -> ClResult<Option<Box<str>>>;
 
-	/// Delete content (`files` rows and their `file_variants`) no entry references and last
-	/// touched before `before`, plus dedup redirects pointing at it. Returns the reaped content
-	/// ids. The blob sweep reclaims the bytes.
+	/// Delete content (`files` rows and their `file_variants`) no entry, `entry_versions` row or
+	/// `pending_replaces` row references and last touched before `before`, plus dedup redirects
+	/// pointing at it. Returns the reaped content ids. The blob sweep reclaims the bytes.
 	async fn reap_orphan_files(&self, tn_id: TnId, before: Timestamp) -> ClResult<Vec<Box<str>>>;
 
 	/// Hard-delete every tombstoned (`status = 'D'`) entry, as [`Self::hard_delete_file`] does, in
 	/// one transaction. Content they leave unreferenced goes with [`Self::reap_orphan_files`].
 	/// Returns the number purged.
 	async fn purge_tombstones(&self, tn_id: TnId) -> ClResult<u64>;
+
+	/// Entries (any status, managed excluded) with `updated_at >= since`, ordered by
+	/// `(updated_at, e_id)`, at most `limit`. `after` (an entry id) is the keyset tie-break: rows
+	/// at exactly `since` with `e_id` at or below its `e_id` are skipped; an unknown `after` is
+	/// ignored. `purged_at` is the tenant's last tombstone purge.
+	///
+	/// Not gap-free: `updated_at` is stamped before the write commits. A fresh feed request
+	/// rewinds 10s to catch writes that commit late; a write committed more than 10s after it
+	/// was stamped can still be missed.
+	async fn list_entry_changes(
+		&self,
+		tn_id: TnId,
+		since: Timestamp,
+		after: Option<&str>,
+		limit: u32,
+	) -> ClResult<EntryChanges>;
 
 	/// A new entry over existing content `file_id` (BLOB), placed from `opts`'s placement fields.
 	/// No content row is written. `NotFound` for unknown content. Returns the entry id.
@@ -2822,6 +2878,63 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		file_id: &str,
 		opts: CreateFile,
 	) -> ClResult<Box<str>>;
+
+	/// Start replacing BLOB entry `entry_id`'s content: create new content (no entry, `file_id`
+	/// unset, `preset` / `content_type` / `x` / `root_id` from `content`) and its
+	/// `pending_replaces` row, swapped in by [`Self::finalize_file`]. `max_history_size` (bytes)
+	/// caps the old content kept as a version. `PreconditionFailed` when the entry's current
+	/// content id is not `expected_file_id`, `NotFound` for an unknown, trashed or deleted entry
+	/// or one without content, `ValidationError` for a non-BLOB entry. Returns the new content `f_id`.
+	/// `replaced_by` is `None` for a share-link / via-embed caller (no holder identity).
+	async fn create_pending_replace(
+		&self,
+		tn_id: TnId,
+		entry_id: &str,
+		expected_file_id: &str,
+		content: CreateFile,
+		replaced_by: Option<&str>,
+		max_history_size: u64,
+	) -> ClResult<u64>;
+
+	/// Content `f_id`'s `(root_id, replaced_by)` (replace content from
+	/// [`Self::create_pending_replace`]). `replaced_by` is `None` once finalized: the pending row
+	/// is consumed. `None` only when no `files` row exists.
+	async fn read_pending_replace(
+		&self,
+		tn_id: TnId,
+		f_id: u64,
+	) -> ClResult<Option<(Option<Box<str>>, Option<Box<str>>)>>;
+
+	/// Entry `entry_id`'s content history, newest first. Empty for an unknown entry.
+	async fn list_entry_versions(&self, tn_id: TnId, entry_id: &str)
+	-> ClResult<Vec<EntryVersion>>;
+
+	/// Point entry `entry_id` back at `file_id` from its history (dropping that history row);
+	/// the current content always goes to history (no size cap), so a restore can be undone.
+	/// `PreconditionFailed` when `expected_file_id` is given and not the current content id,
+	/// `NotFound` when the entry or the version is unknown, or the entry is trashed or deleted.
+	async fn restore_entry_version(
+		&self,
+		tn_id: TnId,
+		entry_id: &str,
+		file_id: &str,
+		expected_file_id: Option<&str>,
+		replaced_by: Option<&str>,
+	) -> ClResult<()>;
+
+	/// Drop history rows beyond each entry's newest `keep_count`, and any replaced before
+	/// `older_than`. Returns the number dropped; their content goes with
+	/// [`Self::reap_orphan_files`].
+	async fn prune_entry_versions(
+		&self,
+		tn_id: TnId,
+		keep_count: u32,
+		older_than: Timestamp,
+	) -> ClResult<u64>;
+
+	/// Drop `pending_replaces` rows created before `before` (processing never finished), so
+	/// their content becomes an orphan. Returns the number dropped.
+	async fn purge_stale_pending_replaces(&self, tn_id: TnId, before: Timestamp) -> ClResult<u64>;
 
 	/// Add a managed attachment entry (`parent_id` = [`MANAGED_PARENT_ID`]) for content
 	/// `file_id`, named `file_name`, owned by `action_id` (`None`: a profile pic mirror, kept by

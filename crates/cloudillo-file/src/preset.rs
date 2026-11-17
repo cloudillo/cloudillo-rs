@@ -1,20 +1,23 @@
 // SPDX-FileCopyrightText: Szilárd Hajba
 // SPDX-License-Identifier: MPL-2.0
 
-//! File processing presets for different use cases.
+//! File processing presets and upload profiles.
 //!
-//! Presets define which variants to generate for different media types
-//! and use cases (e.g., "default", "podcast", "archive").
+//! A *profile* (`orig`, `preview`, `standard`, `high`, `compact`, or a tenant-defined one in
+//! the `file.profiles` setting) accepts every media class and says how much processing each
+//! class gets. A *purpose preset* (`profile-picture`, `cover`, `thumbnail-only`, `apkg`,
+//! `site`) is a fixed system-internal recipe. Both resolve into a [`FilePreset`].
 
 use serde::{Deserialize, Serialize};
 
 use crate::image::ImageFormat;
+use crate::prelude::*;
 use crate::variant::VariantClass;
 
 /// File processing preset configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilePreset {
-	/// Preset name (e.g., "default", "podcast", "archive")
+	/// Preset or profile name (e.g., "standard", "cover")
 	pub name: String,
 	/// Allowed media classes for upload (e.g., [Visual, Video, Audio])
 	pub allowed_media_classes: Vec<VariantClass>,
@@ -36,180 +39,9 @@ pub struct FilePreset {
 	pub store_original: bool,
 }
 
-impl Default for FilePreset {
-	fn default() -> Self {
-		Self {
-			name: "default".to_string(),
-			allowed_media_classes: vec![
-				VariantClass::Visual,
-				VariantClass::Video,
-				VariantClass::Audio,
-				VariantClass::Document,
-			],
-			image_variants: vec![
-				"vis.tn".into(),
-				"vis.sd".into(),
-				"vis.md".into(),
-				"vis.hd".into(),
-			],
-			video_variants: vec!["vid.sd".into(), "vid.md".into(), "vid.hd".into()],
-			audio_variants: vec!["aud.md".into()],
-			extract_audio: false,
-			generate_thumbnail: true,
-			max_variant: Some("vid.hd".into()),
-			thumbnail_variant: Some("vis.tn".into()),
-			store_original: true,
-		}
-	}
-}
-
-/// Built-in presets
+/// Purpose presets (system-internal, not tenant-configurable)
 pub mod presets {
 	use super::{FilePreset, VariantClass};
-
-	/// Default preset - balanced quality and storage
-	pub fn default() -> FilePreset {
-		FilePreset::default()
-	}
-
-	/// File preset - generic uploads from the Files app. Processes known media
-	/// (images/video/audio/PDF) into variants, and stores any other type as a Raw
-	/// BLOB so arbitrary binaries (zip, bin, etc.) can be uploaded.
-	pub fn file() -> FilePreset {
-		FilePreset {
-			name: "file".to_string(),
-			allowed_media_classes: vec![
-				VariantClass::Visual,
-				VariantClass::Video,
-				VariantClass::Audio,
-				VariantClass::Document,
-				VariantClass::Raw,
-			],
-			image_variants: vec![
-				"vis.tn".into(),
-				"vis.sd".into(),
-				"vis.md".into(),
-				"vis.hd".into(),
-			],
-			video_variants: vec!["vid.sd".into(), "vid.md".into(), "vid.hd".into()],
-			audio_variants: vec!["aud.md".into()],
-			extract_audio: false,
-			generate_thumbnail: true,
-			max_variant: Some("vid.hd".into()),
-			thumbnail_variant: Some("vis.tn".into()),
-			store_original: true,
-		}
-	}
-
-	/// Podcast preset - prioritizes audio extraction and quality
-	pub fn podcast() -> FilePreset {
-		FilePreset {
-			name: "podcast".to_string(),
-			allowed_media_classes: vec![VariantClass::Audio, VariantClass::Video],
-			image_variants: vec!["vis.tn".into()], // Just thumbnail for audio-focused
-			video_variants: vec!["vid.sd".into()],
-			audio_variants: vec!["aud.sd".into(), "aud.md".into(), "aud.hd".into()],
-			extract_audio: true,
-			generate_thumbnail: true,
-			max_variant: Some("vid.sd".into()),
-			thumbnail_variant: Some("vis.tn".into()),
-			store_original: true,
-		}
-	}
-
-	/// Archive preset - keep original only, minimal processing (allows all types including raw)
-	pub fn archive() -> FilePreset {
-		FilePreset {
-			name: "archive".to_string(),
-			allowed_media_classes: vec![
-				VariantClass::Visual,
-				VariantClass::Video,
-				VariantClass::Audio,
-				VariantClass::Document,
-				VariantClass::Raw,
-			],
-			image_variants: vec!["vis.tn".into()], // Minimal processing
-			video_variants: vec![],
-			audio_variants: vec![],
-			extract_audio: false,
-			generate_thumbnail: true,
-			max_variant: None, // Keep original only
-			thumbnail_variant: Some("vis.tn".into()),
-			store_original: true, // Archive always stores original
-		}
-	}
-
-	/// High quality preset - maximum quality variants
-	pub fn high_quality() -> FilePreset {
-		FilePreset {
-			name: "high_quality".to_string(),
-			allowed_media_classes: vec![
-				VariantClass::Visual,
-				VariantClass::Video,
-				VariantClass::Audio,
-			],
-			image_variants: vec![
-				"vis.tn".into(),
-				"vis.sd".into(),
-				"vis.md".into(),
-				"vis.hd".into(),
-				"vis.xd".into(),
-			],
-			video_variants: vec![
-				"vid.sd".into(),
-				"vid.md".into(),
-				"vid.hd".into(),
-				"vid.xd".into(),
-			],
-			audio_variants: vec!["aud.md".into(), "aud.hd".into()],
-			extract_audio: false,
-			generate_thumbnail: true,
-			max_variant: Some("vid.xd".into()),
-			thumbnail_variant: Some("vis.tn".into()),
-			store_original: true,
-		}
-	}
-
-	/// Mobile preset - optimized for mobile devices and bandwidth
-	pub fn mobile() -> FilePreset {
-		FilePreset {
-			name: "mobile".to_string(),
-			allowed_media_classes: vec![
-				VariantClass::Visual,
-				VariantClass::Video,
-				VariantClass::Audio,
-			],
-			image_variants: vec!["vis.tn".into(), "vis.sd".into(), "vis.md".into()],
-			video_variants: vec!["vid.sd".into(), "vid.md".into()],
-			audio_variants: vec!["aud.sd".into()],
-			extract_audio: false,
-			generate_thumbnail: true,
-			max_variant: Some("vid.md".into()),
-			thumbnail_variant: Some("vis.tn".into()),
-			store_original: false, // Mobile optimization - minimize storage
-		}
-	}
-
-	/// Video preset - video-focused, no separate audio track extraction
-	pub fn video() -> FilePreset {
-		FilePreset {
-			name: "video".to_string(),
-			allowed_media_classes: vec![VariantClass::Video],
-			image_variants: vec![
-				"vis.tn".into(),
-				"vis.sd".into(),
-				"vis.md".into(),
-				"vis.hd".into(),
-			],
-			video_variants: vec!["vid.sd".into(), "vid.md".into(), "vid.hd".into()],
-			audio_variants: vec![], // No separate audio variants
-			extract_audio: false,   // Don't extract audio track
-			generate_thumbnail: true,
-			max_variant: Some("vid.hd".into()),
-			thumbnail_variant: Some("vis.tn".into()),
-			store_original: true,
-		}
-	}
 
 	/// Profile picture preset - includes vis.pf variant for small profile thumbnails
 	pub fn profile_picture() -> FilePreset {
@@ -251,28 +83,6 @@ pub mod presets {
 			max_variant: Some("vis.hd".into()),
 			thumbnail_variant: Some("vis.tn".into()),
 			store_original: false, // Generated variants are sufficient
-		}
-	}
-
-	/// Original-only preset - store original as-is, no processing at all
-	pub fn orig_only() -> FilePreset {
-		FilePreset {
-			name: "orig-only".to_string(),
-			allowed_media_classes: vec![
-				VariantClass::Visual,
-				VariantClass::Video,
-				VariantClass::Audio,
-				VariantClass::Document,
-				VariantClass::Raw,
-			],
-			image_variants: vec![],
-			video_variants: vec![],
-			audio_variants: vec![],
-			extract_audio: false,
-			generate_thumbnail: false,
-			max_variant: None,
-			thumbnail_variant: None,
-			store_original: true,
 		}
 	}
 
@@ -333,44 +143,210 @@ pub mod presets {
 		}
 	}
 
-	/// Get preset by name
+	/// Get purpose preset by name
 	pub fn get(name: &str) -> Option<FilePreset> {
 		match name {
-			"default" => Some(default()),
-			"file" => Some(file()),
-			"podcast" => Some(podcast()),
-			"archive" => Some(archive()),
-			"high_quality" => Some(high_quality()),
-			"mobile" => Some(mobile()),
-			"video" => Some(video()),
 			"profile-picture" => Some(profile_picture()),
 			"cover" => Some(cover()),
-			"orig-only" => Some(orig_only()),
 			"thumbnail-only" => Some(thumbnail_only()),
 			"apkg" => Some(apkg()),
 			"site" => Some(site()),
 			_ => None,
 		}
 	}
+}
 
-	/// List all available preset names
-	pub fn list() -> Vec<&'static str> {
-		vec![
-			"default",
-			"file",
-			"podcast",
-			"archive",
-			"high_quality",
-			"mobile",
-			"video",
-			"profile-picture",
-			"cover",
-			"orig-only",
-			"thumbnail-only",
-			"apkg",
-			"site",
-		]
+/// Upload profile: how much processing each media class gets.
+///
+/// Levels are bare tier names (`"hd"`), `None` = no variants for that class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Profile {
+	/// Store the original blob
+	pub orig: bool,
+	/// Visual level: tn, sd, md, hd, xd
+	pub vis: Option<String>,
+	/// Video level: sd, md, hd, xd
+	pub vid: Option<String>,
+	/// Audio level: sd, md, hd
+	pub aud: Option<String>,
+	/// Generate a `vis.tn` thumbnail
+	pub thumb: bool,
+	/// Extract the audio track from video
+	pub extract_audio: bool,
+}
+
+/// Visual level ladder, lowest first
+pub const VIS_LADDER: &[&str] = &["tn", "sd", "md", "hd", "xd"];
+/// Video level ladder, lowest first
+pub const VID_LADDER: &[&str] = &["sd", "md", "hd", "xd"];
+/// Audio level ladder, lowest first
+pub const AUD_LADDER: &[&str] = &["sd", "md", "hd"];
+
+/// Profile name stored for federated sync mirrors; never a valid profile name.
+pub const RESERVED_SYNC: &str = "sync";
+
+/// Fallback profile for stored names that no longer resolve
+pub const DEFAULT_PROFILE: &str = "standard";
+
+fn profile(orig: bool, vis: Option<&str>, vid: Option<&str>, aud: Option<&str>) -> Profile {
+	Profile {
+		orig,
+		vis: vis.map(String::from),
+		vid: vid.map(String::from),
+		aud: aud.map(String::from),
+		thumb: vis.is_some(),
+		extract_audio: false,
 	}
+}
+
+/// Built-in profiles (code defaults; tenants override them field-wise in `file.profiles`)
+pub fn builtin_profiles() -> [(&'static str, Profile); 5] {
+	[
+		("orig", profile(true, None, None, None)),
+		("preview", profile(true, Some("tn"), None, None)),
+		("standard", standard_profile()),
+		("high", profile(true, Some("xd"), Some("xd"), Some("hd"))),
+		("compact", profile(false, Some("md"), Some("md"), Some("sd"))),
+	]
+}
+
+fn builtin_profile(name: &str) -> Option<Profile> {
+	builtin_profiles().into_iter().find(|(n, _)| *n == name).map(|(_, p)| p)
+}
+
+fn standard_profile() -> Profile {
+	profile(true, Some("hd"), Some("hd"), Some("md"))
+}
+
+/// Expand a level into the variant list for its class.
+///
+/// vis/vid: every rung up to the level. aud: from `md` upward, `sd` only when the level is `sd`.
+fn expand(class: &str, ladder: &[&str], level: Option<&str>) -> Vec<String> {
+	let Some(idx) = level.and_then(|l| ladder.iter().position(|r| *r == l)) else {
+		return Vec::new();
+	};
+	let start = usize::from(class == "aud" && idx > 0);
+	let rungs = if class == "aud" && idx == 0 { &ladder[..1] } else { &ladder[start..=idx] };
+	rungs.iter().map(|r| format!("{class}.{r}")).collect()
+}
+
+/// Turn a profile into the runtime processing descriptor
+pub fn profile_to_preset(name: &str, p: &Profile) -> FilePreset {
+	FilePreset {
+		name: name.to_string(),
+		allowed_media_classes: vec![
+			VariantClass::Visual,
+			VariantClass::Video,
+			VariantClass::Audio,
+			VariantClass::Document,
+			VariantClass::Raw,
+		],
+		image_variants: expand("vis", VIS_LADDER, p.vis.as_deref()),
+		video_variants: expand("vid", VID_LADDER, p.vid.as_deref()),
+		audio_variants: expand("aud", AUD_LADDER, p.aud.as_deref()),
+		extract_audio: p.extract_audio,
+		generate_thumbnail: p.thumb,
+		max_variant: p.vid.as_deref().map(|l| format!("vid.{l}")),
+		thumbnail_variant: p.thumb.then(|| "vis.tn".to_string()),
+		store_original: p.orig,
+	}
+}
+
+/// Syntax of a profile name: lowercase, digits, `-`; 1-32 bytes. Also checks names of profiles
+/// that live on another tenant (`rfile:` keys).
+pub fn check_name_syntax(name: &str) -> ClResult<()> {
+	let valid_chars =
+		name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+	if name.is_empty() || name.len() > 32 || !valid_chars {
+		return Err(Error::ValidationError(format!("invalid profile name '{name}'")));
+	}
+	Ok(())
+}
+
+fn check_name(name: &str) -> ClResult<()> {
+	check_name_syntax(name)?;
+	if name == RESERVED_SYNC || presets::get(name).is_some() {
+		return Err(Error::ValidationError(format!("profile name '{name}' is reserved")));
+	}
+	Ok(())
+}
+
+fn check_level(name: &str, class: &str, ladder: &[&str], level: Option<&str>) -> ClResult<()> {
+	match level {
+		Some(l) if !ladder.contains(&l) => {
+			Err(Error::ValidationError(format!("profile '{name}': unknown {class} level '{l}'")))
+		}
+		_ => Ok(()),
+	}
+}
+
+/// Parse one `file.profiles` entry, merged field-wise over the built-in of the same name
+/// (or over `standard` for a custom name).
+fn parse_profile(name: &str, entry: &serde_json::Value) -> ClResult<Profile> {
+	check_name(name)?;
+	let Some(fields) = entry.as_object() else {
+		return Err(Error::ValidationError(format!("profile '{name}' must be an object")));
+	};
+	let base = builtin_profile(name).unwrap_or_else(standard_profile);
+	let mut merged = serde_json::to_value(base)
+		.map_err(|e| Error::ValidationError(format!("profile '{name}': {e}")))?;
+	if let Some(obj) = merged.as_object_mut() {
+		obj.extend(fields.clone());
+	}
+	let p: Profile = serde_json::from_value(merged)
+		.map_err(|e| Error::ValidationError(format!("profile '{name}': {e}")))?;
+	check_level(name, "vis", VIS_LADDER, p.vis.as_deref())?;
+	check_level(name, "vid", VID_LADDER, p.vid.as_deref())?;
+	check_level(name, "aud", AUD_LADDER, p.aud.as_deref())?;
+	Ok(p)
+}
+
+/// Validate a whole `file.profiles` value (the settings validator)
+pub fn validate_profiles(value: &serde_json::Value) -> ClResult<()> {
+	let Some(map) = value.as_object() else {
+		return Err(Error::ValidationError("file.profiles must be an object".into()));
+	};
+	for (name, entry) in map {
+		parse_profile(name, entry)?;
+	}
+	Ok(())
+}
+
+/// Find a profile by name: tenant entry merged over its base, else the built-in.
+fn find_profile(overrides: &serde_json::Value, name: &str) -> ClResult<Option<Profile>> {
+	match overrides.get(name) {
+		Some(entry) => parse_profile(name, entry).map(Some),
+		None => Ok(builtin_profile(name)),
+	}
+}
+
+/// Resolve a preset or profile name for an upload.
+///
+/// Purpose preset → profile (tenant `file.profiles` merged over built-in, or custom) →
+/// `InvalidField` (400).
+pub async fn resolve(app: &App, tn_id: TnId, name: &str) -> ClResult<FilePreset> {
+	if let Some(p) = presets::get(name) {
+		return Ok(p);
+	}
+	let overrides = app.settings.get_json(tn_id, "file.profiles").await?;
+	match find_profile(&overrides, name)? {
+		Some(p) => Ok(profile_to_preset(name, &p)),
+		None => Err(Error::InvalidField {
+			field: "preset",
+			message: "unknown preset or profile".into(),
+		}),
+	}
+}
+
+/// Resolve a stored name (which may have been deleted since); falls back to `standard`.
+pub async fn resolve_stored(app: &App, tn_id: TnId, name: Option<&str>) -> FilePreset {
+	if let Some(n) = name
+		&& let Ok(p) = resolve(app, tn_id, n).await
+	{
+		return p;
+	}
+	profile_to_preset(DEFAULT_PROFILE, &standard_profile())
 }
 
 /// Video quality tier with associated settings
@@ -441,49 +417,107 @@ pub fn get_image_tier(variant: &str) -> Option<&'static ImageQualityTier> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use serde_json::json;
 
-	#[test]
-	fn test_default_preset() {
-		let preset = presets::default();
-		assert_eq!(preset.name, "default");
-		assert!(preset.video_variants.contains(&"vid.hd".to_string()));
-		assert!(preset.generate_thumbnail);
+	fn builtin(name: &str) -> FilePreset {
+		profile_to_preset(name, &find_profile(&json!({}), name).unwrap().unwrap())
+	}
+
+	fn v(items: &[&str]) -> Vec<String> {
+		items.iter().map(|s| (*s).to_string()).collect()
 	}
 
 	#[test]
-	fn test_podcast_preset() {
-		let preset = presets::podcast();
-		assert_eq!(preset.name, "podcast");
-		assert!(preset.extract_audio);
-		assert!(preset.audio_variants.contains(&"aud.hd".to_string()));
+	fn test_every_builtin_resolves() {
+		for (name, _) in builtin_profiles() {
+			let p = builtin(name);
+			assert_eq!(p.name, name);
+			assert_eq!(p.allowed_media_classes.len(), 5);
+			assert!(p.allowed_media_classes.contains(&VariantClass::Raw));
+		}
 	}
 
 	#[test]
-	fn test_get_preset() {
-		assert!(presets::get("default").is_some());
-		assert!(presets::get("podcast").is_some());
-		assert!(presets::get("nonexistent").is_none());
+	fn test_standard_equals_old_file_preset() {
+		let p = builtin("standard");
+		assert_eq!(p.image_variants, v(&["vis.tn", "vis.sd", "vis.md", "vis.hd"]));
+		assert_eq!(p.video_variants, v(&["vid.sd", "vid.md", "vid.hd"]));
+		assert_eq!(p.audio_variants, v(&["aud.md"]));
+		assert_eq!(p.max_variant.as_deref(), Some("vid.hd"));
+		assert_eq!(p.thumbnail_variant.as_deref(), Some("vis.tn"));
+		assert!(p.generate_thumbnail);
+		assert!(p.store_original);
+		assert!(!p.extract_audio);
 	}
 
 	#[test]
-	fn test_file_preset() {
-		let preset = presets::file();
-		assert_eq!(preset.name, "file");
-		assert!(presets::get("file").is_some());
-		assert!(presets::get("file").unwrap().allowed_media_classes.contains(&VariantClass::Raw));
-		assert!(presets::list().contains(&"file"));
+	fn test_high_and_compact_audio() {
+		assert_eq!(builtin("high").audio_variants, v(&["aud.md", "aud.hd"]));
+		let compact = builtin("compact");
+		assert_eq!(compact.audio_variants, v(&["aud.sd"]));
+		assert!(!compact.store_original);
 	}
 
 	#[test]
-	fn test_orig_only_preset() {
-		let preset = presets::orig_only();
-		assert_eq!(preset.name, "orig-only");
-		assert!(preset.image_variants.is_empty());
-		assert!(preset.video_variants.is_empty());
-		assert!(preset.audio_variants.is_empty());
-		assert!(preset.thumbnail_variant.is_none());
-		assert!(preset.store_original);
-		assert!(!preset.generate_thumbnail);
+	fn test_orig_and_preview() {
+		let orig = builtin("orig");
+		assert!(orig.image_variants.is_empty() && orig.video_variants.is_empty());
+		assert!(orig.audio_variants.is_empty());
+		assert!(orig.thumbnail_variant.is_none() && !orig.generate_thumbnail);
+		assert!(orig.max_variant.is_none() && orig.store_original);
+		let preview = builtin("preview");
+		assert_eq!(preview.image_variants, v(&["vis.tn"]));
+		assert!(preview.max_variant.is_none() && preview.generate_thumbnail);
+	}
+
+	#[test]
+	fn test_merge_override() {
+		let overrides = json!({
+			"standard": { "vis": "xd", "aud": null },
+			"podcast": { "extractAudio": true },
+		});
+		let p = find_profile(&overrides, "standard").unwrap().unwrap();
+		assert_eq!(p.vis.as_deref(), Some("xd"));
+		assert_eq!(p.vid.as_deref(), Some("hd"));
+		assert!(p.aud.is_none());
+		let custom = find_profile(&overrides, "podcast").unwrap().unwrap();
+		assert!(custom.extract_audio);
+		assert_eq!(custom.vid.as_deref(), Some("hd"));
+		assert!(validate_profiles(&overrides).is_ok());
+		assert!(find_profile(&overrides, "nonexistent").unwrap().is_none());
+	}
+
+	#[test]
+	fn test_validator_rejects() {
+		assert!(validate_profiles(&json!({ "sync": {} })).is_err());
+		assert!(validate_profiles(&json!({ "cover": {} })).is_err());
+		assert!(validate_profiles(&json!({ "Bad_Name": {} })).is_err());
+		assert!(check_name(&"a".repeat(33)).is_err());
+		assert!(validate_profiles(&json!({ "x": { "vid": "tn" } })).is_err());
+		assert!(validate_profiles(&json!({ "x": { "aud": "xd" } })).is_err());
+		assert!(validate_profiles(&json!({ "x": 1 })).is_err());
+		assert!(validate_profiles(&json!([])).is_err());
+		// Unknown fields are tolerated (compat W1/A1).
+		assert!(validate_profiles(&json!({ "x": { "bogus": true } })).is_ok());
+		assert!(validate_profiles(&json!({})).is_ok());
+	}
+
+	#[test]
+	fn test_purpose_presets() {
+		assert!(presets::get("cover").is_some());
+		assert!(presets::get("standard").is_none());
+		assert!(presets::get("default").is_none());
+		assert!(builtin_profile("sync").is_none());
+	}
+
+	/// `resolve` needs an `App`; this replays its lookup order without one.
+	#[test]
+	fn test_unknown_and_sync_unresolvable() {
+		for name in ["bogus", "sync", "default", "orig-only"] {
+			assert!(presets::get(name).is_none(), "{name}");
+			assert!(matches!(find_profile(&json!({}), name), Ok(None)), "{name}");
+		}
+		assert!(find_profile(&json!({ "sync": {} }), "sync").is_err());
 	}
 
 	#[test]

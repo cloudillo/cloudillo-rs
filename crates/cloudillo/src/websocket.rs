@@ -5,18 +5,21 @@
 //!
 //! Routes WebSocket connections to appropriate protocol handlers:
 //! - `/ws/bus` - Notification bus (presence, typing, actions, events)
+//! - `/ws/file-changes` - `filesChanged` hints for a scoped device API key
 //! - `/ws/rtdb/:file_id` - Real-time database changes for a file
 //! - `/ws/crdt/:doc_id` - Collaborative document editing
 
 use axum::{
 	extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
-	extract::{ConnectInfo, Path, State},
+	extract::{ConnectInfo, Path, RawQuery, State},
+	http::HeaderMap,
 	response::Response,
 };
 use cloudillo_types::extract::Query;
-use futures::SinkExt;
+use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::net::SocketAddr;
+use tokio::sync::broadcast::error::RecvError;
 
 use crate::crdt;
 use crate::rtdb;
@@ -24,11 +27,11 @@ use cloudillo_core::OptionalAuth;
 use cloudillo_core::audit;
 use cloudillo_core::extract::IdTag;
 use cloudillo_core::file_access::{self, FileAccessError};
-use cloudillo_core::ws_bus;
-use cloudillo_types::auth_adapter::{AuditCategory, AuditEvent};
+use cloudillo_core::ws_bus::{self, BusMessage};
+use cloudillo_types::auth_adapter::{AuditCategory, AuditEvent, AuthCtx};
 use cloudillo_types::meta_adapter::{CreateFile, FileStatus};
-use cloudillo_types::types::AccessLevel;
-use cloudillo_types::utils::normalize_id_tag;
+use cloudillo_types::types::{AccessLevel, ScopeSet, TokenScope};
+use cloudillo_types::utils::{normalize_id_tag, random_id};
 
 /// Record `access.doc.open` once per accepted connection (gated by the `access` category).
 /// `actor` is the asserted identity: `None` for a guest or an anonymous share-link token.
@@ -500,6 +503,161 @@ pub async fn get_ws_bus(
 	ws.on_upgrade(move |socket| ws_bus::handle_bus_connection(socket, user_id, tn_id, app))
 }
 
+/// Who may open `/ws/file-changes`: an API key (no `exp`) of the host tenant whose scope has a
+/// file or drive entry. Sessions and share links (`exp`), unscoped, `idp_`, DAV, notification,
+/// `apkg:` and `rfile:` keys are refused. The tenant test compares id_tags directly:
+/// `abac::is_tenant_account` requires an unscoped credential, so it rejects every scoped key.
+/// Hints are confined to the key's scope ([`hint_in_scope`]).
+pub fn ws_file_changes_admission(a: &AuthCtx, tenant_id_tag: &str) -> bool {
+	a.exp.is_none()
+		&& &*a.id_tag == tenant_id_tag
+		&& a.scope.as_deref().and_then(ScopeSet::parse).is_some_and(|s| {
+			matches!(s.delegated, Some(TokenScope::File { .. } | TokenScope::Drive { .. }))
+		})
+}
+
+/// WebSocket upgrade handler for `filesChanged` hints; admission is
+/// [`ws_file_changes_admission`]. The client refetches `GET /api/file-changes` on each hint.
+pub async fn get_ws_file_changes(
+	ws: WebSocketUpgrade,
+	State(app): State<crate::app::App>,
+	IdTag(tenant_id_tag): IdTag,
+	OptionalAuth(auth): OptionalAuth,
+	headers: HeaderMap,
+	RawQuery(query): RawQuery,
+) -> Response {
+	use tracing::warn;
+
+	let ws = limit_ws(ws);
+	let Some(auth_ctx) = auth else {
+		warn!("File-changes WebSocket rejected - no authentication");
+		return ws_close_unauthenticated(ws);
+	};
+	if !ws_file_changes_admission(&auth_ctx, &tenant_id_tag) {
+		warn!(subject = %auth_ctx.id_tag, "File-changes WebSocket rejected - not a scoped tenant key");
+		return ws_close_for_error(ws, &FileAccessError::AccessDenied);
+	}
+
+	// The raw key, the same way `authenticate` reads it, for the periodic revocation recheck.
+	let token = match headers.get("Authorization").and_then(|h| h.to_str().ok()) {
+		Some(h) => h.strip_prefix("Bearer ").map(|t| t.trim().to_string()),
+		None => {
+			cloudillo_core::middleware::extract_token_from_query(query.as_deref().unwrap_or(""))
+		}
+	};
+	let Some(token) = token else {
+		return ws_close_unauthenticated(ws);
+	};
+
+	ws.on_upgrade(move |socket| {
+		handle_file_changes_connection(socket, auth_ctx, tenant_id_tag, token, app)
+	})
+}
+
+/// How often an open `/ws/file-changes` socket rechecks that its key still exists unchanged.
+const KEY_RECHECK: std::time::Duration = std::time::Duration::from_mins(5);
+
+/// Whether a `filesChanged` broadcast (`data.entries`) concerns a key scoped by `auth.scope`:
+/// some entry lies in a `file:` scope's live folder, or is readable under a drive scope.
+/// No entries means "location unknown": true. Errors and NotFound fail closed.
+async fn hint_in_scope(
+	app: &crate::app::App,
+	auth: &AuthCtx,
+	tenant_id_tag: &str,
+	data: &serde_json::Value,
+) -> bool {
+	let entries: Vec<&str> = data["entries"]
+		.as_array()
+		.map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+		.unwrap_or_default();
+	if entries.is_empty() {
+		return true;
+	}
+	let Some(scope) = auth.scope.as_deref() else { return false };
+	// one ancestry walk per hint per socket (DirCache memoized); batch if
+	// file-change sockets get numerous.
+	if file_access::drive_scope(Some(scope)).is_some() {
+		let ctx = file_access::FileAccessCtx::from_auth(Some(auth), tenant_id_tag);
+		for id in entries {
+			if let Ok(r) = file_access::check_file_access(app, auth.tn_id, id, &ctx, None).await
+				&& r.access_level.can_read()
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+	for id in entries {
+		if matches!(file_access::within_scope_folder(app, auth.tn_id, scope, id).await, Ok(true)) {
+			return true;
+		}
+	}
+	false
+}
+
+/// Forward the tenant's `filesChanged` broadcasts that concern the key's scope
+/// ([`hint_in_scope`]), nothing else; inbound frames are dropped. Closes once the key is
+/// revoked or its scope changed, checked every [`KEY_RECHECK`].
+async fn handle_file_changes_connection(
+	socket: WebSocket,
+	auth_ctx: AuthCtx,
+	tenant_id_tag: Box<str>,
+	token: String,
+	app: crate::app::App,
+) {
+	use cloudillo_core::ws_broadcast::FILE_CHANGES_SLOT;
+	let tn_id = auth_ctx.tn_id;
+	let mut last_checked = std::time::Instant::now();
+	let conn_id = random_id().unwrap_or_default();
+	let mut rx = app.broadcast.register_user(tn_id, FILE_CHANGES_SLOT, &conn_id).await;
+	let (mut tx, mut inbound) = socket.split();
+	let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+	// Always an empty hint, whatever the broadcast carried: the key's view of the change is
+	// the feed it refetches, which `get_file_changes` confines to its scope.
+	let hint = || BusMessage::new("filesChanged", serde_json::json!({})).to_ws_message().ok();
+
+	loop {
+		let frame = tokio::select! {
+			msg = rx.recv() => match msg {
+				Ok(m) if m.cmd == "filesChanged" => {
+					if !hint_in_scope(&app, &auth_ctx, &tenant_id_tag, &m.data).await {
+						continue;
+					}
+					hint()
+				}
+				Ok(_) => continue,
+				// A skipped message may have been a hint; the client refetches regardless.
+				Err(RecvError::Lagged(_)) => hint(),
+				Err(RecvError::Closed) => break,
+			},
+			msg = inbound.next() => match msg {
+				Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+				Some(Ok(_)) => continue,
+			},
+			_ = heartbeat.tick() => {
+				if last_checked.elapsed() >= KEY_RECHECK {
+					// the key check is a hash verify on the worker pool, so it runs at
+					// most every 5 minutes, and a revoked key keeps its socket up to that long.
+					let live = app.auth_adapter.validate_api_key(&token).await.is_ok_and(|v| {
+						v.tn_id == tn_id && v.scopes == auth_ctx.scope
+					});
+					if !live {
+						break;
+					}
+					last_checked = std::time::Instant::now();
+				}
+				Some(Message::Ping(vec![].into()))
+			}
+		};
+		let Some(frame) = frame else { continue };
+		if tx.send(frame).await.is_err() {
+			break;
+		}
+	}
+
+	app.broadcast.unregister_user(tn_id, FILE_CHANGES_SLOT, &conn_id).await;
+}
+
 /// WebSocket upgrade handler for RTDB subscriptions
 ///
 /// Route: `/ws/rtdb/:file_id`
@@ -720,7 +878,7 @@ pub async fn get_ws_crdt(
 
 #[cfg(test)]
 mod tests {
-	use super::{AccessQuery, ws_bus_admission};
+	use super::{AccessQuery, ws_bus_admission, ws_file_changes_admission};
 	use cloudillo_types::auth_adapter::AuthCtx;
 	use cloudillo_types::types::{Timestamp, TnId};
 
@@ -751,6 +909,35 @@ mod tests {
 		// Another tenant's session, a leader or moderator there included.
 		assert!(!ws_bus_admission(&ctx(None, exp, &["leader"]), "club.test"));
 		assert!(!ws_bus_admission(&ctx(None, exp, &["moderator"]), "club.test"));
+	}
+
+	#[test]
+	fn file_changes_admits_only_scoped_tenant_keys() {
+		let exp = Some(Timestamp::from_now(60));
+		let host = "alice.idp.test";
+		// File- and drive-scoped API keys of the tenant (no expiry).
+		for s in ["file:f1~x:R", "file:*:R", "file:__root__:W", "file:*:R,notifications:read"] {
+			assert!(ws_file_changes_admission(&ctx(Some(s), None, &["leader"]), host), "{s}");
+		}
+		// A share link and a session carry `exp`.
+		assert!(!ws_file_changes_admission(&ctx(Some("file:f1~x:R"), exp, &[]), host));
+		assert!(!ws_file_changes_admission(&ctx(None, exp, &["leader"]), host));
+		// An unscoped tenant key; an `idp_` key (no scope, no expiry, no roles).
+		assert!(!ws_file_changes_admission(&ctx(None, None, &["leader"]), host));
+		assert!(!ws_file_changes_admission(&ctx(None, None, &[]), host));
+		// Keys without a file or drive entry, and a malformed scope.
+		for s in [
+			"carddav:read",
+			"notifications:read",
+			"apkg:publish",
+			"rfile:bob.example:f1~x:R",
+			"bogus",
+			"",
+		] {
+			assert!(!ws_file_changes_admission(&ctx(Some(s), None, &["leader"]), host), "{s}");
+		}
+		// Another tenant's key.
+		assert!(!ws_file_changes_admission(&ctx(Some("file:*:R"), None, &["leader"]), "club.test"));
 	}
 
 	fn query(q: &str) -> AccessQuery {

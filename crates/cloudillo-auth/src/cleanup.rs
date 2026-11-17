@@ -86,6 +86,13 @@ impl Task<App> for AuthCleanupTask {
 			}
 		}
 
+		if let Ok(store) = app.ext::<crate::qr_pair::PairStore>() {
+			let count = store.cleanup_expired();
+			if count > 0 {
+				info!("Cleaned up {} expired QR pairing sessions", count);
+			}
+		}
+
 		if let Ok(store) = app.ext::<crate::totp::MfaStore>() {
 			let count = store.cleanup_expired();
 			if count > 0 {

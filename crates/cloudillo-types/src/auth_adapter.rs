@@ -180,9 +180,9 @@ pub struct AuthCtx {
 	/// Expiry of the presented access token; `None` for credentials that are not one (API keys,
 	/// DAV passwords, synthetic contexts). Caps the hatted `file:` scope mint.
 	pub exp: Option<Timestamp>,
-	/// When the session behind the credential began (access token `auth_time`, or a `cl_`
-	/// key's original login). `None` for synthetic contexts; session-age checks treat that
-	/// as epoch, i.e. stale.
+	/// When the session behind the credential began (access token `auth_time`). An API key is
+	/// no session: it carries "now" on every use. `None` for synthetic contexts; session-age
+	/// checks treat that as epoch, i.e. stale.
 	pub auth_time: Option<Timestamp>,
 }
 
@@ -393,8 +393,6 @@ pub struct CreateApiKeyOptions<'a> {
 	pub name: Option<&'a str>,
 	pub scopes: Option<&'a str>,
 	pub expires_at: Option<Timestamp>,
-	/// Login time of the session that created the key, carried into sessions it mints
-	pub auth_time: Option<Timestamp>,
 }
 
 /// Result of creating an API key (includes plaintext key shown only once)
@@ -412,8 +410,7 @@ pub struct ApiKeyValidation {
 	pub key_id: i64,
 	pub scopes: Option<Box<str>>,
 	pub roles: Option<Box<str>>,
-	/// Scoped key: original login time behind it (`created_at` for keys without one).
-	/// Unscoped key: now — each use counts as a fresh login, bounded by `auth.remember_days`.
+	/// Always now: an API key is no session and is not bound to the minting session's login.
 	pub auth_time: Option<Timestamp>,
 }
 

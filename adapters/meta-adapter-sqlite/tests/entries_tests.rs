@@ -1150,3 +1150,56 @@ async fn list_trashed_entries_returns_only_live_trash_roots() {
 	assert_eq!(got, want, "only live trash roots (the D child stays under its folder)");
 	assert!(adapter.list_trashed_entries(TN, Timestamp(0)).await.expect("list").is_empty());
 }
+
+/// The change feed: every entry (tombstones too, managed never) in `(updated_at, e_id)` order,
+/// with `after` breaking the tie at `since`.
+#[tokio::test]
+async fn the_change_feed_orders_rows_and_keysets_on_after() {
+	let (adapter, _temp) = create_test_adapter().await;
+	folder(&adapter, "fold-a").await;
+	folder(&adapter, "fold-b").await;
+	upload(&adapter, "fold-a", None, "b1~keep", "f1~keep").await;
+	let gone = upload(&adapter, "fold-b", None, "b1~gone", "f1~gone").await;
+	adapter.delete_file(TN, "f1~gone").await.expect("tombstone");
+	adapter
+		.create_managed_entry(TN, "f1~keep", "x", Some("a1~post"), Some('F'), None)
+		.await
+		.expect("managed entry");
+
+	let all = adapter
+		.list_entry_changes(TN, Timestamp(0), None, 100)
+		.await
+		.expect("feed")
+		.rows;
+	assert_eq!(all.len(), 4, "two folders, two uploads, no managed entry: {all:?}");
+	assert!(
+		all.windows(2)
+			.all(|w| (w[0].updated_at.0, w[0].e_id) < (w[1].updated_at.0, w[1].e_id)),
+		"not in (updated_at, e_id) order: {all:?}"
+	);
+	assert!(all.iter().all(|r| r.view.parent_id.as_deref() != Some(MANAGED_PARENT_ID)));
+	let tomb = all.iter().find(|r| r.view.entry_id == gone.entry_id).expect("tombstone row");
+	assert!(matches!(tomb.status, FileStatus::Deleted), "{tomb:?}");
+
+	// Keyset: resume after the first row at its own timestamp.
+	let first = &all[0];
+	let rest = adapter
+		.list_entry_changes(TN, first.updated_at, Some(&first.view.entry_id), 100)
+		.await
+		.expect("feed after")
+		.rows;
+	let ids = |rows: &[cloudillo_types::meta_adapter::EntryChange]| {
+		rows.iter().map(|r| r.view.entry_id.clone()).collect::<Vec<_>>()
+	};
+	assert_eq!(ids(&rest), ids(&all[1..]));
+
+	// An unknown `after` drops nothing (the client dedupes); `limit` caps the page.
+	let unknown = adapter
+		.list_entry_changes(TN, first.updated_at, Some("nope"), 100)
+		.await
+		.expect("feed");
+	assert_eq!(ids(&unknown.rows), ids(&all));
+	let page = adapter.list_entry_changes(TN, Timestamp(0), None, 1).await.expect("feed");
+	assert_eq!(ids(&page.rows), ids(&all[..1]));
+	assert!(page.purged_at.is_none(), "nothing purged yet");
+}

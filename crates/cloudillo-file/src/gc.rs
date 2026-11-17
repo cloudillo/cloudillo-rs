@@ -16,8 +16,12 @@
 //!   2. managed-file sweep — hard-deletes unreferenced entries whose
 //!      `parent_id = MANAGED_PARENT_ID`. Content is never deleted with an entry. Then the
 //!      tombstone purge hard-deletes entries a permanent delete left at `status = 'D'`.
-//!   3. orphan-content sweep — deletes content no entry references, older than the
-//!      safety window, with its `file_variants`, so the blob sweep can reap the blobs.
+//!      Then version history is pruned to the tenant's `file.version_keep_count` /
+//!      `file.version_keep_days`, and pending replaces older than the scratch window are
+//!      dropped (their processing never finished).
+//!   3. orphan-content sweep — deletes content no entry, history row or pending replace
+//!      references, older than the safety window, with its `file_variants`, so the blob sweep
+//!      can reap the blobs.
 //!   4. blob sweep — iterates the blob store and deletes blobs that no longer
 //!      have a corresponding `file_variants` row (including `SHARED_TN`, the
 //!      shared store used for deduplicated federated public/verified content).
@@ -126,7 +130,7 @@ impl Task<App> for GcTask {
 		let mut total_blobs_scanned: u64 = 0;
 		let mut total_blobs_deleted: u64 = 0;
 		for tn in tn_ids {
-			let (fs, fd, bs, bd) = sweep_tenant(app, tn, cutoff).await;
+			let (fs, fd, bs, bd) = sweep_tenant(app, tn, cutoff, scratch_cutoff).await;
 			total_files_scanned += fs;
 			total_files_deleted += fd;
 			total_blobs_scanned += bs;
@@ -151,7 +155,12 @@ impl Task<App> for GcTask {
 /// sweep must precede blob sweep so freshly-orphaned blobs are reaped in the
 /// same pass. Each sub-sweep warns-and-continues on failure so partial
 /// accounting from earlier sub-sweeps is preserved in the final summary line.
-async fn sweep_tenant(app: &App, tn_id: TnId, cutoff: i64) -> (u64, u64, u64, u64) {
+async fn sweep_tenant(
+	app: &App,
+	tn_id: TnId,
+	cutoff: i64,
+	scratch_cutoff: i64,
+) -> (u64, u64, u64, u64) {
 	// 1. Sweep stale `tmp-*` upload artifacts first: they live above the
 	// sharded hash dirs (see BlobAdapterFs::create_blob_stream) so the
 	// regular `list_blobs` walk never reaches them.
@@ -175,6 +184,37 @@ async fn sweep_tenant(app: &App, tn_id: TnId, cutoff: i64) -> (u64, u64, u64, u6
 		Ok(n) if n > 0 => info!("gc: tenant {} purged {} deleted entries", tn_id, n),
 		Ok(_) => {}
 		Err(e) => warn!("gc: tenant {} tombstone purge failed: {}", tn_id, e),
+	}
+
+	// 2c. Version retention — history beyond the newest `keep_count` per entry, or older than
+	// `keep_days` (0 = no age limit), goes, so its content can turn orphan below.
+	let keep_count = app.settings.get_int(tn_id, "file.version_keep_count").await.unwrap_or(10);
+	let keep_days = app.settings.get_int(tn_id, "file.version_keep_days").await.unwrap_or(30);
+	let older_than = if keep_days > 0 {
+		Timestamp::now().0.saturating_sub(keep_days.saturating_mul(86_400))
+	} else {
+		i64::MIN
+	};
+	let keep_count = u32::try_from(keep_count.max(0)).unwrap_or(u32::MAX);
+	match app
+		.meta_adapter
+		.prune_entry_versions(tn_id, keep_count, Timestamp(older_than))
+		.await
+	{
+		Ok(n) if n > 0 => info!("gc: tenant {} pruned {} file versions", tn_id, n),
+		Ok(_) => {}
+		Err(e) => warn!("gc: tenant {} version prune failed: {}", tn_id, e),
+	}
+
+	// 2d. Stale pending replaces — processing that never finalized releases its content.
+	match app
+		.meta_adapter
+		.purge_stale_pending_replaces(tn_id, Timestamp(scratch_cutoff))
+		.await
+	{
+		Ok(n) if n > 0 => info!("gc: tenant {} dropped {} stale pending replaces", tn_id, n),
+		Ok(_) => {}
+		Err(e) => warn!("gc: tenant {} pending-replace purge failed: {}", tn_id, e),
 	}
 
 	// 3. Orphan-content sweep — content no entry references any more (its last entry was

@@ -13,7 +13,7 @@ use axum::{
 	middleware::Next,
 };
 use cloudillo_types::auth_adapter::AuthCtx;
-use cloudillo_types::types::{TokenScope, scope_for_log};
+use cloudillo_types::types::{ScopeSet, TokenScope, delegated_scope, scope_for_log};
 use std::pin::Pin;
 
 /// Tenant API key prefix (validated by auth adapter)
@@ -99,7 +99,7 @@ where
 }
 
 /// Extract token from query parameters
-fn extract_token_from_query(query: &str) -> Option<String> {
+pub fn extract_token_from_query(query: &str) -> Option<String> {
 	for param in query.split('&') {
 		if param.starts_with("token=") {
 			let token = param.strip_prefix("token=")?;
@@ -115,28 +115,30 @@ fn extract_token_from_query(query: &str) -> Option<String> {
 
 /// Owner/leader gate. Must be layered *after* `require_auth`, which installs `Auth`.
 ///
-/// *Delegated* credentials — share links and apkg-publish tokens — are rejected
+/// *Delegated* credentials — share links, apkg-publish and `rfile:` keys — are rejected
 /// before the role check: tenant API keys are minted with the *full* owner role set
 /// regardless of their `scopes` column, so a role test alone would let one through.
 ///
-/// Capability scopes (`carddav:*` / `caldav:*`) are deliberately not rejected here —
-/// `crate::scope::scope_permits` already constrained them fail-closed in
-/// `require_auth`, and a second rejection would 403 a DAV key on its own routes.
-/// Device keys (`device:*`) pass for the same reason: `scope_permits` confines them
-/// to their own push-subscription routes and `GET /api/notifications` inside this group.
+/// A scope list carrying at least one capability (`carddav:*` / `caldav:*` /
+/// `notifications:*`) is deliberately not rejected here, whatever its delegated
+/// entry — `crate::scope::scope_permits` already confined every entry fail-closed in
+/// `require_auth`, and a second rejection would 403 a key on its own routes (a DAV key
+/// on pim, `notifications:read` on `GET /api/notifications`, `notifications:push` on the
+/// subscription routes). Any lone delegated entry is rejected, and so is a malformed list.
 pub async fn require_leader(
 	Auth(auth_ctx): Auth,
 	req: Request<Body>,
 	next: Next,
 ) -> ClResult<Response<Body>> {
-	if matches!(
-		auth_ctx.scope.as_deref().and_then(TokenScope::parse),
-		Some(s) if !matches!(s, TokenScope::Device { .. })
-	) {
+	let scope_passes = auth_ctx
+		.scope
+		.as_deref()
+		.is_none_or(|s| ScopeSet::parse(s).is_some_and(|set| !set.caps.is_empty()));
+	if !scope_passes {
 		warn!(
 			subject = %auth_ctx.id_tag,
 			scope = ?auth_ctx.scope.as_deref().map(scope_for_log),
-			"Owner/leader permission denied - delegated token"
+			"Owner/leader permission denied - delegated token or malformed scope"
 		);
 		return Err(Error::PermissionDenied);
 	}
@@ -425,7 +427,7 @@ pub async fn require_auth_public_data(
 async fn share_link_live(app: &App, auth: &AuthCtx) -> ClResult<()> {
 	use cloudillo_types::types::AccessLevel;
 	let Some(TokenScope::File { file_id, ref_id: Some(ref_id), access }) =
-		auth.scope.as_deref().and_then(TokenScope::parse)
+		auth.scope.as_deref().and_then(delegated_scope)
 	else {
 		return Ok(());
 	};
@@ -703,6 +705,32 @@ mod tests {
 			run_require_leader(Some(auth_ctx(&["leader"], Some("carddav:read")))).await,
 			StatusCode::OK
 		);
+	}
+
+	#[tokio::test]
+	async fn require_leader_scope_lists() {
+		for (scope, want) in [
+			// A capability passes on roles, whatever the delegated entry beside it.
+			("file:f1~abc:W,notifications:read,notifications:push", StatusCode::OK),
+			("file:f1~abc:W,carddav:read", StatusCode::OK),
+			// Lone delegations never pass, `device:` is no longer a scope kind.
+			("file:f1~abc:W", StatusCode::FORBIDDEN),
+			("rfile:bob.example:f1~x:W", StatusCode::FORBIDDEN),
+			("device:f1~abc", StatusCode::FORBIDDEN),
+			("apkg:publish", StatusCode::FORBIDDEN),
+			// Malformed lists never degrade into "capability key, pass on roles".
+			("carddav:read,", StatusCode::FORBIDDEN),
+			("carddav:read,bogus", StatusCode::FORBIDDEN),
+			("file:a:R,apkg:publish", StatusCode::FORBIDDEN),
+			("nonsense", StatusCode::FORBIDDEN),
+			("", StatusCode::FORBIDDEN),
+		] {
+			assert_eq!(
+				run_require_leader(Some(auth_ctx(&["leader"], Some(scope)))).await,
+				want,
+				"{scope}"
+			);
+		}
 	}
 
 	#[tokio::test]

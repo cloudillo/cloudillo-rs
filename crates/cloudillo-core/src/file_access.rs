@@ -18,7 +18,7 @@ use crate::prelude::*;
 use cloudillo_types::auth_adapter::AuthCtx;
 use cloudillo_types::meta_adapter;
 use cloudillo_types::meta_adapter::FileView;
-use cloudillo_types::types::{AccessLevel, TokenScope};
+use cloudillo_types::types::{AccessLevel, DriveTarget, TokenScope, delegated_scope};
 
 pub use cloudillo_types::meta_adapter::MAX_PARENT_DEPTH;
 
@@ -34,6 +34,21 @@ pub enum FileAccessError {
 	NotFound,
 	AccessDenied,
 	InternalError(String),
+}
+
+/// The drive scope (`file:__root__|~name|*:{R|W}`) `scope` carries, with its level cap.
+/// `None` for no scope and for every other scope.
+pub fn drive_scope(scope: Option<&str>) -> Option<(DriveTarget, AccessLevel)> {
+	match delegated_scope(scope?)? {
+		TokenScope::Drive { drive, access } => Some((drive, access)),
+		_ => None,
+	}
+}
+
+/// `auth` with its scope cleared, for a drive-scoped caller's unscoped evaluation (room gate,
+/// tenant-self, impostor checks). Same id_tag, same roles: no role is ever added.
+pub fn unscoped_auth(auth: &AuthCtx) -> AuthCtx {
+	AuthCtx { scope: None, ..auth.clone() }
 }
 
 /// Context describing the subject requesting file access
@@ -77,6 +92,12 @@ impl<'a> FileAccessCtx<'a> {
 
 	/// The subject the visibility ladder sees: a scoped caller is a guest there (scope =
 	/// guest + grant), so its identity, roles and hat are stripped.
+	/// The same subject with the scope cleared: how a drive scope is evaluated. A drive scope
+	/// narrows the subject's own unscoped access (drive filter + level cap), never grants.
+	pub fn unscoped(&self) -> Self {
+		Self { scope: None, ..*self }
+	}
+
 	fn visibility_subject(&self) -> Self {
 		if self.scope.is_some() {
 			Self { user_id_tag: "", user_roles: &[], hatted: false, scope: None, ..*self }
@@ -319,7 +340,11 @@ pub fn role_access_level(user_roles: &[Box<str>]) -> AccessLevel {
 /// row nothing else does — the remote owner and the community leader included. On a local row,
 /// Admin level or the community `moderator` role pass too; Write grantees may edit, not delete.
 /// The room caps the role: a moderator outside the file's room does not pass on that.
-/// Scoped callers never pass: a scope carries no lifecycle authority, whoever holds it.
+/// A scoped caller passes only with a `file:` scope at level `W` on a live folder and `file`
+/// strictly inside it (never the root); the handlers then apply [`scope_allows_lifecycle`].
+/// A drive scope narrows instead: level `W`, `file` in a scoped drive, and the unscoped rule for
+/// the same subject (its level recomputed unscoped, since `level` arrives capped).
+/// Fails closed on a lookup error.
 pub async fn can_manage_lifecycle(
 	app: &App,
 	tn_id: TnId,
@@ -327,9 +352,32 @@ pub async fn can_manage_lifecycle(
 	ctx: &FileAccessCtx<'_>,
 	level: AccessLevel,
 ) -> bool {
-	if ctx.scope.is_some() {
-		return false;
+	if let Some((drive, access)) = drive_scope(ctx.scope) {
+		if !access.can_write() || !drive.matches(file.channel, ctx.tenant_id_tag) {
+			return false;
+		}
+		let ctx = ctx.unscoped();
+		let level = get_access_level(app, tn_id, *file, &ctx, None).await;
+		return manages_lifecycle_unscoped(app, tn_id, file, &ctx, level).await;
 	}
+	if let Some(scope) = ctx.scope {
+		let Ok(Some((root, access))) = live_scope_root(app, tn_id, scope).await else {
+			return false;
+		};
+		return access.can_write()
+			&& matches!(in_folder(app, tn_id, &root, file.entry_id, false).await, Ok(true));
+	}
+	manages_lifecycle_unscoped(app, tn_id, file, ctx, level).await
+}
+
+/// The unscoped half of [`can_manage_lifecycle`].
+async fn manages_lifecycle_unscoped(
+	app: &App,
+	tn_id: TnId,
+	file: &FileRef<'_>,
+	ctx: &FileAccessCtx<'_>,
+	level: AccessLevel,
+) -> bool {
 	if file.owner_id_tag == ctx.user_id_tag {
 		return true;
 	}
@@ -392,6 +440,140 @@ pub async fn check_lifecycle(
 		return Err(Error::NotFound);
 	}
 	Ok(())
+}
+
+/// The live entry a `file:` scope is bound to, with the level it grants. `None` for any other
+/// scope (malformed, capability-only, `apkg:`, `rfile:`), an unresolvable target, or one that is
+/// not active or sits in the trash — trashing the root cuts its scopes off.
+async fn live_scope_root(
+	app: &App,
+	tn_id: TnId,
+	scope: &str,
+) -> ClResult<Option<(FileView, AccessLevel)>> {
+	let Some(token_scope) = delegated_scope(scope) else { return Ok(None) };
+	let Some((scope_id, access)) = token_scope.file_grant() else { return Ok(None) };
+	let Some(root) = resolve_scope_entry(&app.meta_adapter, tn_id, scope_id).await else {
+		return Ok(None);
+	};
+	if !matches!(root.status, meta_adapter::FileStatus::Active)
+		|| in_trash(app, tn_id, &root).await?
+	{
+		return Ok(None);
+	}
+	Ok(Some((root, access)))
+}
+
+/// Whether `id` is a descendant of the folder `root`, or `root` itself when `or_root`. Always
+/// false when `root` is not a folder: a document scope's `root_id` tree is no folder subtree.
+async fn in_folder(
+	app: &App,
+	tn_id: TnId,
+	root: &FileView,
+	id: &str,
+	or_root: bool,
+) -> ClResult<bool> {
+	if root.file_tp.as_deref() != Some("FLDR") {
+		return Ok(false);
+	}
+	if *root.entry_id == *id {
+		return Ok(or_root);
+	}
+	is_descendant_of(&app.meta_adapter, app.ext::<DirCache>()?, tn_id, id, &root.entry_id).await
+}
+
+/// Whether `id` is the folder a `file:` scope (any level) is bound to, or inside it. False for
+/// a document scope and every non-`file:` scope.
+pub async fn within_scope_folder(app: &App, tn_id: TnId, scope: &str, id: &str) -> ClResult<bool> {
+	match live_scope_root(app, tn_id, scope).await? {
+		Some((root, _)) => in_folder(app, tn_id, &root, id, true).await,
+		None => Ok(false),
+	}
+}
+
+/// A lifecycle verb, as [`scope_allows_lifecycle`] rules on it.
+#[derive(Debug, Clone)]
+pub enum LifecycleOp {
+	Rename,
+	/// `new_parent` `None` = the drive root, always outside a scope.
+	Move {
+		new_parent: Option<String>,
+	},
+	Trash,
+	RestoreFromTrash {
+		parent: Option<String>,
+	},
+	Purge,
+	Replace,
+	Versions,
+	/// Restore-as-copy into `parent`.
+	CopyInto {
+		parent: Option<String>,
+	},
+	Share,
+}
+
+/// The lifecycle rule for a scoped caller on `target`. `scope == None` → `Ok(())`: unscoped
+/// callers go through the role checks. With a scope, every verb needs a `file:` scope at level
+/// `W` on a live folder, and `target` strictly inside it (never the root). Move, restore and
+/// restore-as-copy also need the destination parent to be the root or inside it. Replace also
+/// passes on the root itself when the root is a BLOB — the only verb a document scope gets.
+/// Purge and share management are refused for every scope. `PermissionDenied` otherwise.
+///
+/// A drive scope: level `W`, `target` in a scoped drive (every entry is strictly inside a drive
+/// root), and for move / restore / restore-as-copy a destination parent in the target's own
+/// drive, else `FileCrossRoom` (`None` = a drive root; a cross-drive root move is refused by the
+/// move itself). The unscoped lifecycle checks still run beside it — narrowing.
+pub async fn scope_allows_lifecycle(
+	app: &App,
+	tn_id: TnId,
+	tenant_id_tag: &str,
+	scope: Option<&str>,
+	target: &FileView,
+	op: LifecycleOp,
+) -> ClResult<()> {
+	let Some(scope) = scope else { return Ok(()) };
+	if matches!(op, LifecycleOp::Purge | LifecycleOp::Share) {
+		return Err(Error::PermissionDenied);
+	}
+	if let Some((drive, access)) = drive_scope(Some(scope)) {
+		if !access.can_write() || !drive.matches(target.channel.as_deref(), tenant_id_tag) {
+			return Err(Error::PermissionDenied);
+		}
+		let same_drive = match op {
+			LifecycleOp::Move { new_parent: Some(parent) }
+			| LifecycleOp::RestoreFromTrash { parent: Some(parent) }
+			| LifecycleOp::CopyInto { parent: Some(parent) } => {
+				match app.meta_adapter.read_file(tn_id, &parent).await? {
+					Some(p) => p.channel == target.channel,
+					None => false,
+				}
+			}
+			_ => true,
+		};
+		// Another drive is a cross-drive move, refused as such (the client maps it to `EXDEV`).
+		return if same_drive { Ok(()) } else { Err(Error::FileCrossRoom) };
+	}
+	let Some((root, access)) = live_scope_root(app, tn_id, scope).await? else {
+		return Err(Error::PermissionDenied);
+	};
+	if !access.can_write() {
+		return Err(Error::PermissionDenied);
+	}
+	let inside = in_folder(app, tn_id, &root, &target.entry_id, false).await?;
+	let allowed = match op {
+		LifecycleOp::Rename | LifecycleOp::Trash | LifecycleOp::Versions => inside,
+		LifecycleOp::Replace => {
+			inside || (root.entry_id == target.entry_id && root.file_tp.as_deref() == Some("BLOB"))
+		}
+		LifecycleOp::Move { new_parent: parent }
+		| LifecycleOp::RestoreFromTrash { parent }
+		| LifecycleOp::CopyInto { parent } => match parent {
+			Some(parent) => inside && in_folder(app, tn_id, &root, &parent, true).await?,
+			None => false,
+		},
+		LifecycleOp::Purge | LifecycleOp::Share => false,
+	};
+	if allowed { Ok(()) } else { Err(Error::PermissionDenied) }
 }
 
 /// Whether a file in `channel` is within the subject's ambient reach: open floor always is,
@@ -543,6 +725,21 @@ async fn access_level(
 	inherited_share: Option<AccessLevel>,
 	skip_direct: bool,
 ) -> AccessLevel {
+	// A drive scope narrows: the subject's own unscoped ladder, denied outside the scoped
+	// drive(s) with no visibility fall-through, capped at the scope level.
+	if let Some((drive, access)) = drive_scope(ctx.scope) {
+		if !drive.matches(file.channel, ctx.tenant_id_tag) {
+			return AccessLevel::None;
+		}
+		let ctx = ctx.unscoped();
+		let level = identity_level(app, tn_id, file, &ctx, inherited_share, skip_direct).await;
+		let level = if level == AccessLevel::None {
+			visibility_level(app, tn_id, &file, &ctx).await
+		} else {
+			level
+		};
+		return level.min(access);
+	}
 	let level = match ctx.scope {
 		Some(scope) => scope_grant(app, tn_id, &file, scope).await.unwrap_or(AccessLevel::None),
 		None => identity_level(app, tn_id, file, ctx, inherited_share, skip_direct).await,
@@ -698,8 +895,8 @@ async fn identity_level(
 }
 
 /// The scope rung: what a `file:{file_id}:{R|C|W}` scope grants on `file`. `None` on a mismatch,
-/// an `ApkgPublish` scope, or an unparseable one — the caller then falls to the visibility rung.
-/// A `device:{root_id}` scope grants like a `file:{root_id}:W` folder share.
+/// an `ApkgPublish` or `RemoteFile` scope, or an unparseable one — the caller then falls to the
+/// visibility rung.
 ///
 /// Matches, in order: the scoped file itself; a child in its document tree (`root_id`); a file
 /// linked from it by an `'F'` share entry, capped at that entry; a descendant of a scoped folder.
@@ -709,7 +906,7 @@ async fn scope_grant(
 	file: &FileRef<'_>,
 	scope: &str,
 ) -> Option<AccessLevel> {
-	let token_scope = TokenScope::parse(scope)?;
+	let token_scope = delegated_scope(scope)?;
 	let (scope_file_id, access) = token_scope.file_grant()?;
 	let entry_id = file.entry_id;
 	let scope_view = resolve_scope_entry(&app.meta_adapter, tn_id, scope_file_id).await?;
@@ -829,7 +1026,9 @@ pub async fn admitted(
 		check_lifecycle(app, tn_id, &view, &file, ctx, level, ctx.names_holder).await?;
 		return Ok(vec![(view, level)]);
 	}
-	let direct = match (ctx.scope, entries.first().and_then(|e| e.file_id.as_deref())) {
+	// A drive scope looks its direct shares up like the unscoped subject it narrows.
+	let share_scope = if drive_scope(ctx.scope).is_some() { None } else { ctx.scope };
+	let direct = match (share_scope, entries.first().and_then(|e| e.file_id.as_deref())) {
 		(None, Some(content_id)) if !ctx.user_id_tag.is_empty() => {
 			app.meta_adapter
 				.check_content_share_access(tn_id, content_id, ctx.user_id_tag)
@@ -934,6 +1133,17 @@ async fn entry_level(
 		}
 		_ => level,
 	}
+}
+
+/// Whether the caller may read `view` itself — access rungs and room, ignoring where it sits and
+/// its lifecycle (trashed, tombstoned). Only for deciding who learns that an entry left a view.
+pub async fn readable_ignoring_lifecycle(
+	app: &App,
+	tn_id: TnId,
+	view: &FileView,
+	ctx: &FileAccessCtx<'_>,
+) -> bool {
+	entry_level(app, tn_id, view, ctx, None, None, false).await.can_read()
 }
 
 /// The visibility rung: `Read` when the file's `visibility` admits the caller and its channel is
@@ -1050,8 +1260,9 @@ async fn access_result(
 
 	// Cap access by file-to-file share entry when opened via embedding
 	// (resource = target, subject = the embedding container)
+	// A drive-scoped caller is the unscoped subject narrowed: the cap applies to it too.
 	if let Some(via_file_id) = via
-		&& ctx.scope.is_none()
+		&& (ctx.scope.is_none() || drive_scope(ctx.scope).is_some())
 		&& access_level != AccessLevel::None
 	{
 		// The embedding container is named by any file id — a deduplicated content id names
@@ -1103,12 +1314,13 @@ pub enum ScopeCheck {
 pub async fn check_scope_allows_file(
 	meta: &Arc<dyn meta_adapter::MetaAdapter>,
 	tn_id: TnId,
+	tenant_id_tag: &str,
 	scope: Option<&str>,
 	file: &FileView,
 ) -> ScopeCheck {
 	let Some(scope_str) = scope else { return ScopeCheck::NoScope };
-	// If a scope string is present but can't be parsed, deny access (least privilege)
-	let Some(token_scope) = TokenScope::parse(scope_str) else { return ScopeCheck::Denied };
+	// A malformed or capability-only scope carries no file grant: deny (least privilege)
+	let Some(token_scope) = delegated_scope(scope_str) else { return ScopeCheck::Denied };
 	match &token_scope {
 		TokenScope::File { file_id: scope_file_id, access, .. } => {
 			let Some(target) = resolve_scope_entry(meta, tn_id, scope_file_id).await else {
@@ -1124,9 +1336,16 @@ pub async fn check_scope_allows_file(
 			}
 			ScopeCheck::Denied
 		}
-		// Not a user-data scope. A device key reads its root subtree through `scope_grant`
-		// (Write, via `file_grant()`); only this path refuses it.
-		TokenScope::ApkgPublish | TokenScope::Device { .. } => ScopeCheck::Denied,
+		// A drive scope: any entry in a scoped drive (the caller's access check narrowed it).
+		TokenScope::Drive { drive, access } => {
+			if drive.matches(file.channel.as_deref(), tenant_id_tag) {
+				ScopeCheck::Allowed(*access)
+			} else {
+				ScopeCheck::Denied
+			}
+		}
+		// Not a local user-data scope: `rfile:` grants nothing on this node.
+		TokenScope::ApkgPublish | TokenScope::RemoteFile { .. } => ScopeCheck::Denied,
 	}
 }
 
@@ -1148,20 +1367,35 @@ pub async fn check_scope_allows_create_in(
 	meta: &Arc<dyn meta_adapter::MetaAdapter>,
 	cache: &DirCache,
 	tn_id: TnId,
+	tenant_id_tag: &str,
 	scope: Option<&str>,
 	parent_id: Option<&str>,
 	root_id: Option<&str>,
 ) -> Result<(), Error> {
 	let Some(scope_str) = scope else { return Ok(()) };
-	// If a scope string is present but can't be parsed, deny access (least privilege)
-	let Some(token_scope) = TokenScope::parse(scope_str) else {
+	// A malformed or capability-only scope carries no file grant: deny (least privilege)
+	let Some(token_scope) = delegated_scope(scope_str) else {
 		return Err(Error::PermissionDenied);
 	};
 	// Middleware already restricts `apkg:publish` to /api/files/apkg/
 	if token_scope == TokenScope::ApkgPublish {
 		return Ok(());
 	}
-	// A device scope bounds creation exactly like a `file:{root_id}:W` folder share.
+	// A drive scope at `W`: the parent is in a scoped drive. At a drive root (no parent) the
+	// handler's `resolve_child_channel` checks the landing drive, then the unscoped create rules.
+	if let TokenScope::Drive { drive, access } = &token_scope {
+		if !access.can_write() {
+			return Err(Error::PermissionDenied);
+		}
+		let Some(parent) = parent_id.filter(|p| *p != meta_adapter::ROOT_PARENT_ID) else {
+			return Ok(());
+		};
+		return match meta.read_file(tn_id, parent).await? {
+			Some(p) if drive.matches(p.channel.as_deref(), tenant_id_tag) => Ok(()),
+			_ => Err(Error::PermissionDenied),
+		};
+	}
+	// `rfile:` has no local grant, so `file_grant()` is `None` and creation is refused.
 	let Some((scope_file_id, access)) = token_scope.file_grant() else {
 		return Err(Error::PermissionDenied);
 	};
@@ -1212,8 +1446,9 @@ pub fn scope_char_within(requested: AccessLevel, held: AccessLevel) -> Option<ch
 pub fn scope_grants_collection_op(scope: Option<&str>, resource_type: &str, action: &str) -> bool {
 	let Some(scope) = scope else { return false };
 	// `Write` is the top of the scope vocabulary — `AccessLevel::to_scope_char` caps `Admin` at
-	// `'W'` and `TokenScope::parse` refuses any other char, so `Admin` is unreachable here.
-	TokenScope::parse(scope)
+	// `'W'` and `TokenScope::parse` (behind `delegated_scope`) refuses any other char, so
+	// `Admin` is unreachable here.
+	delegated_scope(scope)
 		.is_some_and(|ts| matches!(ts.file_grant(), Some((_, AccessLevel::Write))))
 		&& resource_type == "file"
 		&& action == "create"
@@ -1250,7 +1485,7 @@ mod tests {
 
 	#[tokio::test]
 	#[allow(clippy::unwrap_used)]
-	async fn device_scope_bounds_create_to_its_root_subtree() {
+	async fn folder_scope_bounds_create_to_its_root_subtree() {
 		use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 		use cloudillo_types::meta_adapter::{CreateFile, FileStatus, MetaAdapter as _};
 
@@ -1275,15 +1510,26 @@ mod tests {
 		let cache = DirCache::new(64);
 
 		for (scope, parent, allowed) in [
-			("device:PB", Some("PB"), true),
-			("device:PB", Some("PB1"), true),
-			("device:PB", Some("OTHER"), false),
-			("device:PB", None, false),
-			("device:PB1", Some("PB"), false),
-			("device:MISSING", Some("PB"), false),
+			("file:PB:W", Some("PB"), true),
+			("file:PB:W", Some("PB1"), true),
+			("file:PB:W", Some("OTHER"), false),
+			("file:PB:W", None, false),
+			("file:PB1:W", Some("PB"), false),
+			("file:MISSING:W", Some("PB"), false),
+			("file:PB:R", Some("PB"), false),
+			("rfile:bob.example:PB:W", Some("PB"), false),
+			("device:PB", Some("PB"), false),
 		] {
-			let r =
-				check_scope_allows_create_in(&meta, &cache, tn_id, Some(scope), parent, None).await;
+			let r = check_scope_allows_create_in(
+				&meta,
+				&cache,
+				tn_id,
+				"owner",
+				Some(scope),
+				parent,
+				None,
+			)
+			.await;
 			assert_eq!(r.is_ok(), allowed, "{scope} into {parent:?}");
 		}
 	}
@@ -1291,7 +1537,7 @@ mod tests {
 	#[test]
 	fn folder_write_scope_grants_file_create() {
 		assert!(scope_grants_collection_op(Some("file:f1~abc:W"), "file", "create"));
-		assert!(scope_grants_collection_op(Some("device:f1~abc"), "file", "create"));
+		assert!(!scope_grants_collection_op(Some("rfile:bob.example:f1~abc:W"), "file", "create"));
 	}
 
 	#[test]

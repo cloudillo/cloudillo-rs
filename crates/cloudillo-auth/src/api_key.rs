@@ -6,7 +6,7 @@
 use axum::{
 	Json,
 	extract::{ConnectInfo, Path, State},
-	http::StatusCode,
+	http::{HeaderMap, StatusCode, header},
 };
 use cloudillo_types::extract::JsonBody;
 use serde::{Deserialize, Serialize};
@@ -17,8 +17,8 @@ use crate::audit::{record_auth, verify_own_password};
 
 use cloudillo_core::Auth;
 use cloudillo_types::{
-	auth_adapter::{ApiKeyInfo, AuthCtx, CreateApiKeyOptions},
-	types::{ApiResponse, ApiTime},
+	auth_adapter::{ApiKeyInfo, AuthCtx, CreateApiKeyOptions, CreatedApiKey},
+	types::{ApiResponse, ApiTime, ScopeSet},
 };
 
 use crate::prelude::*;
@@ -184,7 +184,6 @@ pub(crate) async fn mint_remember_key(
 			name: Some(name.unwrap_or("Remembered device")),
 			scopes: None,
 			expires_at: clamp_unscoped_expiry(app, tn_id, now, None).await?,
-			auth_time: Some(now),
 		};
 		let created = app.auth_adapter.create_api_key(tn_id, opts).await?;
 		let details = serde_json::json!({
@@ -202,29 +201,101 @@ pub(crate) async fn mint_remember_key(
 	})
 }
 
-/// A `device:{root_id}` scope must name a live (active, untrashed) folder of this tenant
-async fn check_device_root(app: &App, tn_id: TnId, scopes: Option<&str>) -> ClResult<()> {
-	use cloudillo_core::file_access;
-	use cloudillo_types::{meta_adapter::FileStatus, types::TokenScope};
-	let Some(TokenScope::Device { root_id }) = scopes.and_then(TokenScope::parse) else {
-		return Ok(());
-	};
-	let ok = match file_access::resolve_scope_entry(&app.meta_adapter, tn_id, &root_id).await {
-		Some(view) => {
-			view.file_tp.as_deref() == Some("FLDR")
-				&& matches!(view.status, FileStatus::Active)
-				&& !file_access::in_trash(app, tn_id, &view).await?
-		}
-		None => false,
-	};
-	if ok {
-		Ok(())
-	} else {
-		Err(Error::InvalidField {
-			field: "scopes",
-			message: "device root must be an active folder".into(),
+/// Parse a key's `scopes`: every entry must be known, with at most one delegated scope.
+fn parse_scope_set(scopes: Option<&str>) -> ClResult<Option<ScopeSet>> {
+	scopes
+		.map(|s| {
+			ScopeSet::parse(s).ok_or(Error::InvalidField {
+				field: "scopes",
+				message: "invalid scope list".into(),
+			})
 		})
+		.transpose()
+}
+
+/// The delegated entry of an API key must be bindable. `file:{id}:{R|W}` names a live (active,
+/// untrashed) entry of this tenant, a folder or a single file, and carries no share-link ref.
+/// `rfile:{id_tag}:{id}:{R|W}` names another context; its root is checked there, at exchange.
+/// A drive scope (`file:__root__` / `file:*` / `file:~name`) names a drive of this tenant: the
+/// main drive and `*` always exist, a room must exist. `rfile:` drive targets are checked remotely.
+async fn check_file_key_root(
+	app: &App,
+	tn_id: TnId,
+	tenant_id_tag: &str,
+	set: Option<&ScopeSet>,
+) -> ClResult<()> {
+	use cloudillo_core::file_access;
+	use cloudillo_types::{
+		meta_adapter::FileStatus,
+		types::{DriveTarget, TokenScope},
+	};
+	match set.and_then(|s| s.delegated.as_ref()) {
+		Some(TokenScope::File { file_id, ref_id, .. }) => {
+			let live =
+				match file_access::resolve_scope_entry(&app.meta_adapter, tn_id, file_id).await {
+					Some(view) => {
+						matches!(view.status, FileStatus::Active)
+							&& !file_access::in_trash(app, tn_id, &view).await?
+					}
+					None => false,
+				};
+			if ref_id.is_none() && live {
+				Ok(())
+			} else {
+				Err(Error::InvalidField {
+					field: "scopes",
+					message: "file scope root must be an active entry, without a share ref".into(),
+				})
+			}
+		}
+		Some(TokenScope::RemoteFile { id_tag, .. })
+			if id_tag.eq_ignore_ascii_case(tenant_id_tag) =>
+		{
+			Err(Error::InvalidField {
+				field: "scopes",
+				message: "remote file scope must name another context".into(),
+			})
+		}
+		Some(TokenScope::Drive { drive: DriveTarget::Room(name), .. }) => {
+			app.meta_adapter.read_channel(tn_id, name).await.map(|_| ()).map_err(|_| {
+				Error::InvalidField {
+					field: "scopes",
+					message: "drive scope room not found".into(),
+				}
+			})
+		}
+		_ => Ok(()),
 	}
+}
+
+/// Mint core shared by `POST /api/auth/api-keys` and QR pairing: validates `opts.scopes`
+/// (parse, then [`check_file_key_root`]), creates the key and audits it. Callers minting an
+/// unscoped key (`scopes: None`) must gate it first (MFA, re-auth, expiry clamp), as
+/// [`create_api_key`] does.
+pub(crate) async fn mint_api_key(
+	app: &App,
+	addr: &SocketAddr,
+	tn_id: TnId,
+	id_tag: &str,
+	opts: CreateApiKeyOptions<'_>,
+) -> ClResult<CreatedApiKey> {
+	let set = parse_scope_set(opts.scopes)?;
+	check_file_key_root(app, tn_id, id_tag, set.as_ref()).await?;
+	let created = app.auth_adapter.create_api_key(tn_id, opts).await?;
+	record_auth(
+		app,
+		"auth.apikey.create",
+		"success",
+		Some(tn_id),
+		id_tag,
+		addr,
+		Some(serde_json::json!({
+			"keyId": created.info.key_id,
+			"keyPrefix": &*created.info.key_prefix,
+		})),
+	)
+	.await;
+	Ok(created)
 }
 
 /// POST /api/auth/api-keys - Create a new API key
@@ -237,7 +308,6 @@ pub async fn create_api_key(
 	info!("Creating API key for tenant {}", auth.id_tag);
 
 	let scopes = non_blank(req.scopes);
-	check_device_root(&app, auth.tn_id, scopes.as_deref()).await?;
 	let mut expires_at = req.expires_at.map(Timestamp::from);
 	if scopes.is_none() {
 		if cloudillo_core::middleware::unscoped_key_refused(&app, auth.tn_id).await? {
@@ -249,30 +319,12 @@ pub async fn create_api_key(
 		require_reauth(&app, &addr, &auth, req.reauth.as_ref()).await?;
 		expires_at = clamp_unscoped_expiry(&app, auth.tn_id, Timestamp::now(), expires_at).await?;
 	}
-	// A scoped key inherits the caller's login time, so a key → session → key chain stays
-	// bounded by `auth.session_timeout`. An unscoped key counts as a fresh login on each use;
-	// it is bounded by `auth.remember_days` and only mintable after re-authentication.
-	let opts = CreateApiKeyOptions {
-		name: req.name.as_deref(),
-		scopes: scopes.as_deref(),
-		expires_at,
-		auth_time: auth.auth_time,
-	};
+	// Every API key counts as a fresh login on each use, so it carries no login time. It is
+	// bounded by `expires_at`; an unscoped key also by `auth.remember_days` and re-auth to mint.
+	let opts =
+		CreateApiKeyOptions { name: req.name.as_deref(), scopes: scopes.as_deref(), expires_at };
 
-	let created = app.auth_adapter.create_api_key(auth.tn_id, opts).await?;
-	record_auth(
-		&app,
-		"auth.apikey.create",
-		"success",
-		Some(auth.tn_id),
-		&auth.id_tag,
-		&addr,
-		Some(serde_json::json!({
-			"keyId": created.info.key_id,
-			"keyPrefix": &*created.info.key_prefix,
-		})),
-	)
-	.await;
+	let created = mint_api_key(&app, &addr, auth.tn_id, &auth.id_tag, opts).await?;
 
 	let response_data = CreateApiKeyRes {
 		key_id: created.info.key_id.to_string(),
@@ -337,7 +389,8 @@ pub async fn update_api_key(
 	let name = merge(req.name, current.name.map(String::from));
 	let was_scoped = current.scopes.as_deref().is_some_and(|s| !s.trim().is_empty());
 	let scopes = non_blank(merge(req.scopes, current.scopes.map(String::from)));
-	check_device_root(&app, auth.tn_id, scopes.as_deref()).await?;
+	let set = parse_scope_set(scopes.as_deref())?;
+	check_file_key_root(&app, auth.tn_id, &auth.id_tag, set.as_ref()).await?;
 	let mut expires_at =
 		merge(req.expires_at.map(Timestamp::from), current.expires_at.map(Timestamp::from));
 	if scopes.is_none() && was_scoped {
@@ -395,6 +448,49 @@ pub async fn delete_api_key(
 
 	info!("Deleted API key {} for tenant {}", key_id, auth.id_tag);
 
+	Ok(StatusCode::NO_CONTENT)
+}
+
+/// DELETE /api/auth/current-api-key - A tenant API key deletes itself.
+///
+/// `AuthCtx` carries no key id, so the bearer is re-validated here to find it. Only a `cl_`
+/// key in the `Authorization` header qualifies; access tokens, share links, sessions and
+/// `idp_` keys get 403. `scope_permits` admits this route for every valid scope set.
+pub async fn delete_self_api_key(
+	State(app): State<App>,
+	ConnectInfo(addr): ConnectInfo<SocketAddr>,
+	Auth(auth): Auth,
+	headers: HeaderMap,
+) -> ClResult<StatusCode> {
+	let token = headers
+		.get(header::AUTHORIZATION)
+		.and_then(|h| h.to_str().ok())
+		.and_then(|h| h.strip_prefix("Bearer "))
+		.map(str::trim)
+		.filter(|t| t.starts_with("cl_"))
+		.ok_or(Error::PermissionDenied)?;
+	let validation = app
+		.auth_adapter
+		.validate_api_key(token)
+		.await
+		.map_err(|_| Error::PermissionDenied)?;
+	if validation.tn_id != auth.tn_id {
+		return Err(Error::PermissionDenied);
+	}
+
+	app.auth_adapter.delete_api_key(auth.tn_id, validation.key_id).await?;
+	record_auth(
+		&app,
+		"auth.apikey.delete",
+		"success",
+		Some(auth.tn_id),
+		&auth.id_tag,
+		&addr,
+		Some(serde_json::json!({ "keyId": validation.key_id, "self": true })),
+	)
+	.await;
+
+	info!("API key {} deleted itself for tenant {}", validation.key_id, auth.id_tag);
 	Ok(StatusCode::NO_CONTENT)
 }
 

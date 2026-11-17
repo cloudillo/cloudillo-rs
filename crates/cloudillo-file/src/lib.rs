@@ -30,6 +30,7 @@ pub mod sync;
 pub mod tag;
 pub mod trash_purge;
 pub(crate) mod variant;
+pub mod version;
 pub(crate) mod video;
 
 mod prelude;
@@ -57,6 +58,19 @@ pub use container::{MAX_CONTAINER_BYTES, MAX_ENTRY_BYTES, MAX_MANIFEST_BYTES};
 /// paths use, rather than a second copy of it — and streams into it with the same capped
 /// writer.
 pub use scratch::{TempFileGuard, write_capped};
+
+/// Tell the tenant's WebSocket sessions that something in the file tree changed; clients
+/// re-poll `GET /api/file-changes`. `entries` are the changed entry ids whose current **or
+/// previous** location decides which scoped `/ws/file-changes` sockets are told; an empty slice
+/// means "location unknown, tell everyone". The bus is tenant-only, so the ids are harmless there.
+pub async fn notify_files_changed(app: &App, tn_id: TnId, entries: &[&str]) {
+	let msg = cloudillo_core::ws_broadcast::BroadcastMessage::new(
+		"filesChanged",
+		serde_json::json!({ "entries": entries }),
+		"system",
+	);
+	app.broadcast.send_to_tenant(tn_id, msg).await;
+}
 
 /// Create a new container cache for registration in extensions
 pub fn new_container_cache() -> Arc<ContainerCache> {

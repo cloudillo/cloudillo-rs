@@ -477,7 +477,7 @@ async fn file_id_generated_reaches_only_the_uploader() {
 	for (i, owner) in [Some("m-contributor.test"), None].into_iter().enumerate() {
 		let blob = format!("b1~zqm-fid{i}");
 		let opts = CreateFile {
-			preset: Some("default".into()),
+			preset: Some("standard".into()),
 			orig_variant_id: Some(blob.as_str().into()),
 			owner_tag: owner.map(Into::into),
 			content_type: "text/plain".into(),
@@ -1604,7 +1604,7 @@ async fn seed_blob(
 		.create_file(
 			tn,
 			CreateFile {
-				preset: Some("default".into()),
+				preset: Some("standard".into()),
 				orig_variant_id: Some(blob.as_str().into()),
 				// A reference names its content up front; an upload learns it at finalize.
 				file_id: upstream.map(|_| format!("f1~zqm-{key}").into()),
@@ -1767,6 +1767,183 @@ async fn room_drives() {
 	let (st, body) = send("m-moderator@club.test", Method::PATCH, curi, to_main).await;
 	assert!(st.is_client_error(), "off-roster moderator moves across drives: {st} {body}");
 	assert_eq!(channel(cdir).await.as_deref(), Some(closed), "folder stays in closed-w");
+}
+
+/// The change feed (`GET /api/file-changes`): an entry moved and renamed out of the root comes
+/// back as a bare `gone` marker without its new name, a trashed one as `gone`; an entry the
+/// caller cannot read — inside the root in a room it cannot enter (a lower role), or a private
+/// entry elsewhere in the tenant (stranger, follower, grantee) — comes back not at all; a cursor
+/// older than a tombstone purge is 410. The purge runs on the disposable `trash` tenant: on
+/// alice or club it would turn every `since=0` curated row into a 410.
+#[tokio::test]
+async fn file_change_feed() {
+	use cloudillo::meta_adapter::{CreateFile, FileStatus};
+	use serde_json::{Value, json};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let subj = |n: &str| fx.subject(n);
+	let send = |host: &'static str, n: &'static str, m: Method, uri: String, v: Value| async move {
+		let body = if v.is_null() { Body::empty() } else { Body::from(v.to_string()) };
+		call(&fx.api, req(host, m, &uri, bearer(subj(n)), body)).await
+	};
+	let mk = |host: &'static str, n: &'static str, v: Value| async move {
+		let (st, body) = send(host, n, Method::POST, "/api/files".into(), v).await;
+		assert!(st.is_success(), "{n} creates: {st} {body}");
+		find_str(&body, "id").expect("entry id")
+	};
+	let fldr = |name: &str, parent: Option<&str>| json!({ "fileTp": "FLDR", "fileName": name, "parentId": parent });
+	// Every change under `root` since `since`, all pages.
+	let feed = |host: &'static str, n: &'static str, root: String, since: i64| async move {
+		let mut out = Vec::new();
+		let mut q = format!("since={since}");
+		loop {
+			let uri = format!("/api/file-changes?root={root}&limit=1000&{q}");
+			let (st, body) = send(host, n, Method::GET, uri, Value::Null).await;
+			assert_eq!(st, StatusCode::OK, "{n} reads the feed of {root}: {body}");
+			let data = &body["data"];
+			out.extend(data["changes"].as_array().cloned().unwrap_or_default());
+			match data["next"].as_str() {
+				Some(next) => q = format!("since={}&after={next}", data["cursor"]),
+				None => break out,
+			}
+		}
+	};
+	let find = |rows: &[Value], id: &str| rows.iter().find(|r| r["id"] == id).cloned();
+	let assert_gone = |r: &Value, what: &str| {
+		let mut keys: Vec<_> =
+			r.as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
+		keys.sort();
+		assert_eq!(keys, ["gone", "id", "updatedAt"], "{what}: a bare gone marker: {r}");
+		assert_eq!(r["gone"].as_bool(), Some(true), "{what}: {r}");
+	};
+
+	// Moved and renamed out of the root, and trashed inside it.
+	let o = "owner@alice";
+	let root = mk(ALICE, o, fldr("zqm-feed-root", None)).await;
+	let out = mk(ALICE, o, fldr("zqm-feed-out", None)).await;
+	let moved = mk(ALICE, o, fldr("zqm-feed-moved", Some(root.as_str()))).await;
+	let trashed = mk(ALICE, o, fldr("zqm-feed-trashed", Some(root.as_str()))).await;
+	let rows = feed(ALICE, o, root.clone(), 0).await;
+	for id in [&moved, &trashed] {
+		let r = find(&rows, id).expect("an entry inside the root is listed");
+		assert!(r.get("gone").is_none() && r["fileName"].is_string(), "a full row: {r}");
+	}
+	let uri = format!("/api/files/{moved}");
+	let (st, body) = send(ALICE, o, Method::PATCH, uri.clone(), json!({ "parentId": out })).await;
+	assert!(st.is_success(), "move out: {st} {body}");
+	let rename = json!({ "fileName": "zqm-feed-renamed" });
+	let (st, body) = send(ALICE, o, Method::PATCH, uri, rename).await;
+	assert!(st.is_success(), "rename: {st} {body}");
+	let uri = format!("/api/files/{trashed}");
+	let (st, body) = send(ALICE, o, Method::DELETE, uri, Value::Null).await;
+	assert!(st.is_success(), "trash: {st} {body}");
+	let rows = feed(ALICE, o, root, 0).await;
+	assert_gone(&find(&rows, &moved).expect("moved out: still reported"), "moved out");
+	assert_gone(&find(&rows, &trashed).expect("trashed: still reported"), "trashed");
+	let all = Value::Array(rows).to_string();
+	assert!(!all.contains("zqm-feed-renamed"), "the root's feed names the moved entry: {all}");
+	// Where it went, it is a full row.
+	let rows = feed(ALICE, o, out, 0).await;
+	let r = find(&rows, &moved).expect("listed in its new folder");
+	assert_eq!(r["fileName"], "zqm-feed-renamed", "{r}");
+
+	// Inside a folder the contributor reads, but in `mods`, which needs a moderator.
+	let club = fx.tenants.club.tn_id;
+	let folder = fx
+		.objs
+		.iter()
+		.find_map(|o| match o {
+			fixture::Obj::File(f) if f.tn_id == club && f.spec.name == "folder-blob-d-active" => {
+				Some(f.entry_id.clone())
+			}
+			_ => None,
+		})
+		.expect("club folder");
+	let c = "m-contributor@club.test";
+	let mine = mk(CLUB, c, fldr("zqm-feed-mine", Some(folder.as_str()))).await;
+	let in_mods = fx
+		.app
+		.meta_adapter
+		.create_file(
+			club,
+			CreateFile {
+				file_name: "zqm-feed-mods".into(),
+				file_tp: Some("FLDR".into()),
+				content_type: "cloudillo/folder".into(),
+				parent_id: Some(folder.clone().into()),
+				channel: Some("@club.test~mods".into()),
+				status: Some(FileStatus::Active),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap()
+		.entry_id;
+	let rows = feed(CLUB, c, folder.clone(), 0).await;
+	let r = find(&rows, &mine).expect("own entry in the folder");
+	assert!(r.get("gone").is_none(), "own entry in full: {r}");
+	// Not even as `gone`: the feed never names an entry the caller cannot read.
+	assert!(find(&rows, &in_mods).is_none(), "unenterable room entry named to a contributor");
+	let rows = feed(CLUB, "owner@club", folder, 0).await;
+	let r = find(&rows, &in_mods).expect("room entry, owner");
+	assert_eq!(r["fileName"], "zqm-feed-mods", "the owner enters the room: {r}");
+
+	// A private entry elsewhere in the tenant, changed after a public folder: no subject who
+	// reads the folder (or follows `__root__`) learns its id, as a row or as `gone`. The guest,
+	// share-link and `idp_` refusals are curated (MG-726..MG-729, MG-745, MG-795).
+	let alice = fx.tenants.alice.tn_id;
+	let pub_dir = fx
+		.app
+		.meta_adapter
+		.create_file(
+			alice,
+			CreateFile {
+				file_name: "zqm-feed-public".into(),
+				file_tp: Some("FLDR".into()),
+				content_type: "cloudillo/folder".into(),
+				visibility: Some('P'),
+				status: Some(FileStatus::Active),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap()
+		.entry_id;
+	let secret = mk(ALICE, o, fldr("zqm-feed-secret", None)).await;
+	let rename = json!({ "fileName": "zqm-feed-secret2" });
+	let (st, body) = send(ALICE, o, Method::PATCH, format!("/api/files/{secret}"), rename).await;
+	assert!(st.is_success(), "rename the private entry: {st} {body}");
+	for n in ["stranger@alice.test", "follower@alice.test", "g-read@alice.test"] {
+		for root in [pub_dir.to_string(), "__root__".to_owned()] {
+			let rows = feed(ALICE, n, root.clone(), 0).await;
+			assert!(find(&rows, &secret).is_none(), "{n} learns a private id from {root}");
+		}
+	}
+	let rows = feed(ALICE, o, "__root__".to_owned(), 0).await;
+	assert!(find(&rows, &secret).is_some(), "the owner sees its own entry");
+	// A fresh request rewinds 10s: a row stamped 5s before `since` (a late commit) comes back.
+	let now = cloudillo::types::Timestamp::now().0;
+	let rows = feed(ALICE, o, "__root__".to_owned(), now + 5).await;
+	assert!(find(&rows, &secret).is_some(), "a row 5s before a fresh since");
+	let rows = feed(ALICE, o, "__root__".to_owned(), now + 60).await;
+	assert!(find(&rows, &secret).is_none(), "the rewind is bounded");
+
+	// A cursor older than the last tombstone purge: 410; a cursor after it reads.
+	let trash = fx.tenants.trash.tn_id;
+	let t = "owner@trash";
+	let troot = mk(TRASH, t, fldr("zqm-feed-purge", None)).await;
+	let doomed = seed_blob(fx, trash, "feed-doomed", "zqm-feed-doomed", None, None, None).await;
+	for q in ["", "?permanent=true"] {
+		let uri = format!("/api/files/{doomed}{q}");
+		let (st, body) = send(TRASH, t, Method::DELETE, uri, Value::Null).await;
+		assert!(st.is_success(), "delete{q}: {st} {body}");
+	}
+	let purged = fx.app.meta_adapter.purge_tombstones(trash).await.unwrap();
+	assert!(purged >= 1, "a tombstone to purge");
+	let uri = format!("/api/file-changes?root={troot}&since=0");
+	let (st, body) = send(TRASH, t, Method::GET, uri, Value::Null).await;
+	assert_eq!(st, StatusCode::GONE, "a cursor older than the purge: {body}");
+	feed(TRASH, t, troot, cloudillo::types::Timestamp::now().0 + 1).await;
 }
 
 /// Trashing, then purging, one entry of a BLOB leaves the live sibling whole: its grantee still
@@ -4035,7 +4212,7 @@ async fn seed_part(
 		.create_file(
 			tn,
 			CreateFile {
-				preset: Some("default".into()),
+				preset: Some("standard".into()),
 				orig_variant_id: Some(orig.into()),
 				root_id: root.map(Into::into),
 				channel: channel.map(Into::into),
@@ -4863,7 +5040,7 @@ async fn a_deduped_draft_attachment_still_publishes() {
 		.create_file(
 			alice,
 			CreateFile {
-				preset: Some("default".into()),
+				preset: Some("standard".into()),
 				orig_variant_id: Some("b1~zqm-dd-2".into()),
 				owner_tag: Some(ALICE.into()),
 				content_type: "text/plain".into(),
@@ -5582,8 +5759,8 @@ async fn folder_link_writes() {
 		async move { call(&fx.api, r).await }
 	};
 	let upload = |parent: Option<&str>| match parent {
-		Some(p) => format!("/api/uploads/file?name=zqm-fw.txt&parentId={p}"),
-		None => "/api/uploads/file?name=zqm-fw.txt".to_owned(),
+		Some(p) => format!("/api/uploads/standard?name=zqm-fw.txt&parentId={p}"),
+		None => "/api/uploads/standard?name=zqm-fw.txt".to_owned(),
 	};
 	for (id, tok, parent, allowed) in [
 		("FC-155", &w, Some(folder.as_str()), true),
@@ -6533,7 +6710,7 @@ async fn upload_named_restore_creates_a_file() {
 	let _g = FIXTURE_LOCK.write().await;
 	let fx = setup().await;
 	let owner = bearer(fx.subject("owner@alice"));
-	let uri = "/api/uploads/file?name=restore";
+	let uri = "/api/uploads/standard?name=restore";
 	let (st, b) = call(&fx.api, req(ALICE, Method::POST, uri, owner, Body::from("zqm-p6"))).await;
 	assert!(st.is_success(), "upload named restore: {st} {b}");
 	assert_eq!(find_str(&b, "fileName").as_deref(), Some("restore"), "{b}");
@@ -6605,7 +6782,7 @@ async fn share_link_variants_and_descriptor() {
 		assert!(!st.is_success() && !desc, "{who} reads the file or its descriptor: {st} {desc}");
 	}
 
-	let up = "/api/uploads/file?name=zqm-p6.txt";
+	let up = "/api/uploads/standard?name=zqm-p6.txt";
 	let r = req(ALICE, Method::POST, up, Some(link), Body::from("zqm"));
 	let (st, b) = call(&fx.api, r).await;
 	assert!(!st.is_success(), "a read link uploads: {st} {b}");

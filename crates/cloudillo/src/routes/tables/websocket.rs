@@ -22,13 +22,14 @@
 use axum::{Router, routing::any};
 
 use crate::prelude::*;
-use crate::websocket::{get_ws_bus, get_ws_crdt, get_ws_rtdb};
+use crate::websocket::{get_ws_bus, get_ws_crdt, get_ws_file_changes, get_ws_rtdb};
 
-/// The three WebSocket upgrade endpoints, mounted only on the API domain under
+/// The four WebSocket upgrade endpoints, mounted only on the API domain under
 /// the `"websocket"` rate-limit bucket (`routes/public.rs`).
 pub(crate) fn all() -> Router<App> {
 	Router::new()
 		.route("/ws/bus", any(get_ws_bus))
+		.route("/ws/file-changes", any(get_ws_file_changes))
 		.route("/ws/rtdb/{file_id}", any(get_ws_rtdb))
 		.route("/ws/crdt/{doc_id}", any(get_ws_crdt))
 }

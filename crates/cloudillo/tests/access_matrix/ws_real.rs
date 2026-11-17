@@ -8,8 +8,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::Request;
-use axum::http::header;
+use axum::http::{Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use futures::StreamExt;
@@ -18,8 +19,10 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use cloudillo_core::extract::IdTag;
 
-use crate::fixture::{ALICE, Fixture};
-use crate::objects::canon_root;
+use cloudillo::auth_adapter::CreateApiKeyOptions;
+
+use crate::fixture::{ALICE, Fixture, call, find_str, req};
+use crate::objects::{canon_folder, canon_root};
 use crate::ops::bearer;
 use crate::report::{Mismatch, Report};
 use crate::{FIXTURE_LOCK, setup};
@@ -43,8 +46,9 @@ async fn serve(fx: &Fixture) -> SocketAddr {
 	addr
 }
 
-/// Connect to `path` on `host` with `token` in `?token=`: `Ok(())` when admitted (no close
-/// within a second), `Err(code)` for the close code the server sent.
+/// Connect to `path` on `host` with `token` in `?token=`: `Ok(())` when admitted (the first
+/// frame within a second is not a Close; the bus pings at once), `Err(code)` for the close code
+/// the server sent.
 async fn connect(addr: SocketAddr, host: &str, path: &str, token: Option<&str>) -> Result<(), u16> {
 	let sep = if path.contains('?') { '&' } else { '?' };
 	let q = token.map_or(String::new(), |t| format!("{sep}token={t}"));
@@ -58,7 +62,7 @@ async fn connect(addr: SocketAddr, host: &str, path: &str, token: Option<&str>) 
 	}
 }
 
-/// WS-84..92 over a real upgrade; only the tenant account's bus stamps presence.
+/// WS-84..92, WS-104..105 over a real upgrade; only the tenant account's bus stamps presence.
 #[tokio::test]
 async fn ws_real() {
 	let _g = FIXTURE_LOCK.write().await;
@@ -73,7 +77,7 @@ async fn ws_real() {
 	let rtdb = crate::objects::file_id(ALICE, "tenant-rtdb-d-active");
 	let crdt_path = format!("/ws/crdt/{root}");
 	let rtdb_path = format!("/ws/rtdb/{rtdb}");
-	let cells: [(&str, &str, &str, Result<(), u16>); 9] = [
+	let cells: [(&str, &str, &str, Result<(), u16>); 11] = [
 		("WS-84", "owner@alice", "/ws/bus", Ok(())),
 		("WS-85", "stranger@alice.test", "/ws/bus", Err(4403)),
 		("WS-86", "anon@alice.test", "/ws/bus", Err(4401)),
@@ -83,6 +87,8 @@ async fn ws_real() {
 		("WS-90", "g-read@alice.test", &rtdb_path, Ok(())),
 		("WS-91", "stranger@alice.test", &rtdb_path, Err(4403)),
 		("WS-92", "owner@club", "/ws/bus", Ok(())),
+		("WS-104", "anon@alice.test", "/ws/file-changes", Err(4401)),
+		("WS-105", "apikey-file@alice", "/ws/file-changes", Ok(())),
 	];
 	for (id, name, path, want) in cells {
 		rep.cell();
@@ -99,6 +105,7 @@ async fn ws_real() {
 			});
 		}
 	}
+	rep.finish();
 
 	// A refused connection stamps no presence; the account's own does, once it closes.
 	let alice = fx.tenants.alice.tn_id;
@@ -110,9 +117,10 @@ async fn ws_real() {
 	assert_eq!(seen().await.map(|t| t.0), before.map(|t| t.0), "a refused bus stamped presence");
 	tokio::time::sleep(Duration::from_millis(1100)).await;
 	let (host, token) = tok("owner@alice");
-	let _ = connect(addr, &host, "/ws/bus", token.as_deref()).await;
+	let got = connect(addr, &host, "/ws/bus", token.as_deref()).await;
+	assert_eq!(got, Ok(()), "owner bus refused");
 	let mut stamped = false;
-	for _ in 0..30 {
+	for _ in 0..100 {
 		if seen().await.map(|t| t.0) != before.map(|t| t.0) {
 			stamped = true;
 			break;
@@ -120,7 +128,85 @@ async fn ws_real() {
 		tokio::time::sleep(Duration::from_millis(100)).await;
 	}
 	assert!(stamped, "the owner's bus left no presence stamp");
-	rep.finish();
+}
+
+/// A `filesChanged` text frame within `wait`; pings and other frames are skipped.
+async fn hint_within<S>(ws: &mut S, wait: Duration) -> bool
+where
+	S: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+	let deadline = tokio::time::Instant::now() + wait;
+	loop {
+		match tokio::time::timeout_at(deadline, ws.next()).await {
+			Ok(Some(Ok(Message::Text(t)))) if t.contains("filesChanged") => return true,
+			Ok(Some(Ok(_))) => {}
+			Ok(Some(Err(_)) | None) | Err(_) => return false,
+		}
+	}
+}
+
+/// `/ws/file-changes` hints stay inside the key's scope: a folder-scoped key's socket hears
+/// nothing of a folder created at the drive root, but hears one created in its folder. A key
+/// deleted via `DELETE /api/auth/current-api-key` cannot open a new socket.
+///
+/// The open socket's periodic revocation recheck (`KEY_RECHECK`, 5 minutes) is beyond the
+/// fixture's patience; the refused reconnect is the reachable negative for it.
+#[tokio::test]
+async fn ws_file_changes_scope() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let addr = serve(fx).await;
+	let alice = fx.tenants.alice.tn_id;
+	let folder = fx.app.meta_adapter.read_file(alice, &canon_folder(ALICE)).await.unwrap();
+	let folder = folder.unwrap().entry_id;
+	let scopes = format!("file:{folder}:R");
+	let opts =
+		CreateApiKeyOptions { name: Some("zqm-ws-scope"), scopes: Some(&scopes), expires_at: None };
+	let key = fx.app.auth_adapter.create_api_key(alice, opts).await.unwrap();
+	let key = key.plaintext_key.to_string();
+
+	let mut r = format!("ws://{addr}/ws/file-changes?token={key}")
+		.into_client_request()
+		.unwrap();
+	r.headers_mut().insert(header::HOST, ALICE.parse().unwrap());
+	let (mut ws, _) = tokio_tungstenite::connect_async(r).await.unwrap();
+	// Let the handler register its slot before anything changes.
+	tokio::time::sleep(Duration::from_millis(200)).await;
+	let owner = bearer(fx.subject("owner@alice")).map(str::to_owned);
+	let mkdir = async |name: &str, parent: Option<&str>| {
+		let body = serde_json::json!({ "fileTp": "FLDR", "fileName": name, "parentId": parent });
+		let req = req(ALICE, Method::POST, "/api/files", owner.as_deref(), body.to_string().into());
+		let (st, b) = call(&fx.api, req).await;
+		find_str(&b, "id").unwrap_or_else(|| panic!("mkdir {name}: {st} {b}"))
+	};
+
+	mkdir("zqm-ws-outside", None).await;
+	assert!(!hint_within(&mut ws, Duration::from_millis(700)).await, "hint outside the scope");
+	mkdir("zqm-ws-inside", Some(&folder)).await;
+	assert!(hint_within(&mut ws, Duration::from_secs(3)).await, "no hint inside the scope");
+	// A soft delete moves the entry out of the scope: the hint names the old parent too.
+	let trashed = mkdir("zqm-ws-trash", Some(&folder)).await;
+	assert!(hint_within(&mut ws, Duration::from_secs(3)).await, "no hint for the new folder");
+	let path = format!("/api/files/{trashed}");
+	let (st, b) =
+		call(&fx.api, req(ALICE, Method::DELETE, &path, owner.as_deref(), Body::empty())).await;
+	assert!(st.is_success(), "trash: {st} {b}");
+	assert!(
+		hint_within(&mut ws, Duration::from_secs(3)).await,
+		"no hint when trashed out of scope"
+	);
+	drop(ws);
+
+	let del = req(ALICE, Method::DELETE, "/api/auth/current-api-key", Some(&key), Body::empty());
+	let (st, b) = call(&fx.api, del).await;
+	assert!(st.is_success() || st == StatusCode::NO_CONTENT, "delete self key: {st} {b}");
+	// Refused at the upgrade: the key no longer authenticates (401), so no socket opens.
+	let mut r = format!("ws://{addr}/ws/file-changes?token={key}")
+		.into_client_request()
+		.unwrap();
+	r.headers_mut().insert(header::HOST, ALICE.parse().unwrap());
+	let got = tokio_tungstenite::connect_async(r).await;
+	assert!(got.is_err(), "a deleted key reopened /ws/file-changes");
 }
 
 // vim: ts=4

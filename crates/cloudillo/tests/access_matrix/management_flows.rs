@@ -24,6 +24,14 @@ use crate::ops::{Actual, bearer, status_class};
 use crate::subjects::Subject;
 use crate::{FIXTURE_LOCK, setup};
 
+/// The root entry id of a `file:{root}:{lvl}[,caps]` scope string.
+fn scope_root(scope: &str) -> &str {
+	scope
+		.strip_prefix("file:")
+		.and_then(|s| s.split(':').next())
+		.unwrap_or_default()
+}
+
 async fn send(fx: &Fixture, s: &Subject, m: Method, uri: &str, body: &str) -> (StatusCode, Value) {
 	let body = if body.is_empty() { Body::empty() } else { Body::from(body.to_owned()) };
 	call(&fx.api, req(&s.host, m, uri, bearer(s), body)).await
@@ -1220,12 +1228,7 @@ async fn suspension_expiry_and_mfa() {
 	let sadm = fx.subject("owner-sadm@admin");
 	let susp = "zqm-susp.test";
 	let tn = crate::fixture::tenant(&fx.app, susp, None).await.tn_id;
-	let opts = CreateApiKeyOptions {
-		name: Some("zqm-susp"),
-		scopes: None,
-		expires_at: None,
-		auth_time: None,
-	};
+	let opts = CreateApiKeyOptions { name: Some("zqm-susp"), scopes: None, expires_at: None };
 	let key = fx.app.auth_adapter.create_api_key(tn, opts).await.unwrap().plaintext_key;
 	let post = |uri: &'static str, body: String| {
 		call(&fx.api, req(susp, Method::POST, uri, None, Body::from(body)))
@@ -1313,7 +1316,6 @@ async fn suspension_expiry_and_mfa() {
 		name: Some("zqm-mfa-scoped"),
 		scopes: Some("carddav:read"),
 		expires_at: None,
-		auth_time: None,
 	};
 	let id = fx.app.auth_adapter.create_api_key(tn, scoped).await.unwrap().info.key_id;
 	let body = format!(r#"{{"scopes":null,"reauth":{{"password":"{PASSWORD}"}}}}"#);
@@ -1604,8 +1606,8 @@ async fn renewal_refused_past_session_timeout() {
 
 /// Unscoped API keys (full-owner, "stay logged in"): `auth.remember_days` bounds their lifetime
 /// (0 refuses them, blank scopes included), PATCH merges against the stored row instead of
-/// wiping it, and a scoped key carries its creator's login time so a key → session → key chain
-/// stops at `auth.session_timeout`; an unscoped key counts as a fresh login on each use.
+/// wiping it, and every key — scoped (`file:`, `rfile:`, capability) or unscoped — counts as a
+/// fresh login on each use, however old the session that minted it.
 #[tokio::test]
 async fn api_key_unscoped_lifetime() {
 	const REAUTH: &str = concat!(r#""reauth":{"password":""#, "matrix-pass-0", r#""}"#);
@@ -1679,7 +1681,6 @@ async fn api_key_unscoped_lifetime() {
 		name: Some("zqm-unscope"),
 		scopes: Some("carddav:read"),
 		expires_at: None,
-		auth_time: Some(Timestamp::now()),
 	};
 	let unscope_id = fx.app.auth_adapter.create_api_key(alice, scoped).await.unwrap().info.key_id;
 	created.push(unscope_id);
@@ -1727,24 +1728,30 @@ async fn api_key_unscoped_lifetime() {
 		created.push(b["data"]["id"].as_str().and_then(|s| s.parse::<i64>().ok()).expect("id"));
 	}
 	let timeout = fx.app.settings.get_int(alice, "auth.session_timeout").await.unwrap();
-	let stale_at = Timestamp(Timestamp::now().0 - timeout - 60);
 
-	// Key chain: a scoped `cl_` key carries its creator's login time.
-	let mk = |scopes, auth_time| CreateApiKeyOptions {
-		name: Some("zqm-chain"),
-		scopes,
-		expires_at: None,
-		auth_time: Some(auth_time),
-	};
-	let key = fx.app.auth_adapter.create_api_key(alice, mk(Some("carddav:read"), stale_at));
-	let key = key.await.unwrap();
-	created.push(key.info.key_id);
-	let v = fx.app.auth_adapter.validate_api_key(&key.plaintext_key).await.unwrap();
-	assert_eq!(v.auth_time, Some(stale_at), "scoped key lost its creator's login time");
+	// Every API key is a fresh login on each use: no login time is stored with it, so it
+	// validates with `auth_time` = now. A `file:` or `rfile:` key minted from a session past
+	// `auth.session_timeout` still works (the `rfile:` proxy-token exchange has no session-age
+	// gate: MG-748).
+	let dev_scope = fx.subject("device@alice").facts.scope.clone().unwrap_or_default();
+	let file_scope = format!("file:{}:W", scope_root(&dev_scope));
+	let mk = |scopes| CreateApiKeyOptions { name: Some("zqm-chain"), scopes, expires_at: None };
+	for scopes in [
+		Some(file_scope.as_str()),
+		Some("rfile:peer.test:f1~zqm-remote:W"),
+		Some("carddav:read"),
+		None,
+	] {
+		let key = fx.app.auth_adapter.create_api_key(alice, mk(scopes)).await.unwrap();
+		created.push(key.info.key_id);
+		let v = fx.app.auth_adapter.validate_api_key(&key.plaintext_key).await.unwrap();
+		let fresh = Timestamp::now().0 - timeout / 2;
+		let at = v.auth_time;
+		assert!(at.is_some_and(|t| t.0 >= fresh), "{scopes:?} key not a fresh login: {at:?}");
+	}
 
-	// An unscoped key is a fresh login on each use: a stored `auth_time` past the session
-	// timeout still exchanges for a session that renews.
-	let key = fx.app.auth_adapter.create_api_key(alice, mk(None, stale_at)).await.unwrap();
+	// An unscoped key exchanges for a session that renews.
+	let key = fx.app.auth_adapter.create_api_key(alice, mk(None)).await.unwrap();
 	created.push(key.info.key_id);
 	let uri = format!("/api/auth/access-token?apiKey={}", key.plaintext_key);
 	let (st, b) = call(&fx.api, post_q(ALICE, &uri, None)).await;
@@ -1827,9 +1834,9 @@ async fn push_subscription_refused_when_disallowed() {
 	assert_eq!(st, StatusCode::FORBIDDEN, "subscribe with push disallowed: {b}");
 }
 
-/// A device key (`device:{root_id}`) manages its own push subscription through the leader
-/// group (`scope_permits` allows it, `require_leader` must not re-refuse it), and is still
-/// refused on the group's other routes.
+/// A `notifications:push` key (what a native client carries next to its `file:` root) manages
+/// its own push subscription through the leader group (`scope_permits` allows it,
+/// `require_leader` must not re-refuse it), and is still refused on the group's other routes.
 #[tokio::test]
 async fn device_key_manages_push_subscription() {
 	use cloudillo::auth_adapter::CreateApiKeyOptions;
@@ -1838,9 +1845,8 @@ async fn device_key_manages_push_subscription() {
 	let alice = fx.tenants.alice.tn_id;
 	let opts = CreateApiKeyOptions {
 		name: Some("zqm-device"),
-		scopes: Some("device:zqm-root"),
+		scopes: Some("notifications:push"),
 		expires_at: None,
-		auth_time: None,
 	};
 	let created = fx.app.auth_adapter.create_api_key(alice, opts).await.unwrap();
 	let key = &*created.plaintext_key;
@@ -1853,13 +1859,55 @@ async fn device_key_manages_push_subscription() {
 	let del = sub_b["data"]["id"]
 		.as_str()
 		.map(|id| format!("/api/notifications/subscriptions/{id}"));
+	let del_key = |uri: String, endpoint: Option<&'static str>| {
+		let mut r = req(ALICE, Method::DELETE, &uri, Some(key), Body::empty());
+		if let Some(ep) = endpoint {
+			r.headers_mut().insert("cloudillo-push-endpoint", ep.parse().unwrap());
+		}
+		call(&fx.api, r)
+	};
+	let own = "https://push.zqm.test/dev";
+	// The owner's subscription: the device key must not drop it, even with its own endpoint.
+	let owner_body = r#"{"subscription":{"endpoint":"https://push.zqm.test/owner",
+		"keys":{"p256dh":"zqm","auth":"zqm"}}}"#;
+	let (_, owner_b) = send(
+		fx,
+		fx.subject("owner@alice"),
+		Method::POST,
+		"/api/notifications/subscriptions",
+		owner_body,
+	)
+	.await;
+	let owner_del = owner_b["data"]["id"]
+		.as_str()
+		.map(|id| format!("/api/notifications/subscriptions/{id}"));
+	let mut denied = Vec::new();
+	if let Some(uri) = &del {
+		denied.push(("no endpoint proof", del_key(uri.clone(), None).await));
+		denied
+			.push(("wrong endpoint", del_key(uri.clone(), Some("https://push.zqm.test/x")).await));
+	}
+	if let Some(uri) = &owner_del {
+		denied.push(("the owner's subscription", del_key(uri.clone(), Some(own)).await));
+	}
 	let del_res = match &del {
-		Some(uri) => Some(call_key(Method::DELETE, uri, "").await),
+		Some(uri) => Some(del_key(uri.clone(), Some(own)).await),
+		None => None,
+	};
+	let owner_cleanup = match &owner_del {
+		Some(uri) => Some(send(fx, fx.subject("owner@alice"), Method::DELETE, uri, "").await),
 		None => None,
 	};
 	let (contacts_st, contacts_b) = call_key(Method::GET, "/api/contacts", "").await;
 	fx.app.auth_adapter.delete_api_key(alice, created.info.key_id).await.unwrap();
 	assert!(sub_st.is_success(), "device key subscribes: {sub_st} {sub_b}");
+	assert!(owner_del.is_some(), "owner subscribes: {owner_b}");
+	assert_eq!(denied.len(), 3, "deny cases ran");
+	for (what, (st, b)) in denied {
+		assert_eq!(status_class(st), Actual::Deny, "device key deletes with {what}: {st} {b}");
+	}
+	let (st, b) = owner_cleanup.unwrap_or_else(|| panic!("owner id: {owner_b}"));
+	assert!(st.is_success(), "owner drops its subscription: {st} {b}");
 	let (st, b) = del_res.unwrap_or_else(|| panic!("id: {sub_b}"));
 	assert!(st.is_success(), "device key drops its subscription: {st} {b}");
 	assert_eq!(
@@ -1869,9 +1917,9 @@ async fn device_key_manages_push_subscription() {
 	);
 }
 
-/// Device-key edges the curated rows (MG-673…684) cannot express: it is never an access-token
-/// scope (owner mint or `?apiKey=` exchange), it never edits its own root, and an off-list
-/// `optional_auth` route (`/api/search`) serves it as anonymous.
+/// Native-client key edges the curated rows (MG-673…685, MG-733…747) cannot express: its
+/// multi-scope set is never an access-token scope (owner mint or `?apiKey=` exchange), it never
+/// renames its own root, and `/api/search` (on the `file:` route list) answers it.
 #[tokio::test]
 async fn device_key_scope_bounds() {
 	let _g = FIXTURE_LOCK.write().await;
@@ -1879,24 +1927,23 @@ async fn device_key_scope_bounds() {
 	let dev = fx.subject("device@alice");
 	let key = bearer(dev);
 	let scope = dev.facts.scope.clone().unwrap_or_default();
-	let root = scope.strip_prefix("device:").unwrap_or_default();
+	let root = scope_root(&scope);
 
+	// Renaming the scope root is refused to a W key (the root is never renamed).
 	let uri = format!("/api/files/{root}");
-	let (st, b) = call(&fx.api, req(ALICE, Method::PATCH, &uri, key, Body::from("{}"))).await;
-	assert_eq!(status_class(st), Actual::Deny, "device key PATCH on its root: {st} {b}");
+	let rename = Body::from(r#"{"fileName":"zqm-root-renamed"}"#);
+	let (st, b) = call(&fx.api, req(ALICE, Method::PATCH, &uri, key, rename)).await;
+	assert_eq!(status_class(st), Actual::Deny, "device key renames its root: {st} {b}");
 
-	// `/api/search` is `optional_auth`: a scope it refuses is served as anonymous, never more.
 	let search = "/api/search?q=zqm";
-	let (dev_st, dev_b) = call(&fx.api, req(ALICE, Method::GET, search, key, Body::empty())).await;
-	let (anon_st, anon_b) =
-		call(&fx.api, req(ALICE, Method::GET, search, None, Body::empty())).await;
-	assert_eq!((dev_st, &dev_b["data"]), (anon_st, &anon_b["data"]), "device search = anon");
+	let (st, b) = call(&fx.api, req(ALICE, Method::GET, search, key, Body::empty())).await;
+	assert_eq!(status_class(st), Actual::Allow, "device key search: {st} {b}");
 
-	// The owner cannot mint an access token carrying a device scope.
+	// The owner cannot mint an access token carrying a multi-scope set (strict `TokenScope`).
 	let owner = fx.subject("owner@alice");
 	let mint = format!("/api/auth/access-token?scope={scope}");
 	let (st, b) = call(&fx.api, post_q(ALICE, &mint, bearer(owner))).await;
-	assert_eq!(status_class(st), Actual::Deny, "device scope mint: {st} {b}");
+	assert!(!st.is_success(), "multi-scope mint: {st} {b}");
 
 	// Nor is the device key itself ever exchanged for one.
 	let xchg = format!("/api/auth/access-token?apiKey={}", key.unwrap_or_default());
@@ -1904,8 +1951,9 @@ async fn device_key_scope_bounds() {
 	assert_eq!(status_class(st), Actual::Deny, "device key exchange: {st} {b}");
 }
 
-/// Minting or re-scoping a device key needs a live folder root: a missing id, a non-folder and
-/// a trashed folder are refused; alice's canonical folder is accepted.
+/// Minting or re-scoping a `file:` key needs a live, untrashed root: a missing id and a trashed
+/// folder are refused; a folder and a BLOB are accepted (any entry roots a `file:` key, where a
+/// `device:` key needed a folder). An `rfile:` key must name another context than its tenant.
 #[tokio::test]
 async fn device_key_mint_validates_root() {
 	let _g = FIXTURE_LOCK.write().await;
@@ -1923,29 +1971,499 @@ async fn device_key_mint_validates_root() {
 			})
 			.unwrap_or_else(|| panic!("{name}@alice"))
 	};
-	let mint = |root: String| async move {
-		let body =
-			serde_json::json!({ "name": "zqm-dev-mint", "scopes": format!("device:{root}") });
+	let mint = |scopes: String| async move {
+		let body = serde_json::json!({ "name": "zqm-dev-mint", "scopes": scopes });
 		send(fx, owner, Method::POST, "/api/auth/api-keys", &body.to_string()).await
 	};
-	for (what, root) in [
-		("missing", "f1~zqm-dev-missing".to_owned()),
-		("non-folder", entry("tenant-blob-d-active")),
-		("trashed", entry("folder-blob-p-trashed")),
+	let trashed = format!("file:{}:W", entry("folder-blob-p-trashed"));
+	for (what, scopes) in [
+		("missing", "file:f1~zqm-dev-missing:W".to_owned()),
+		("trashed", trashed.clone()),
+		("rfile on its own tenant", format!("rfile:{ALICE}:f1~zqm-remote:W")),
 	] {
-		let (st, b) = mint(root).await;
-		assert_eq!(st, StatusCode::BAD_REQUEST, "{what} device root: {b}");
+		let (st, b) = mint(scopes).await;
+		assert_eq!(st, StatusCode::BAD_REQUEST, "{what} key root: {b}");
 	}
 
-	let (st, b) = mint(entry("folder-blob-d-active")).await;
-	assert!(st.is_success(), "folder device root: {st} {b}");
-	let key_id: i64 = b["data"]["id"].as_str().and_then(|s| s.parse().ok()).unwrap_or_default();
-	// Re-scoping the key onto a non-folder is refused like minting it.
-	let body = serde_json::json!({ "scopes": format!("device:{}", entry("tenant-blob-d-active")) });
+	let folder = entry("folder-blob-d-active");
+	let mut minted = Vec::new();
+	for (what, scopes) in [
+		("folder", format!("file:{folder}:W,notifications:read,notifications:push")),
+		("blob", format!("file:{}:W", entry("tenant-blob-d-active"))),
+		("rfile", "rfile:peer.test:f1~zqm-remote:W".to_owned()),
+	] {
+		let (st, b) = mint(scopes).await;
+		let id: i64 = b["data"]["id"].as_str().and_then(|s| s.parse().ok()).unwrap_or_default();
+		minted.push((what, st, b, id));
+	}
+	// Re-scoping a key onto a trashed root is refused like minting it.
+	let key_id = minted[0].3;
+	let body = serde_json::json!({ "scopes": trashed });
 	let uri = format!("/api/auth/api-keys/{key_id}");
 	let (patch_st, patch_b) = send(fx, owner, Method::PATCH, &uri, &body.to_string()).await;
+	for (_, _, _, id) in &minted {
+		if *id != 0 {
+			fx.app.auth_adapter.delete_api_key(alice, *id).await.unwrap();
+		}
+	}
+	for (what, st, b, _) in minted {
+		assert!(st.is_success(), "{what} key root: {st} {b}");
+	}
+	assert_eq!(patch_st, StatusCode::BAD_REQUEST, "re-scope onto a trashed root: {patch_b}");
+}
+
+/// Multi-scope keys: a malformed list (two delegated entries, an old-format `device:` entry, an
+/// unknown entry, a bad `file:` root inside a list, a trailing blank) is refused at mint;
+/// `notifications:read` alone mints and reads only the log; no key carrying a capability is
+/// exchanged for an access token, and the owner cannot mint a `notifications:read` token.
+#[tokio::test]
+async fn multi_scope_key_mint_and_exchange() {
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let owner = fx.subject("owner@alice");
+	let dev_scope = fx.subject("device@alice").facts.scope.clone().unwrap_or_default();
+	let root = scope_root(&dev_scope);
+	let mint = |scopes: String| async move {
+		let body = serde_json::json!({ "name": "zqm-multi-mint", "scopes": scopes });
+		send(fx, owner, Method::POST, "/api/auth/api-keys", &body.to_string()).await
+	};
+	for scopes in [
+		format!("file:{root}:W,file:{root}:R"),
+		format!("device:{root},notifications:read"),
+		"notifications:read,bogus".to_owned(),
+		"file:f1~zqm-missing:W,notifications:read".to_owned(),
+		"carddav:read,".to_owned(),
+	] {
+		let (st, b) = mint(scopes.clone()).await;
+		assert_eq!(st, StatusCode::BAD_REQUEST, "mint {scopes}: {b}");
+	}
+
+	let (st, b) = mint("notifications:read".to_owned()).await;
+	assert!(st.is_success(), "notifications:read mint: {st} {b}");
+	let key_id: i64 = b["data"]["id"].as_str().and_then(|s| s.parse().ok()).unwrap_or_default();
+	let notif_key = b["data"]["plaintextKey"].as_str().unwrap_or_default().to_owned();
+	let get = |uri: &'static str, key: String| async move {
+		call(&fx.api, req(ALICE, Method::GET, uri, Some(&key), Body::empty())).await
+	};
+	let (log_st, log_b) = get("/api/notifications", notif_key.clone()).await;
+	// `GET /api/files` is on the public tier, where a refused scope drops to anonymous; probe a
+	// protected route instead.
+	let (files_st, files_b) = get("/api/auth/api-keys", notif_key.clone()).await;
+
+	let mut xchg = Vec::new();
+	for (what, key) in [
+		("device-notif", bearer(fx.subject("device-notif@alice")).unwrap_or_default()),
+		("notifications:read", notif_key.as_str()),
+	] {
+		let uri = format!("/api/auth/access-token?apiKey={key}");
+		let (st, b) = call(&fx.api, post_q(ALICE, &uri, None)).await;
+		xchg.push((what, st, b));
+	}
+	let uri = "/api/auth/access-token?scope=notifications:read";
+	let (scope_st, scope_b) = call(&fx.api, post_q(ALICE, uri, bearer(owner))).await;
 	fx.app.auth_adapter.delete_api_key(alice, key_id).await.unwrap();
-	assert_eq!(patch_st, StatusCode::BAD_REQUEST, "re-scope onto a non-folder: {patch_b}");
+
+	assert_eq!(status_class(log_st), Actual::Allow, "notifications:read key, log: {log_b}");
+	assert_eq!(status_class(files_st), Actual::Deny, "notifications:read key, api-keys: {files_b}");
+	for (what, st, b) in xchg {
+		assert_eq!(status_class(st), Actual::Deny, "{what} key exchange: {st} {b}");
+	}
+	// `validated_scope` refuses an unknown scope as a malformed request, not a permission.
+	assert_eq!(scope_st, StatusCode::BAD_REQUEST, "notif token mint: {scope_b}");
+}
+
+/// Lifecycle verbs under a folder scope, on fresh entries (the allowed calls mutate; the
+/// curated denials are MG-733..MG-742). The W native-client key (`device@alice`) and a W share
+/// link on the same folder rename, move, replace, list the versions of and trash an entry
+/// strictly inside the root. Neither renames or trashes the root, moves an entry out of it or
+/// purges; neither restores what it trashed (a trashed row keeps no parent, so it is never
+/// provably inside the root: the owner restores).
+#[tokio::test]
+async fn scoped_lifecycle_inside_root() {
+	use axum::http::{HeaderValue, header};
+	use cloudillo::meta_adapter::{CreateRefOptions, SHARE_FILE_REF_TYPE};
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let owner = fx.subject("owner@alice");
+	let dev = fx.subject("device@alice");
+	let root = scope_root(dev.facts.scope.as_deref().unwrap_or_default()).to_owned();
+	// A W share link on the scope root: the fixture seeds only an R one there.
+	let opts = CreateRefOptions {
+		typ: SHARE_FILE_REF_TYPE.into(),
+		resource_id: Some(root.clone()),
+		access_level: Some('W'),
+		..Default::default()
+	};
+	fx.app.meta_adapter.create_ref(alice, "zqref-p5-folder-w", &opts).await.unwrap();
+	let xchg = "/api/auth/access-token?refId=zqref-p5-folder-w";
+	let (st, b) = call(&fx.api, post_q(ALICE, xchg, None)).await;
+	let link = find_str(&b, "token").unwrap_or_else(|| panic!("W folder link: {st} {b}"));
+	let dev_key = bearer(dev).unwrap_or_default().to_owned();
+	let as_tok = |tok: &str, m: Method, uri: &str, body: String| {
+		call(&fx.api, req(ALICE, m, uri, Some(tok), Body::from(body)))
+	};
+	let root_uri = format!("/api/files/{root}");
+	let up = format!(r#"{{"parentId":"{root}"}}"#);
+
+	for (i, (what, tok)) in [("W key", dev_key.as_str()), ("W folder link", link.as_str())]
+		.into_iter()
+		.enumerate()
+	{
+		// A BLOB and a subfolder inside the root, placed by the owner.
+		let key = format!("p5-life-{i}");
+		let a = crate::seed_blob(fx, alice, &key, "zqm-p5-a.txt", None, None, None).await;
+		let uri = format!("/api/files/{a}");
+		let (st, b) = send(fx, owner, Method::PATCH, &uri, &up).await;
+		assert!(st.is_success(), "owner moves {a} into the root: {st} {b}");
+		let dir = serde_json::json!({
+			"fileTp": "FLDR", "fileName": format!("zqm-p5-dir-{i}"), "parentId": root,
+		});
+		let (st, b) = send(fx, owner, Method::POST, "/api/files", &dir.to_string()).await;
+		let dir = find_str(&b, "id").unwrap_or_else(|| panic!("subfolder: {st} {b}"));
+
+		let into_dir = format!(r#"{{"parentId":"{dir}"}}"#);
+		for (verb, m, u, body) in [
+			("rename", Method::PATCH, uri.clone(), r#"{"fileName":"zqm-p5-renamed"}"#.to_owned()),
+			("move into a subfolder", Method::PATCH, uri.clone(), into_dir),
+			("move back to the root", Method::PATCH, uri.clone(), up.clone()),
+			("list versions", Method::GET, format!("{uri}/versions"), String::new()),
+		] {
+			let (st, b) = as_tok(tok, m, &u, body).await;
+			assert_eq!(status_class(st), Actual::Allow, "{what} {verb} inside: {st} {b}");
+		}
+		// Replace: `If-Match` names the current content (`seed_blob` makes it `f1~zqm-{key}`).
+		let put = format!("{uri}/content");
+		let mut r = req(ALICE, Method::PUT, &put, Some(tok), Body::from("zqm-p5"));
+		let h = r.headers_mut();
+		h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+		h.insert(header::IF_MATCH, HeaderValue::from_str(&format!("\"f1~zqm-{key}\"")).unwrap());
+		let (st, b) = call(&fx.api, r).await;
+		assert_eq!(st, StatusCode::ACCEPTED, "{what} replaces inside: {b}");
+
+		for (verb, m, u, body) in [
+			("rename the root", Method::PATCH, root_uri.clone(), r#"{"fileName":"zqm-p5-root"}"#),
+			("trash the root", Method::DELETE, root_uri.clone(), ""),
+			("move out of the root", Method::PATCH, uri.clone(), r#"{"parentId":null}"#),
+			("purge", Method::DELETE, format!("{uri}?permanent=true"), ""),
+		] {
+			let (st, b) = as_tok(tok, m, &u, body.to_owned()).await;
+			assert_eq!(status_class(st), Actual::Deny, "{what} {verb}: {st} {b}");
+		}
+		let (st, b) = as_tok(tok, Method::DELETE, &uri, String::new()).await;
+		assert_eq!(status_class(st), Actual::Allow, "{what} trashes inside: {st} {b}");
+		let (st, b) = as_tok(tok, Method::POST, &format!("{uri}/restore"), "{}".into()).await;
+		assert_eq!(status_class(st), Actual::Deny, "{what} restores from trash: {st} {b}");
+
+		// The owner clears both entries away (the canonical folder is shared).
+		let dir_uri = format!("/api/files/{dir}");
+		let (st, b) = send(fx, owner, Method::DELETE, &dir_uri, "").await;
+		assert!(st.is_success(), "owner trashes {dir}: {st} {b}");
+		for u in [&uri, &dir_uri] {
+			let (st, b) = send(fx, owner, Method::DELETE, &format!("{u}?permanent=true"), "").await;
+			assert!(st.is_success(), "owner purges {u}: {st} {b}");
+		}
+	}
+	fx.app.meta_adapter.delete_ref(alice, "zqref-p5-folder-w").await.unwrap();
+}
+
+/// Two replaces racing on one entry inside a folder scope, by the W native-client key and by a
+/// W folder share link: the first finalized wins, the loser lands in the same entry's history
+/// and no entry anywhere places either old content — nothing is created outside the scope.
+#[tokio::test]
+async fn racing_replace_stays_in_the_entry() {
+	use axum::http::{HeaderValue, header};
+	use cloudillo::file::descriptor::FileIdGeneratorTask;
+	use cloudillo::meta_adapter::{CreateRefOptions, SHARE_FILE_REF_TYPE};
+	use cloudillo_core::scheduler::Task;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let owner = fx.subject("owner@alice");
+	let dev = fx.subject("device@alice");
+	let root = scope_root(dev.facts.scope.as_deref().unwrap_or_default()).to_owned();
+	let opts = CreateRefOptions {
+		typ: SHARE_FILE_REF_TYPE.into(),
+		resource_id: Some(root.clone()),
+		access_level: Some('W'),
+		..Default::default()
+	};
+	fx.app
+		.meta_adapter
+		.create_ref(alice, "zqref-race-folder-w", &opts)
+		.await
+		.unwrap();
+	let xchg = "/api/auth/access-token?refId=zqref-race-folder-w";
+	let (st, xb) = call(&fx.api, post_q(ALICE, xchg, None)).await;
+	let link = find_str(&xb, "token").unwrap_or_else(|| panic!("W folder link: {st} {xb}"));
+	let dev_key = bearer(dev).unwrap_or_default().to_owned();
+	let up = format!(r#"{{"parentId":"{root}"}}"#);
+
+	for (i, (what, tok)) in [("W key", dev_key.as_str()), ("W folder link", link.as_str())]
+		.into_iter()
+		.enumerate()
+	{
+		let key = format!("race-{i}");
+		let entry = crate::seed_blob(fx, alice, &key, "zqm-race.txt", None, None, None).await;
+		let uri = format!("/api/files/{entry}");
+		let (st, b) = send(fx, owner, Method::PATCH, &uri, &up).await;
+		assert!(st.is_success(), "owner moves {entry} into the root: {st} {b}");
+		let original = format!("f1~zqm-{key}");
+		// Both started against the same current content, so both are accepted.
+		let mut pending = Vec::new();
+		for body in ["zqm-race-1", "zqm-race-2"] {
+			let put = format!("{uri}/content");
+			let mut rq = req(ALICE, Method::PUT, &put, Some(tok), Body::from(body));
+			let hd = rq.headers_mut();
+			hd.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+			hd.insert(header::IF_MATCH, HeaderValue::from_str(&format!("\"{original}\"")).unwrap());
+			let (st, b) = call(&fx.api, rq).await;
+			assert_eq!(st, StatusCode::ACCEPTED, "{what} replaces inside: {b}");
+			let pid = find_str(&b, "pendingFileId").unwrap();
+			pending.push(pid.strip_prefix('@').unwrap().parse::<u64>().unwrap());
+		}
+		for f_id in pending {
+			FileIdGeneratorTask::new(alice, f_id).run(&fx.app).await.unwrap();
+		}
+		let current = content_of(fx, alice, &entry).await;
+		let history = versions_of(fx, owner, &entry).await;
+		assert_eq!(history.len(), 2, "{what}: original and loser in history: {history:?}");
+		assert!(history.contains(&original), "{what}: {history:?}");
+		assert!(!history.contains(&current), "{what}: {history:?}");
+		for v in &history {
+			let placed = fx.app.meta_adapter.list_content_entries(alice, v).await.unwrap();
+			assert!(placed.is_empty(), "{what}: {v} placed by an entry: {placed:?}");
+		}
+		let placed = fx.app.meta_adapter.list_content_entries(alice, &current).await.unwrap();
+		let ids: Vec<_> = placed.iter().map(|e| e.entry_id.to_string()).collect();
+		assert_eq!(ids, [entry.to_string()], "{what}: only the entry holds the winner");
+
+		let (st, b) = send(fx, owner, Method::DELETE, &uri, "").await;
+		assert!(st.is_success(), "owner trashes {entry}: {st} {b}");
+		let (st, b) = send(fx, owner, Method::DELETE, &format!("{uri}?permanent=true"), "").await;
+		assert!(st.is_success(), "owner purges {entry}: {st} {b}");
+	}
+	fx.app.meta_adapter.delete_ref(alice, "zqref-race-folder-w").await.unwrap();
+}
+
+/// An `rfile:` key is never exchanged for a local access token (`apiKey`), and an old-format
+/// `device:` key (seeded past the migration) is malformed, so it grants nothing: not its old
+/// folder, not the push routes, not the feed, not a proxy token (the malformed set falls
+/// through to the scoped refusal), no exchange. The `rfile@alice` rows are MG-748..MG-756.
+#[tokio::test]
+async fn remote_file_and_legacy_device_keys() {
+	use cloudillo::auth_adapter::CreateApiKeyOptions;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let rfile = bearer(fx.subject("rfile@alice")).unwrap_or_default().to_owned();
+	let (st, b) =
+		call(&fx.api, post_q(ALICE, &format!("/api/auth/access-token?apiKey={rfile}"), None)).await;
+	assert_eq!(status_class(st), Actual::Deny, "rfile key exchange: {st} {b}");
+
+	let dev_scope = fx.subject("device@alice").facts.scope.clone().unwrap_or_default();
+	let root = scope_root(&dev_scope);
+	let old = format!("device:{root}");
+	let opts =
+		CreateApiKeyOptions { name: Some("zqm-old-device"), scopes: Some(&old), expires_at: None };
+	let created = fx.app.auth_adapter.create_api_key(alice, opts).await.unwrap();
+	let key = created.plaintext_key.to_string();
+	let mut got = Vec::new();
+	for (m, uri, body) in [
+		(Method::POST, format!("/api/files/{root}/blob-check"), r#"{"blobIds":[]}"#),
+		(Method::GET, "/api/notifications/vapid-key".to_owned(), ""),
+		(Method::GET, format!("/api/file-changes?root={root}&since=0"), ""),
+		(Method::POST, "/api/auth/proxy-token".to_owned(), "{}"),
+	] {
+		let r = req(ALICE, m.clone(), &uri, Some(&key), Body::from(body));
+		got.push((m, uri, call(&fx.api, r).await));
+	}
+	let xchg = format!("/api/auth/access-token?apiKey={key}");
+	let (x_st, x_b) = call(&fx.api, post_q(ALICE, &xchg, None)).await;
+	fx.app.auth_adapter.delete_api_key(alice, created.info.key_id).await.unwrap();
+	for (m, uri, (st, b)) in got {
+		assert_eq!(status_class(st), Actual::Deny, "old device key, {m} {uri}: {st} {b}");
+	}
+	assert_eq!(status_class(x_st), Actual::Deny, "old device key exchange: {x_st} {x_b}");
+}
+
+/// Drive scopes beyond the curated MG-757..MG-784. On alice: a drive key renames inside its
+/// drive and its move into a room is refused as `E-FILE-CROSSROOM`; the HTTP key mint
+/// (`check_file_key_root`) accepts the three drive forms and refuses an unknown room; malformed
+/// drive keys grant nothing. On club, drive-scoped PROXY exchanges (the fixture has the
+/// members' keys, so the exchange itself runs): a rostered member reads `~closed-w`; a
+/// non-member is refused at the exchange and denied with a token forced past it (signed on the
+/// community side); the member loses the room on the next request once taken off the roster
+/// (narrowing, never frozen at mint); a contributor's `file:__root__:W` never edits another
+/// member's file (escalation). The app-token and hatted refusals are `scope-drive-*` mint cells.
+#[tokio::test]
+async fn drive_scoped_keys_and_tokens() {
+	use crate::fixture::RemoteId;
+	use cloudillo::auth_adapter::{AccessToken, CreateApiKeyOptions};
+	use cloudillo::types::Timestamp;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let (alice, club) = (fx.tenants.alice.tn_id, fx.tenants.club.tn_id);
+	let owner = fx.subject("owner@alice");
+	let main = fx.subject("drive-main@alice");
+
+	// Inside the main drive: a rename; into the room: a cross-drive move, refused.
+	let a = crate::seed_blob(fx, alice, "drive-main", "zqm-drive-a.txt", None, None, None).await;
+	let uri = format!("/api/files/{a}");
+	let (st, b) = send(fx, main, Method::PATCH, &uri, r#"{"fileName":"zqm-drive-b.txt"}"#).await;
+	assert_eq!(status_class(st), Actual::Allow, "drive key renames in its drive: {st} {b}");
+	let into_room = r#"{"parentId":null,"channel":"@alice.test~close-friends"}"#;
+	let (st, b) = send(fx, main, Method::PATCH, &uri, into_room).await;
+	assert_eq!(st, StatusCode::FORBIDDEN, "drive key moves into a room: {b}");
+	assert_eq!(find_str(&b, "code").as_deref(), Some("E-FILE-CROSSROOM"), "{b}");
+
+	// Malformed drive targets (seeded past the HTTP mint) are malformed scopes: nothing.
+	for bad in ["file:~Bad:W", "file:~-x:W", "file:~:W", "file:__root__:C", "file:*:W:zqref"] {
+		let opts = CreateApiKeyOptions {
+			name: Some("zqm-drive-bad"),
+			scopes: Some(bad),
+			expires_at: None,
+		};
+		let created = fx.app.auth_adapter.create_api_key(alice, opts).await.unwrap();
+		let key = created.plaintext_key.to_string();
+		let mut got = Vec::new();
+		for (m, u, body) in [
+			(Method::GET, uri.clone(), ""),
+			(Method::PATCH, uri.clone(), r#"{"fileName":"zqm-drive-bad"}"#),
+			(Method::GET, "/api/file-changes?root=__root__&since=0".to_owned(), ""),
+		] {
+			let r = req(ALICE, m.clone(), &u, Some(&key), Body::from(body));
+			got.push((m, u, call(&fx.api, r).await));
+		}
+		fx.app.auth_adapter.delete_api_key(alice, created.info.key_id).await.unwrap();
+		for (m, u, (st, b)) in got {
+			assert_eq!(status_class(st), Actual::Deny, "{bad} key, {m} {u}: {st} {b}");
+		}
+	}
+	let (st, b) = send(fx, owner, Method::DELETE, &uri, "").await;
+	assert!(st.is_success(), "owner trashes {a}: {st} {b}");
+	let (st, b) = send(fx, owner, Method::DELETE, &format!("{uri}?permanent=true"), "").await;
+	assert!(st.is_success(), "owner purges {a}: {st} {b}");
+
+	// The HTTP mint: main, all and an existing room are accepted; an unknown room is not.
+	for (scopes, ok) in [
+		("file:__root__:W", true),
+		("file:*:R", true),
+		("file:~close-friends:W", true),
+		("file:~zqm-nope:W", false),
+	] {
+		let reauth = format!(r#""reauth":{{"password":"{PASSWORD}"}}"#);
+		let body = format!(r#"{{"name":"zqm-drive","scopes":"{scopes}",{reauth}}}"#);
+		let (st, b) = send(fx, owner, Method::POST, "/api/auth/api-keys", &body).await;
+		if !ok {
+			assert_eq!(st, StatusCode::BAD_REQUEST, "mint {scopes}: {b}");
+			continue;
+		}
+		assert!(st.is_success(), "mint {scopes}: {st} {b}");
+		let id = b["data"]["id"].as_str().unwrap_or_default();
+		let (st, b) =
+			send(fx, owner, Method::DELETE, &format!("/api/auth/api-keys/{id}"), "").await;
+		assert!(st.is_success(), "delete the {scopes} key: {st} {b}");
+	}
+
+	// club: two contributors, only `member` on the closed room's roster.
+	let seed = |name: &'static str| async move {
+		let r = crate::fixture::remote(name);
+		let meta = &fx.app.meta_adapter;
+		meta.add_profile_public_key(&r.id_tag, &r.key_id, &r.spki_b64, None)
+			.await
+			.unwrap();
+		let mut f = prof(ProfileType::Person);
+		f.connected = Patch::Value(ProfileConnectionStatus::Connected);
+		f.roles = Patch::Value(Some(vec!["contributor".into()]));
+		meta.upsert_profile(club, &r.id_tag, &f).await.unwrap();
+		r
+	};
+	let member = seed("zqm-ds-member").await;
+	let outsider = seed("zqm-ds-outsider").await;
+	let meta = &fx.app.meta_adapter;
+	meta.add_channel_member(club, "closed-w", &member.id_tag).await.unwrap();
+	let xchg = |r: &RemoteId, scope: &str| {
+		let uri = format!("/api/auth/access-token?token={}{scope}", sign(r, &sx::claims(r)));
+		async move { sx::post_token(fx, &uri).await }
+	};
+	let club_file = |name: &str| {
+		fx.objs
+			.iter()
+			.find_map(|o| match o {
+				crate::objects::Obj::File(f) if f.spec.tn == CLUB && f.spec.name == name => {
+					Some(format!("/api/files/{}", f.entry_id))
+				}
+				_ => None,
+			})
+			.unwrap_or_else(|| panic!("{name}@club"))
+	};
+	let cw = club_file("cur-chan-closed-w-file");
+	let others = club_file("memberowned-blob-d-active");
+	let on_club = |tok: String, m: Method, uri: String, body: &'static str| async move {
+		let (st, b) = call(&fx.api, req(CLUB, m, &uri, Some(&tok), Body::from(body))).await;
+		(status_class(st), format!("{st} {b}"))
+	};
+	let room = "&scope=file:~closed-w:R";
+
+	// A rostered member: the drive-scoped token carries the scope and reads the room.
+	let (st, tok) = xchg(&member, room).await;
+	let room_tok = tok.unwrap_or_else(|| panic!("member drive exchange: {st}"));
+	let auth = fx.app.auth_adapter.validate_access_token(club, CLUB, &room_tok).await.unwrap();
+	assert_eq!(auth.scope.as_deref(), Some("file:~closed-w:R"), "exchanged scope");
+	let (got, b) = on_club(room_tok.clone(), Method::GET, cw.clone(), "").await;
+	assert_eq!(got, Actual::Allow, "member reads ~closed-w under its drive scope: {b}");
+
+	// A non-member: refused at the exchange, and denied with the scope forced onto a token.
+	let (st, tok) = xchg(&outsider, room).await;
+	assert!(tok.is_none() && !st.is_success(), "non-member drive exchange: {st}");
+	let forced = |who: &RemoteId| {
+		let sub = who.id_tag.clone();
+		async move {
+			let claims = AccessToken {
+				iss: CLUB,
+				sub: Some(sub.as_str()),
+				scope: Some("file:~closed-w:R"),
+				r: Some("contributor"),
+				h: None,
+				exp: Timestamp::from_now(600),
+				auth_time: Some(Timestamp::now()),
+			};
+			let tok = fx.app.auth_adapter.create_access_token(club, &claims).await.unwrap();
+			tok.into_string()
+		}
+	};
+	let (got, b) = on_club(forced(&outsider).await, Method::GET, cw.clone(), "").await;
+	assert_eq!(got, Actual::Deny, "non-member's forced drive token reads ~closed-w: {b}");
+	// The same forced form for the member is honoured, so the denial above is the room's.
+	let (got, b) = on_club(forced(&member).await, Method::GET, cw.clone(), "").await;
+	assert_eq!(got, Actual::Allow, "member's forced drive token reads ~closed-w: {b}");
+
+	// Escalation: `file:__root__:W` narrows the member's own access; it manages nothing the
+	// member cannot manage unscoped, and reaches no room. Contributors write every community
+	// entry by design (`file_access.rs`, role → Write), so a rename stays allowed both ways;
+	// trashing another member's file needs owner / moderator and is the refused edit.
+	let rename = r#"{"fileName":"zqm-drive-esc"}"#;
+	let (st, tok) = xchg(&member, "").await;
+	let session = tok.unwrap_or_else(|| panic!("member session: {st}"));
+	let (got, b) = on_club(session.clone(), Method::PATCH, others.clone(), rename).await;
+	assert_eq!(got, Actual::Allow, "contributor renames a community entry unscoped: {b}");
+	let (got, b) = on_club(session, Method::DELETE, others.clone(), "").await;
+	assert_eq!(got, Actual::Deny, "member trashes another member's file unscoped: {b}");
+	let (st, tok) = xchg(&member, "&scope=file:__root__:W").await;
+	let main_tok = tok.unwrap_or_else(|| panic!("member main-drive exchange: {st}"));
+	let (got, b) = on_club(main_tok.clone(), Method::PATCH, others.clone(), rename).await;
+	assert_eq!(got, Actual::Allow, "member's file:__root__:W keeps its unscoped rename: {b}");
+	let (got, b) = on_club(main_tok.clone(), Method::DELETE, others, "").await;
+	assert_eq!(got, Actual::Deny, "member's file:__root__:W trashes another's file: {b}");
+	let (got, b) = on_club(main_tok, Method::GET, cw.clone(), "").await;
+	assert_eq!(got, Actual::Deny, "member's file:__root__:W reads ~closed-w: {b}");
+
+	// Off the roster: the already-minted room token is denied on the next request.
+	meta.remove_channel_member(club, "closed-w", &member.id_tag).await.unwrap();
+	let (got, b) = on_club(room_tok, Method::GET, cw, "").await;
+	assert_eq!(got, Actual::Deny, "removed member's drive token reads ~closed-w: {b}");
 }
 
 /// Blob-check and notification-list edges: the id cap, hit/miss for the unscoped owner, the
@@ -2011,7 +2529,7 @@ async fn upload_refused_over_quota() {
 	use axum::http::{HeaderValue, header};
 	let _g = FIXTURE_LOCK.write().await;
 	let fx = setup().await;
-	let uri = "/api/uploads/file?name=zqm-quota.txt";
+	let uri = "/api/uploads/standard?name=zqm-quota.txt";
 	for (tn, host, owner, chunked) in [
 		(fx.tenants.alice.tn_id, ALICE, "owner@alice", false),
 		(fx.tenants.admin.tn_id, ADMIN, "owner-sadm@admin", true),
@@ -2047,7 +2565,7 @@ async fn upload_dedup_over_quota() {
 		let r = req(
 			host,
 			Method::POST,
-			"/api/uploads/file?name=zqm-dedup.txt",
+			"/api/uploads/standard?name=zqm-dedup.txt",
 			Some(tok.as_str()),
 			bytes.into(),
 		);
@@ -2327,6 +2845,385 @@ async fn smtp_password_never_listed() {
 	}
 	assert!(st.is_success(), "SADM GET {key}: {st} {b}");
 	assert_eq!(b["data"]["value"], "***", "SADM GET {key}: {b}");
+}
+
+/// The entry's current content id (`contentId`).
+async fn content_of(fx: &Fixture, tn: cloudillo::types::TnId, entry: &str) -> String {
+	let file = fx.app.meta_adapter.read_file(tn, entry).await.unwrap().unwrap();
+	file.file_id.unwrap().into()
+}
+
+/// `PUT /api/files/{entry}/content` as `text/plain`, `If-Match: "<tag>"` when given.
+async fn put_content(
+	fx: &Fixture,
+	s: &Subject,
+	entry: &str,
+	if_match: Option<&str>,
+	body: &'static str,
+) -> (StatusCode, Value) {
+	use axum::http::{HeaderValue, header};
+	let uri = format!("/api/files/{entry}/content");
+	let mut r = req(&s.host, Method::PUT, &uri, bearer(s), Body::from(body));
+	let h = r.headers_mut();
+	h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+	if let Some(tag) = if_match {
+		h.insert(header::IF_MATCH, HeaderValue::from_str(&format!("\"{tag}\"")).unwrap());
+	}
+	call(&fx.api, r).await
+}
+
+/// Replace `entry`'s content and finalize it: the new content id. The fixture runs no scheduler,
+/// so the replace's `FileIdGeneratorTask` runs here by hand; its finalize does the swap.
+async fn replace_content(
+	fx: &Fixture,
+	tn: cloudillo::types::TnId,
+	s: &Subject,
+	entry: &str,
+	if_match: &str,
+	body: &'static str,
+) -> String {
+	use cloudillo::file::descriptor::FileIdGeneratorTask;
+	use cloudillo_core::scheduler::Task;
+	let (st, b) = put_content(fx, s, entry, Some(if_match), body).await;
+	assert_eq!(st, StatusCode::ACCEPTED, "replace {entry}: {b}");
+	let pending = find_str(&b, "pendingFileId").unwrap();
+	let f_id = pending.strip_prefix('@').unwrap().parse().unwrap();
+	FileIdGeneratorTask::new(tn, f_id).run(&fx.app).await.unwrap();
+	content_of(fx, tn, entry).await
+}
+
+/// The `fileId`s of `GET /api/files/{entry}/versions`, newest first.
+async fn versions_of(fx: &Fixture, s: &Subject, entry: &str) -> Vec<String> {
+	let (st, b) = send(fx, s, Method::GET, &format!("/api/files/{entry}/versions"), "").await;
+	assert!(st.is_success(), "versions of {entry}: {st} {b}");
+	b["data"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.filter_map(|v| find_str(v, "fileId"))
+		.collect()
+}
+
+/// Replace, list, download, restore and restore-as-copy with real version ids, on fresh entries
+/// (the seeded ones are shared). The curated side is MG-691..MG-710: the allowed community
+/// member, and the scoped credentials whose root does not strictly contain the entry, which
+/// the handlers refuse before any version lookup (a W folder key inside its root:
+/// `scoped_lifecycle_inside_root`).
+/// Here: the 428 / 412s, the swap, the bytes served, a reader who cannot write refused on a
+/// version that exists, and another entry's version refused as not this entry's history.
+#[tokio::test]
+async fn content_replace_and_versions_flow() {
+	use axum::http::{HeaderValue, header};
+	use cloudillo::blob_adapter::CreateBlobOptions;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let alice = fx.tenants.alice.tn_id;
+	let owner = fx.subject("owner@alice");
+	// `a` is public, so a stranger and a follower read it without writing it.
+	let a = crate::seed_blob(fx, alice, "ver-a", "zqm-ver-a.txt", Some('P'), None, None).await;
+	let b = crate::seed_blob(fx, alice, "ver-b", "zqm-ver-b.txt", None, None, None).await;
+	let (a0, b0) = ("f1~zqm-ver-a", "f1~zqm-ver-b");
+	let opts = CreateBlobOptions {};
+	fx.app
+		.blob_adapter
+		.create_blob_buf(alice, "b1~zqm-ver-a", b"zqm-v0", &opts)
+		.await
+		.unwrap();
+
+	let (st, body) = put_content(fx, owner, &a, None, "zqm-v1").await;
+	assert_eq!(st, StatusCode::PRECONDITION_REQUIRED, "no If-Match: {body}");
+	let (st, body) = put_content(fx, owner, &a, Some("f1~zqm-stale"), "zqm-v1").await;
+	assert_eq!(st, StatusCode::PRECONDITION_FAILED, "unknown If-Match: {body}");
+	let a1 = replace_content(fx, alice, owner, &a, a0, "zqm-v1").await;
+	assert_ne!(a1, a0, "the replace swapped {a}'s content");
+	let (st, body) = put_content(fx, owner, &a, Some(a0), "zqm-v2").await;
+	assert_eq!(st, StatusCode::PRECONDITION_FAILED, "If-Match of the replaced content: {body}");
+	let b1 = replace_content(fx, alice, owner, &b, b0, "zqm-w1").await;
+	assert_ne!(b1, b0, "the replace swapped {b}'s content");
+
+	assert_eq!(versions_of(fx, owner, &a).await, [a0], "history of {a}");
+	let version_a0 = format!("/api/files/{a}/versions/{a0}");
+	let (st, got) = send(fx, owner, Method::GET, &version_a0, "").await;
+	assert_eq!((st, got), (StatusCode::OK, Value::from("zqm-v0")), "version download");
+
+	// Read access without write: refused, on a version that exists.
+	let copy_a0 = serde_json::json!({ "fromVersion": a0 }).to_string();
+	for name in ["stranger@alice.test", "follower@alice.test"] {
+		let s = fx.subject(name);
+		let (st, body) = send(fx, s, Method::GET, &format!("/api/files/{a}/metadata"), "").await;
+		assert!(st.is_success(), "{name} reads {a}: {st} {body}");
+		for (m, uri, body) in [
+			(Method::GET, format!("/api/files/{a}/versions"), ""),
+			(Method::GET, format!("/api/files/{a}/versions/{a0}"), ""),
+			(Method::POST, format!("/api/files/{a}/versions/{a0}/restore"), ""),
+			(Method::POST, format!("/api/files/{a}/duplicate"), copy_a0.as_str()),
+		] {
+			let (st, b) = send(fx, s, m, &uri, body).await;
+			assert_eq!(status_class(st), Actual::Deny, "{name} {uri}: {st} {b}");
+		}
+		let (st, b) = put_content(fx, s, &a, Some(a1.as_str()), "zqm-x").await;
+		assert_eq!(status_class(st), Actual::Deny, "{name} replaces {a}: {st} {b}");
+	}
+	assert_eq!(content_of(fx, alice, &a).await, a1, "a refused caller changed {a}");
+
+	// Not this entry's history: another entry's version, and the current content.
+	let dup = format!("/api/files/{a}/duplicate");
+	for (m, uri, body) in [
+		(Method::GET, format!("/api/files/{a}/versions/{b0}"), String::new()),
+		(Method::POST, format!("/api/files/{a}/versions/{b0}/restore"), String::new()),
+		(Method::POST, dup.clone(), serde_json::json!({ "fromVersion": b0 }).to_string()),
+		(Method::POST, dup.clone(), serde_json::json!({ "fromVersion": a1 }).to_string()),
+	] {
+		let (st, b) = send(fx, owner, m, &uri, &body).await;
+		assert_eq!(st, StatusCode::NOT_FOUND, "owner {uri} {body}: {b}");
+	}
+
+	// Restore as copy: a new entry over the version's content.
+	let (st, copy) = send(fx, owner, Method::POST, &dup, &copy_a0).await;
+	assert_eq!(st, StatusCode::CREATED, "restore as copy: {copy}");
+	assert_eq!(find_str(&copy, "contentId").as_deref(), Some(a0), "copy content: {copy}");
+	assert_ne!(find_str(&copy, "entryId").as_deref(), Some(&*a), "copy is a new entry: {copy}");
+
+	// Restore in place: a stale If-Match is refused, then the swap moves `a1` into history.
+	let restore = format!("/api/files/{a}/versions/{a0}/restore");
+	let mut r = req(&owner.host, Method::POST, &restore, bearer(owner), Body::empty());
+	r.headers_mut()
+		.insert(header::IF_MATCH, HeaderValue::from_static("\"f1~zqm-stale\""));
+	let (st, body) = call(&fx.api, r).await;
+	assert_eq!(st, StatusCode::PRECONDITION_FAILED, "restore, stale If-Match: {body}");
+	let (st, body) = send(fx, owner, Method::POST, &restore, "").await;
+	assert!(st.is_success(), "restore: {st} {body}");
+	assert_eq!(find_str(&body, "contentId").as_deref(), Some(a0), "restored content: {body}");
+	assert_eq!(versions_of(fx, owner, &a).await, [a1], "history after restore");
+
+	// A W share link replaces: its version row names nobody (its `id_tag` is the tenant's).
+	let tok = crate::link_token(fx, alice, ALICE, "zqref-ver-w", &a, 'W').await;
+	let uri = format!("/api/files/{a}/content");
+	let mut r = req(ALICE, Method::PUT, &uri, Some(&tok), Body::from("zqm-v3"));
+	r.headers_mut()
+		.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+	r.headers_mut()
+		.insert(header::IF_MATCH, HeaderValue::from_str(&format!("\"{a0}\"")).unwrap());
+	let (st, body) = call(&fx.api, r).await;
+	assert_eq!(st, StatusCode::ACCEPTED, "share-link replace: {body}");
+	let pending = find_str(&body, "pendingFileId").unwrap();
+	let f_id = pending.strip_prefix('@').unwrap().parse().unwrap();
+	{
+		use cloudillo::file::descriptor::FileIdGeneratorTask;
+		use cloudillo_core::scheduler::Task;
+		FileIdGeneratorTask::new(alice, f_id).run(&fx.app).await.unwrap();
+	}
+	let (st, got) = send(fx, owner, Method::GET, &format!("/api/files/{a}/versions"), "").await;
+	assert!(st.is_success(), "versions: {st} {got}");
+	let rows = got["data"].as_array().unwrap();
+	assert_eq!(find_str(&rows[0], "fileId").as_deref(), Some(a0), "newest version: {got}");
+	assert!(rows[0]["replacedBy"].is_null(), "share-link replace names nobody: {got}");
+	assert!(rows[1]["replacedBy"].is_string(), "owner restore names the owner: {got}");
+}
+
+/// `POST /api/auth/pair` on `host`: `(sessionId, secret, code)`.
+async fn pair_init(fx: &Fixture, host: &str) -> (String, String, String) {
+	let body = Body::from(r#"{"deviceName":"zqm-desk"}"#);
+	let (st, b) = call(&fx.api, req(host, Method::POST, "/api/auth/pair", None, body)).await;
+	assert_eq!(st, StatusCode::CREATED, "pair init: {b}");
+	let id = find_str(&b, "sessionId").expect("sessionId");
+	(id, find_str(&b, "secret").expect("secret"), find_str(&b, "code").expect("code"))
+}
+
+/// `GET /api/auth/pair/{id}?timeout=0`, with `secret` in the `cloudillo-pair-secret` header.
+async fn pair_poll(fx: &Fixture, id: &str, secret: Option<&str>) -> (StatusCode, Value) {
+	let uri = format!("/api/auth/pair/{id}?timeout=0");
+	let mut r = req(ALICE, Method::GET, &uri, None, Body::empty());
+	if let Some(v) = secret {
+		let v = axum::http::HeaderValue::from_str(v).unwrap();
+		r.headers_mut().insert("cloudillo-pair-secret", v);
+	}
+	call(&fx.api, r).await
+}
+
+/// QR pairing: a poll without the secret (401), with a wrong one or for an unknown session (404)
+/// gets no key. Only the account itself reads details or answers: a follower, a stranger, an
+/// SADM visitor, a share link, an `idp_` key, a `file:` device key and an app's `file:` token
+/// are refused, and another tenant's owner gets 403 (tn_id mismatch), as does a community's
+/// leader on the community's own session. A second answer is 400; the denial is delivered once.
+#[tokio::test]
+async fn qr_pair_gate() {
+	let _g = FIXTURE_LOCK.read().await;
+	let fx = setup().await;
+	let (id, secret, _) = pair_init(fx, ALICE).await;
+	let (st, b) = pair_poll(fx, &id, None).await;
+	assert_eq!(st, StatusCode::UNAUTHORIZED, "poll without the secret: {b}");
+	let (st, b) = pair_poll(fx, &id, Some("zqm-wrong")).await;
+	assert_eq!(st, StatusCode::NOT_FOUND, "poll with a wrong secret: {b}");
+	let (st, b) = pair_poll(fx, "zqm-nope", Some(&secret)).await;
+	assert_eq!(st, StatusCode::NOT_FOUND, "poll an unknown session: {b}");
+	let (st, b) = pair_poll(fx, &id, Some(&secret)).await;
+	assert_eq!(find_str(&b, "status").as_deref(), Some("pending"), "{st} {b}");
+	assert!(find_str(&b, "apiKey").is_none(), "a pending poll holds no key: {b}");
+
+	let details = format!("/api/auth/pair/{id}/details");
+	let respond = format!("/api/auth/pair/{id}/respond");
+	let no = r#"{"approved":false}"#;
+	for n in [
+		"follower@alice.test",
+		"stranger@alice.test",
+		"sadm-visit@alice",
+		"sharelink-r@alice",
+		"idp-key@alice",
+		"device@alice",
+		"owner-scoped-r@alice",
+	] {
+		let s = fx.subject(n);
+		let (st, b) = send(fx, s, Method::GET, &details, "").await;
+		assert_eq!(status_class(st), Actual::Deny, "{n} reads pair details: {st} {b}");
+		let (st, b) = send(fx, s, Method::POST, &respond, no).await;
+		assert_eq!(status_class(st), Actual::Deny, "{n} answers a pairing: {st} {b}");
+	}
+	// Another tenant on the same node, on its own host: the session is alice's.
+	for n in ["owner@club", "owner-sadm@admin"] {
+		let s = fx.subject(n);
+		let (st, b) = send(fx, s, Method::GET, &details, "").await;
+		assert_eq!(st, StatusCode::FORBIDDEN, "{n} reads alice's pair details: {b}");
+		let (st, b) = send(fx, s, Method::POST, &respond, no).await;
+		assert_eq!(st, StatusCode::FORBIDDEN, "{n} answers alice's pairing: {b}");
+	}
+
+	let owner = fx.subject("owner@alice");
+	let (st, b) = send(fx, owner, Method::GET, &details, "").await;
+	assert_eq!(st, StatusCode::OK, "owner reads pair details: {b}");
+	assert_eq!(find_str(&b, "deviceName").as_deref(), Some("zqm-desk"), "{b}");
+	assert!(find_str(&b, "code").is_none(), "details never carry the code: {b}");
+	let (st, b) = send(fx, owner, Method::POST, &respond, r#"{"approved":true}"#).await;
+	assert_eq!(st, StatusCode::BAD_REQUEST, "approve without the code: {b}");
+	let (st, b) = send(fx, owner, Method::POST, &respond, no).await;
+	assert_eq!(st, StatusCode::OK, "owner denies: {b}");
+	let (st, b) = send(fx, owner, Method::POST, &respond, no).await;
+	assert_eq!(st, StatusCode::BAD_REQUEST, "a second answer: {b}");
+	let (st, b) = pair_poll(fx, &id, Some(&secret)).await;
+	assert_eq!(find_str(&b, "status").as_deref(), Some("denied"), "{st} {b}");
+	// Re-readable by the secret holder for a grace period (a lost response is retried) ...
+	let (st, b) = pair_poll(fx, &id, Some(&secret)).await;
+	assert_eq!(find_str(&b, "status").as_deref(), Some("denied"), "denial re-read: {st} {b}");
+	// ... and only by them.
+	let (st, b) = pair_poll(fx, &id, Some("wrong-secret")).await;
+	assert_eq!(st, StatusCode::NOT_FOUND, "a wrong secret reads nothing: {b}");
+
+	// On a community, a leader is not the account: club's pairing is club's alone.
+	let (id, _, _) = pair_init(fx, CLUB).await;
+	let leader = fx.subject("m-leader@club.test");
+	let (st, b) = send(fx, leader, Method::GET, &format!("/api/auth/pair/{id}/details"), "").await;
+	assert_eq!(st, StatusCode::FORBIDDEN, "leader reads club's pair details: {b}");
+	let uri = format!("/api/auth/pair/{id}/respond");
+	let (st, b) = send(fx, leader, Method::POST, &uri, no).await;
+	assert_eq!(st, StatusCode::FORBIDDEN, "leader answers club's pairing: {b}");
+}
+
+/// QR pairing approvals. A trashed root, a missing entry, an unknown room and the tenant's own
+/// id_tag as `contextIdTag` are refused (400) and leave the session pending. `*` (default access
+/// R), `__root__`, `~{room}`, a folder and another context mint the documented scope, delivered
+/// once (the second poll is 404). The folder key reads its root's change feed, not the main
+/// drive's. Then every paired key, and a DAV key, deletes itself: 204, and its next use is 403.
+#[tokio::test]
+async fn qr_pair_approve() {
+	use cloudillo::auth_adapter::CreateApiKeyOptions;
+	use serde_json::json;
+	let _g = FIXTURE_LOCK.write().await;
+	let fx = setup().await;
+	let owner = fx.subject("owner@alice");
+	let entry = |name: &str| {
+		fx.objs
+			.iter()
+			.find_map(|o| match o {
+				crate::objects::Obj::File(f) if f.spec.tn == ALICE && f.spec.name == name => {
+					Some(f.entry_id.clone())
+				}
+				_ => None,
+			})
+			.unwrap_or_else(|| panic!("{name}@alice"))
+	};
+	let answer = |id: String, code: String, mut body: Value| async move {
+		body["code"] = code.into();
+		let uri = format!("/api/auth/pair/{id}/respond");
+		send(fx, owner, Method::POST, &uri, &body.to_string()).await
+	};
+
+	let (id, secret, code) = pair_init(fx, ALICE).await;
+	for (what, body) in [
+		("trashed root", json!({ "approved": true, "target": entry("folder-blob-p-trashed") })),
+		("missing entry", json!({ "approved": true, "target": "f1~zqm-pair-missing" })),
+		("unknown room", json!({ "approved": true, "target": "~zqm-nope" })),
+		("own id_tag as context", json!({ "approved": true, "contextIdTag": ALICE })),
+	] {
+		let (st, b) = answer(id.clone(), code.clone(), body).await;
+		assert_eq!(st, StatusCode::BAD_REQUEST, "approve with a {what}: {b}");
+	}
+	let (st, b) = pair_poll(fx, &id, Some(&secret)).await;
+	assert_eq!(find_str(&b, "status").as_deref(), Some("pending"), "after refusals: {st} {b}");
+
+	let folder = entry("folder-blob-d-active");
+	let mut keys = Vec::new();
+	for (body, scope) in [
+		(json!({ "approved": true }), "file:*:R".to_owned()),
+		(
+			json!({ "approved": true, "target": "__root__", "access": "W" }),
+			"file:__root__:W".to_owned(),
+		),
+		(
+			json!({ "approved": true, "target": "~close-friends", "access": "R" }),
+			"file:~close-friends:R".to_owned(),
+		),
+		(json!({ "approved": true, "target": folder, "access": "W" }), format!("file:{folder}:W")),
+		(
+			json!({ "approved": true, "target": "__root__", "access": "W", "contextIdTag": "peer.test" }),
+			"rfile:peer.test:__root__:W".to_owned(),
+		),
+		// Notification scopes are opt-in.
+		(
+			json!({ "approved": true, "target": "__root__", "access": "W", "notifications": true }),
+			"file:__root__:W,notifications:read,notifications:push".to_owned(),
+		),
+	] {
+		let (id, secret, code) = pair_init(fx, ALICE).await;
+		let (st, b) = answer(id.clone(), code, body).await;
+		assert_eq!(st, StatusCode::OK, "approve {scope}: {b}");
+		let (st, b) = pair_poll(fx, &id, Some(&secret)).await;
+		assert_eq!(find_str(&b, "status").as_deref(), Some("approved"), "{scope}: {st} {b}");
+		assert_eq!(find_str(&b, "scope").as_deref(), Some(scope.as_str()), "{b}");
+		assert_eq!(find_str(&b, "idTag").as_deref(), Some(ALICE), "{scope}: {b}");
+		let key = find_str(&b, "apiKey").unwrap_or_else(|| panic!("{scope}: no key: {b}"));
+		// A lost response is retried within the grace period: the same key comes back.
+		let (st, b) = pair_poll(fx, &id, Some(&secret)).await;
+		assert_eq!(find_str(&b, "apiKey").as_deref(), Some(key.as_str()), "{scope}: {st} {b}");
+		keys.push((scope, key));
+	}
+
+	let folder_key = keys[3].1.clone();
+	let feed = |root: String| {
+		let uri = format!("/api/file-changes?root={root}&since=0");
+		call(&fx.api, req(ALICE, Method::GET, &uri, Some(&folder_key), Body::empty()))
+	};
+	let (st, b) = feed(folder.clone()).await;
+	assert_eq!(status_class(st), Actual::Allow, "paired folder key, its root's feed: {st} {b}");
+	let (st, b) = feed("__root__".to_owned()).await;
+	assert_eq!(status_class(st), Actual::Deny, "paired folder key, the main feed: {st} {b}");
+
+	let alice = fx.tenants.alice.tn_id;
+	let opts = CreateApiKeyOptions {
+		name: Some("zqm-pair-dav"),
+		scopes: Some("carddav:read"),
+		expires_at: None,
+	};
+	let dav = fx.app.auth_adapter.create_api_key(alice, opts).await.unwrap();
+	keys.push(("carddav:read".to_owned(), dav.plaintext_key.to_string()));
+	for (scope, key) in keys {
+		// A deleted `cl_` key is refused by the auth middleware with 403, like any invalid key.
+		for want in [StatusCode::NO_CONTENT, StatusCode::FORBIDDEN] {
+			let r =
+				req(ALICE, Method::DELETE, "/api/auth/current-api-key", Some(&key), Body::empty());
+			let (st, b) = call(&fx.api, r).await;
+			assert_eq!(st, want, "{scope} key deletes itself: {b}");
+		}
+	}
 }
 
 // vim: ts=4

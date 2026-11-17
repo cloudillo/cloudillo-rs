@@ -23,7 +23,7 @@ use crate::{
 	image::ImageResizerTask,
 	pdf,
 	perm::{ResolvedEntry, ResolvedLevel},
-	preset::{self, get_audio_tier, get_image_tier, get_video_tier, presets},
+	preset::{self, get_audio_tier, get_image_tier, get_video_tier},
 	scratch::{self, TempFileGuard},
 	site_html, store, svg,
 	variant::{self, VariantClass},
@@ -40,7 +40,7 @@ use cloudillo_types::meta_adapter;
 use cloudillo_types::meta_adapter::{
 	MANAGED_PARENT_ID, ROOT_PARENT_ID, ShareSetReader, TRASH_PARENT_ID,
 };
-use cloudillo_types::types::{self, AccessLevel, ApiResponse, TokenScope};
+use cloudillo_types::types::{self, AccessLevel, ApiResponse, delegated_scope};
 use cloudillo_types::utils;
 
 // Utility functions //
@@ -69,6 +69,21 @@ pub fn format_from_content_type(content_type: &str) -> Option<&str> {
 		// Document
 		"application/pdf" => "pdf",
 		_ => None?,
+	})
+}
+
+/// `to_bytes` with the size cap reported like the streamed path: a length-limit breach is
+/// 400 `E-CORE-INVALID`, any other body error keeps the `From<axum::Error>` mapping.
+async fn read_capped(body: Body, max: usize) -> ClResult<axum::body::Bytes> {
+	to_bytes(body, max).await.map_err(|e| {
+		let mut src: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+		while let Some(err) = src {
+			if err.is::<http_body_util::LengthLimitError>() {
+				return Error::ValidationError("upload exceeds maximum file size".into());
+			}
+			src = err.source();
+		}
+		Error::from(e)
 	})
 }
 
@@ -426,6 +441,49 @@ pub async fn get_file_list(
 		None => ("", false, &[][..], None),
 	};
 
+	// A drive scope narrows the subject's own listing: everything below runs unscoped (room
+	// gate, share subject, visible levels, never the scoped handoff), then the drive filter.
+	let drive = file_access::drive_scope(scope);
+	let unscoped_auth = drive.as_ref().and(maybe_auth.as_ref()).map(file_access::unscoped_auth);
+	let gate_auth = if drive.is_some() { unscoped_auth.as_ref() } else { maybe_auth.as_ref() };
+	let scope = if drive.is_some() { None } else { scope };
+	if let Some((drive, _)) = &drive {
+		let empty = || Ok((StatusCode::OK, Json(ApiResponse::with_next(Vec::new(), None))));
+		let drive_channel = match drive {
+			types::DriveTarget::Main => Some(String::new()),
+			types::DriveTarget::Room(name) => {
+				Some(cloudillo_core::channels::absolute_channel(&tenant_id_tag, name).into())
+			}
+			types::DriveTarget::All => None,
+		};
+		match opts.parent_id.as_deref() {
+			Some(ROOT_PARENT_ID) | None if opts.file_id.is_none() => {
+				// A root or whole-drive listing names a scoped drive (`*`: the room gate decides).
+				if let Some(c) = drive_channel {
+					match &opts.channel {
+						None => opts.channel = Some(c),
+						Some(given) if *given == c => {}
+						Some(_) => return empty(),
+					}
+					// The adapter applies `channel` to a parentless listing only when recursive;
+					// without a parent both select the same rows.
+					opts.recursive |= opts.parent_id.is_none();
+				}
+			}
+			// Trash, managed and by-id: the backstop filter after the query.
+			Some(TRASH_PARENT_ID | MANAGED_PARENT_ID) | None => {}
+			Some(folder) => {
+				let in_drive = match app.meta_adapter.read_file(tn_id, folder).await {
+					Err(Error::Conflict(_)) => false,
+					r => r?.is_some_and(|f| drive.matches(f.channel.as_deref(), &tenant_id_tag)),
+				};
+				if !in_drive {
+					return empty();
+				}
+			}
+		}
+	}
+
 	// For scoped tokens, push the scope constraint into the DB query.
 	//
 	// A document-tree scope (`file:<doc>:*`) constrains the listing to that tree
@@ -449,9 +507,9 @@ pub async fn get_file_list(
 	// ancestor names above the share root are not disclosed (set in every folder
 	// branch below).
 	let mut folder_scope_root: Option<String> = None;
-	// A device key browses its root's subtree like a `file:{root_id}:W` folder share.
+	// A folder scope (device API key, folder share link) browses its root's subtree.
 	if let Some((scope_fid, scope_access)) = scope
-		.and_then(TokenScope::parse)
+		.and_then(delegated_scope)
 		.and_then(|ts| ts.file_grant().map(|(id, access)| (id.to_string(), access)))
 	{
 		// The list filter matches entries. An unknown id, or a BLOB content id (bound to no
@@ -530,7 +588,7 @@ pub async fn get_file_list(
 	let rel = abac::subject_relation_to_tenant(&app, tn_id, subject_id_tag).await?;
 	let is_real_auth = is_authenticated && !subject_id_tag.is_empty() && subject_id_tag != "guest";
 	// The owner's own `file:` app token (it carries `sub`) keeps tenant level; scope only narrows.
-	let is_tenant = maybe_auth.as_ref().is_some_and(|a| {
+	let is_tenant = gate_auth.is_some_and(|a| {
 		abac::is_tenant_self(a, &tenant_id_tag)
 			|| (a.scope.is_some() && !a.anonymous && a.id_tag.as_ref() == tenant_id_tag.as_ref())
 	});
@@ -568,7 +626,7 @@ pub async fn get_file_list(
 		&app,
 		tn_id,
 		&tenant_id_tag,
-		maybe_auth.as_ref(),
+		gate_auth,
 		subject_id_tag,
 		subject_roles,
 	)
@@ -606,9 +664,11 @@ pub async fn get_file_list(
 		// The room never gates a deliberate handoff. A recursive listing reaches below the
 		// share root, so there only the browsed folder's own room is let through.
 		// Without a parentId the listing is the scope tree, which is the handoff itself.
-		if !opts.recursive || opts.parent_id.is_none() {
+		// A drive scope is no handoff: it keeps the subject's own room gate.
+		if drive.is_none() && (!opts.recursive || opts.parent_id.is_none()) {
 			opts.enterable_channels = None;
-		} else if let Some(channels) = opts.enterable_channels.as_mut()
+		} else if drive.is_none()
+			&& let Some(channels) = opts.enterable_channels.as_mut()
 			&& let Some(parent_id) = opts.parent_id.as_deref()
 		{
 			// An id naming several entries has no single room to let through.
@@ -633,7 +693,12 @@ pub async fn get_file_list(
 	let limit = opts.limit.unwrap_or(30) as usize; // clamped to 1..=200 at the top
 	let sort_field = opts.sort.as_deref().unwrap_or("created");
 
-	let files = app.meta_adapter.list_files(tn_id, &opts).await?;
+	let mut files = app.meta_adapter.list_files(tn_id, &opts).await?;
+	// Drive-scope backstop for what the SQL drive filter cannot express (trash, managed, by-id).
+	// post-filter may shorten a trash page; push a drive filter into the adapter if so.
+	if let Some((drive, _)) = &drive {
+		files.retain(|f| drive.matches(f.channel.as_deref(), &tenant_id_tag));
+	}
 
 	// Compute access_level (Read/Write) for each file
 	// (visibility is already filtered at SQL level via visible_levels)
@@ -1594,10 +1659,30 @@ pub(crate) async fn resolve_upload_channel(
 
 /// The drive a new child lands in. Under a real parent folder it is that folder's channel:
 /// the caller needs Write on the folder, an explicit differing `channel` is a 400, and the
-/// inherited room must pass [`resolve_upload_channel`] (a scoped token is a deliberate handoff
-/// the room does not gate). At the root it is the explicit `channel`, validated the same way,
-/// or the main drive.
+/// inherited room must pass [`resolve_upload_channel`] (a folder-scoped token is a deliberate
+/// handoff the room does not gate). At the root it is the explicit `channel`, validated the same
+/// way, or the main drive. A drive-scoped caller gets no handoff, and the drive must be scoped.
 pub(crate) async fn resolve_child_channel(
+	app: &App,
+	tn_id: TnId,
+	tenant_id_tag: &str,
+	auth: &cloudillo_types::auth_adapter::AuthCtx,
+	parent_id: Option<&str>,
+	channel: Option<&str>,
+) -> ClResult<Option<Box<str>>> {
+	let drive = file_access::drive_scope(auth.scope.as_deref());
+	let channel =
+		resolve_child_channel_in(app, tn_id, tenant_id_tag, auth, parent_id, channel).await?;
+	match drive {
+		Some((drive, _)) if !drive.matches(channel.as_deref(), tenant_id_tag) => {
+			Err(Error::PermissionDenied)
+		}
+		_ => Ok(channel),
+	}
+}
+
+/// [`resolve_child_channel`] before its drive-scope check.
+async fn resolve_child_channel_in(
 	app: &App,
 	tn_id: TnId,
 	tenant_id_tag: &str,
@@ -1619,7 +1704,7 @@ pub(crate) async fn resolve_child_channel(
 	if channel.is_some_and(|c| inherited.as_deref() != Some(c)) {
 		return Err(Error::ValidationError("channel must match the parent folder's drive".into()));
 	}
-	if auth.scope.is_some() {
+	if auth.scope.is_some() && file_access::drive_scope(auth.scope.as_deref()).is_none() {
 		return Ok(inherited);
 	}
 	resolve_upload_channel(app, tn_id, tenant_id_tag, auth, inherited.as_deref()).await
@@ -1678,6 +1763,7 @@ pub async fn post_file(
 		&app.meta_adapter,
 		dir_cache,
 		tn_id,
+		&tenant_id_tag,
 		auth.scope.as_deref(),
 		req.effective_parent_id()?.as_deref(),
 		req.root_id.as_deref(),
@@ -1736,7 +1822,7 @@ pub async fn post_file(
 		.create_file(
 			tn_id,
 			meta_adapter::CreateFile {
-				preset: Some("default".into()),
+				preset: Some("standard".into()),
 				orig_variant_id: Some(file_id.clone().into()),
 				file_id: Some(file_id.clone().into()),
 				parent_id: req.effective_parent_id()?.map(Into::into),
@@ -1757,6 +1843,9 @@ pub async fn post_file(
 
 	info!("Created file metadata for fileTp={} by {}", req.file_tp, auth.id_tag);
 	cloudillo_core::search_index_file(&app, tn_id, &file_id);
+	if req.file_tp == "FLDR" {
+		crate::notify_files_changed(&app, tn_id, &[&created.entry_id]).await;
+	}
 
 	let view = read_created(&app, tn_id, &created.entry_id, &auth.id_tag).await?;
 	Ok((StatusCode::CREATED, Json(ApiResponse::new(view))))
@@ -2278,7 +2367,15 @@ pub async fn post_blob_check(
 			message: format!("at most {BLOB_CHECK_MAX_IDS} ids per request"),
 		});
 	}
-	if auth.scope.is_none() {
+	// A drive scope narrows the unscoped rule: the subject must be the tenant itself.
+	let drive = file_access::drive_scope(auth.scope.as_deref());
+	if drive.is_some() {
+		abac::require_tenant_self(
+			&file_access::unscoped_auth(&auth),
+			&tenant_id_tag,
+			"blob-check",
+		)?;
+	} else if auth.scope.is_none() {
 		abac::require_tenant_self(&auth, &tenant_id_tag, "blob-check")?;
 	}
 	let dir_cache = app.ext::<DirCache>()?;
@@ -2286,6 +2383,7 @@ pub async fn post_blob_check(
 		&app.meta_adapter,
 		dir_cache,
 		tn_id,
+		&tenant_id_tag,
 		auth.scope.as_deref(),
 		Some(&parent_id),
 		None,
@@ -2293,8 +2391,8 @@ pub async fn post_blob_check(
 	.await?;
 
 	// Channel gate like a recursive scoped listing: rooms the caller may enter, plus the
-	// browsed folder's own room. The unscoped tenant itself is never gated.
-	let rooms = if auth.scope.is_some() {
+	// browsed folder's own room. The tenant itself (unscoped or drive-scoped) is never gated.
+	let rooms = if auth.scope.is_some() && drive.is_none() {
 		let rooms = cloudillo_core::channels::reader_enterable_channels(
 			&app,
 			tn_id,
@@ -2333,6 +2431,310 @@ pub async fn post_blob_check(
 	Ok(Json(ApiResponse::new(BlobCheckResponse { known })))
 }
 
+/// Default and hard max page size of `GET /api/file-changes`.
+const CHANGES_DEFAULT_LIMIT: u32 = 500;
+const CHANGES_MAX_LIMIT: u32 = 1000;
+/// How far a fresh `GET /api/file-changes` (no `after`) reads back before `since`. `updated_at`
+/// is stamped before the write commits, so a row can land behind a cursor already handed out;
+/// re-reading a recent window catches writes that commit late. One committed more than this
+/// after it was stamped can still be missed.
+// 10s rewind window; per-tenant change_seq column if late commits ever exceed it
+const CHANGES_REWIND_SECS: i64 = 10;
+
+#[derive(Deserialize)]
+pub struct FileChangesQuery {
+	/// A folder entry id, `__root__` (the main drive) or `~{room}` (that room's drive).
+	root: String,
+	/// Unix seconds, inclusive.
+	since: i64,
+	/// Entry id of the previous page's last row (`next`): the keyset tie-break at `since`.
+	after: Option<String>,
+	limit: Option<u32>,
+}
+
+/// A changed entry inside the root that the caller may read, in its current state.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangeRow {
+	#[serde(flatten)]
+	view: meta_adapter::FileView,
+	updated_at: types::Timestamp,
+}
+
+/// An entry the caller may read that left its view of the root: moved out, another drive,
+/// trashed or tombstoned. Carries nothing but its id and change time. Entries the caller cannot
+/// read get no marker at all.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangeGone {
+	id: Box<str>,
+	updated_at: types::Timestamp,
+	gone: bool,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum FileChange {
+	Row(Box<FileChangeRow>),
+	Gone(FileChangeGone),
+}
+
+#[derive(Serialize)]
+pub struct FileChangesResponse {
+	changes: Vec<FileChange>,
+	/// The last returned row's `updatedAt` (the request's `since` when none came back).
+	cursor: types::Timestamp,
+	/// The last returned row's id when more rows follow; page on with `since=cursor&after=next`.
+	next: Option<Box<str>>,
+}
+
+/// What a change feed is bounded to.
+enum ChangesRoot {
+	/// A folder (entry id): its subtree, the folder's own row included.
+	Folder(Box<str>),
+	/// The main drive: rows with no channel.
+	MainDrive,
+	/// A room's drive (absolute channel `@tenant~name`).
+	Room(Box<str>),
+}
+
+/// `GET /api/file-changes?root=&since=[&after=][&limit=]`: entries changed since `since`
+/// (inclusive), in `(updatedAt, id)` order. A row inside `root` the caller may read comes in
+/// full, plus `updatedAt`. A row outside it, trashed or tombstoned comes as
+/// `{ id, updatedAt, gone: true }` only when the caller may read that entry itself; every other
+/// row is left out. So an entry moved somewhere the caller cannot read leaves a stale row on the
+/// client until it re-lists — accepted, the feed never names entries the caller cannot see.
+/// `410` when a purged tombstone is newer than `since` (it missed a deletion): the client must
+/// re-list.
+///
+/// A fresh request (no `after`) re-reads [`CHANGES_REWIND_SECS`] before `since`, so rows may
+/// repeat; clients dedupe by id.
+///
+/// Real callers only: guests, share links and via-embed tokens, and credentials naming the
+/// tenant without being it are refused. A scoped caller (`file:` API key) may follow only its
+/// scope root folder or a folder inside it, at level ≥ R; `__root__` and rooms are refused to it. A
+/// drive-scoped caller follows a scoped drive (`__root__` / `~name`) or a folder inside one;
+/// `*` is never a feed root.
+pub async fn get_file_changes(
+	State(app): State<App>,
+	tn_id: TnId,
+	IdTag(tenant_id_tag): IdTag,
+	Auth(auth): Auth,
+	Query(q): Query<FileChangesQuery>,
+) -> ClResult<Json<ApiResponse<FileChangesResponse>>> {
+	let scope = auth.scope.as_deref();
+	// A drive scope narrows the unscoped subject: its gates run on the unscoped form.
+	let drive = file_access::drive_scope(scope);
+	let unscoped = drive.as_ref().map(|_| file_access::unscoped_auth(&auth));
+	let gate_auth = unscoped.as_ref().unwrap_or(&auth);
+	// Share links and via-embed tokens name no holder: refused. A folder key is confined to its
+	// own folder below; an unscoped credential naming the tenant without being it (`idp_` key)
+	// is refused here.
+	if auth.id_tag.is_empty()
+		|| auth.id_tag.as_ref() == "guest"
+		|| !gate_auth.names_holder()
+		|| (gate_auth.scope.is_none()
+			&& abac::names_tenant_without_being_it(gate_auth, &tenant_id_tag))
+	{
+		return Err(Error::PermissionDenied);
+	}
+	if q.root == "*" {
+		return Err(Error::ValidationError("root must be one drive or folder".into()));
+	}
+	if let Some((drive, _)) = &drive {
+		let drive_root = if q.root == ROOT_PARENT_ID {
+			Some(None)
+		} else {
+			q.root
+				.strip_prefix('~')
+				.map(|name| Some(cloudillo_core::channels::absolute_channel(&tenant_id_tag, name)))
+		};
+		if drive_root.is_some_and(|c| !drive.matches(c.as_deref(), &tenant_id_tag)) {
+			return Err(Error::PermissionDenied);
+		}
+	}
+	let ctx = file_access::FileAccessCtx::from_auth(Some(&auth), &tenant_id_tag);
+
+	// A folder-scoped caller follows only its own folder: the scope root or a folder inside it.
+	let root = if scope.is_some()
+		&& drive.is_none()
+		&& (q.root == ROOT_PARENT_ID || q.root.starts_with('~'))
+	{
+		return Err(Error::PermissionDenied);
+	} else if q.root == ROOT_PARENT_ID {
+		ChangesRoot::MainDrive
+	} else if let Some(name) = q.root.strip_prefix('~') {
+		if !cloudillo_types::validation::validate_channel_name(name) {
+			return Err(Error::ValidationError("invalid room name".into()));
+		}
+		app.meta_adapter.read_channel(tn_id, name).await?;
+		let channel = cloudillo_core::channels::absolute_channel(&tenant_id_tag, name);
+		let rooms = cloudillo_core::channels::reader_enterable_channels(
+			&app,
+			tn_id,
+			&tenant_id_tag,
+			Some(gate_auth),
+			&auth.id_tag,
+			&auth.roles,
+		)
+		.await?;
+		if rooms.is_some_and(|rooms| !rooms.contains(&channel)) {
+			return Err(Error::PermissionDenied);
+		}
+		ChangesRoot::Room(channel)
+	} else {
+		let root = file_access::check_file_access(&app, tn_id, &q.root, &ctx, None).await.map_err(
+			|e| match e {
+				file_access::FileAccessError::NotFound => Error::NotFound,
+				file_access::FileAccessError::AccessDenied => Error::PermissionDenied,
+				file_access::FileAccessError::InternalError(m) => Error::Internal(m),
+			},
+		)?;
+		file_access::require_entry_id(&root.file_view, &q.root)?;
+		if !root.access_level.can_read() {
+			return Err(Error::PermissionDenied);
+		}
+		// Not just any folder the scope rung reaches (an `'F'` share link): its own subtree.
+		// A drive scope's access check above already confined the folder to a scoped drive.
+		if let Some(scope) = scope
+			&& drive.is_none()
+			&& !file_access::within_scope_folder(&app, tn_id, scope, &root.file_view.entry_id)
+				.await?
+		{
+			return Err(Error::PermissionDenied);
+		}
+		if root.file_view.file_tp.as_deref() != Some("FLDR") {
+			return Err(Error::ValidationError("root must be a folder".into()));
+		}
+		ChangesRoot::Folder(root.file_view.entry_id)
+	};
+
+	let limit = q.limit.unwrap_or(CHANGES_DEFAULT_LIMIT).clamp(1, CHANGES_MAX_LIMIT);
+	let since = types::Timestamp(q.since);
+	// A continuation page keeps the exact keyset so paging always advances: rewinding every
+	// page would loop forever on a 10s window holding more than `limit` rows.
+	let query_since = if q.after.is_some() {
+		since
+	} else {
+		types::Timestamp(q.since.saturating_sub(CHANGES_REWIND_SECS))
+	};
+	let page = app
+		.meta_adapter
+		.list_entry_changes(tn_id, query_since, q.after.as_deref(), limit + 1)
+		.await?;
+	// `since` is inclusive and the client may not have seen every row of that second's tie
+	// group, so an equal cursor may have missed a tombstone purged at that second.
+	// may cost a spurious re-list when a live row shares the purge second
+	if page.purged_at.is_some_and(|purged_at| since <= purged_at) {
+		return Err(Error::Gone);
+	}
+	let mut rows = page.rows;
+	let next = if rows.len() > limit as usize {
+		rows.truncate(limit as usize);
+		rows.last().map(|r| r.view.entry_id.clone())
+	} else {
+		None
+	};
+	let cursor = rows.last().map_or(since, |r| r.updated_at);
+
+	let dir_cache = app.ext::<DirCache>()?;
+	let mut changes = Vec::with_capacity(rows.len());
+	// a parent-chain walk and an access check per row (1000 rows max, folders
+	// memoized in DirCache); batch them if the feed shows up in profiles.
+	for row in rows {
+		let id = row.view.entry_id.clone();
+		let updated_at = row.updated_at;
+		match visible_change(&app, tn_id, dir_cache, &root, &ctx, row.view).await? {
+			Visible::Row(view) => {
+				changes.push(FileChange::Row(Box::new(FileChangeRow { view: *view, updated_at })));
+			}
+			Visible::Gone => {
+				changes.push(FileChange::Gone(FileChangeGone { id, updated_at, gone: true }));
+			}
+			Visible::Skip => {}
+		}
+	}
+	Ok(Json(ApiResponse::new(FileChangesResponse { changes, cursor, next })))
+}
+
+/// How one changed row reaches a change-feed caller.
+enum Visible {
+	Row(Box<meta_adapter::FileView>),
+	Gone,
+	Skip,
+}
+
+/// `view` as the caller sees it inside `root` ([`Visible::Row`]: the single-entry gate
+/// `GET /api/files/{id}` applies, [`file_access::admitted`]). A row outside the root, trashed or
+/// tombstoned is [`Visible::Gone`] only when the caller may read the entry itself
+/// ([`file_access::readable_ignoring_lifecycle`]); anything else is [`Visible::Skip`], so the
+/// feed never names entries the caller cannot see.
+async fn visible_change(
+	app: &App,
+	tn_id: TnId,
+	dir_cache: &DirCache,
+	root: &ChangesRoot,
+	ctx: &file_access::FileAccessCtx<'_>,
+	view: meta_adapter::FileView,
+) -> ClResult<Visible> {
+	let gone_or_skip = async |view: &meta_adapter::FileView| {
+		if file_access::readable_ignoring_lifecycle(app, tn_id, view, ctx).await {
+			Visible::Gone
+		} else {
+			Visible::Skip
+		}
+	};
+	if view.parent_id.as_deref() == Some(TRASH_PARENT_ID)
+		|| matches!(view.status, meta_adapter::FileStatus::Deleted)
+	{
+		return Ok(gone_or_skip(&view).await);
+	}
+	let inside = match root {
+		ChangesRoot::Folder(root_id) => {
+			// A document-tree part stands behind its root (as in `file_access::in_trash`). A
+			// trashed ancestor ends the walk at `__trash__`, so trashed rows are outside.
+			let probe = view.root_id.as_deref().unwrap_or(&view.entry_id);
+			probe == root_id.as_ref()
+				|| match file_access::is_descendant_of(
+					&app.meta_adapter,
+					dir_cache,
+					tn_id,
+					probe,
+					root_id,
+				)
+				.await
+				{
+					Ok(inside) => inside,
+					// A content id naming several entries has no single place.
+					Err(Error::Conflict(_)) => false,
+					Err(e) => return Err(e),
+				}
+		}
+		ChangesRoot::MainDrive => {
+			view.channel.is_none() && !file_access::in_trash(app, tn_id, &view).await?
+		}
+		ChangesRoot::Room(channel) => {
+			view.channel.as_deref() == Some(channel.as_ref())
+				&& !file_access::in_trash(app, tn_id, &view).await?
+		}
+	};
+	if !inside {
+		return Ok(gone_or_skip(&view).await);
+	}
+	match file_access::admitted(app, tn_id, vec![view], ctx, None).await {
+		Ok(mut admitted) => Ok(admitted.pop().filter(|(_, level)| level.can_read()).map_or(
+			Visible::Skip,
+			|(mut view, level)| {
+				view.access_level = Some(level);
+				Visible::Row(Box::new(view))
+			},
+		)),
+		// Inside the root but hidden by the lifecycle gate (pending, trashed ancestor).
+		Err(Error::NotFound) => Ok(Visible::Skip),
+		Err(e) => Err(e),
+	}
+}
+
 async fn build_dedup_response(
 	app: &App,
 	tn_id: types::TnId,
@@ -2361,12 +2763,39 @@ pub(crate) async fn read_created(
 		.ok_or_else(|| Error::Internal("freshly created row missing".into()))
 }
 
-/// Create an upload's entry: `(entry_id, Some(f_id))` for new content, `None` on a dedup hit.
-async fn create_upload(
+/// The entry a `PUT /api/files/{id}/content` upload replaces the content of.
+struct PendingReplace<'a> {
+	entry_id: &'a str,
+	expected_file_id: &'a str,
+	/// `None` when the caller is not its `id_tag` (share link, via-embed: `!names_holder()`)
+	replaced_by: Option<&'a str>,
+	/// Bytes; a larger old content is not kept in history.
+	max_history_size: u64,
+}
+
+/// Attach an upload's content: `(entry_id, Some(f_id))` for new content, `None` on a dedup hit.
+/// Without `replace` this creates the entry; with it, pending content for that entry (never a
+/// dedup hit: finalize merges identical content later).
+async fn attach_upload(
 	app: &App,
 	tn_id: TnId,
+	replace: Option<&PendingReplace<'_>>,
 	opts: meta_adapter::CreateFile,
 ) -> ClResult<(Box<str>, Option<u64>)> {
+	if let Some(r) = replace {
+		let f_id = app
+			.meta_adapter
+			.create_pending_replace(
+				tn_id,
+				r.entry_id,
+				r.expected_file_id,
+				opts,
+				r.replaced_by,
+				r.max_history_size,
+			)
+			.await?;
+		return Ok((r.entry_id.into(), Some(f_id)));
+	}
 	let created = app.meta_adapter.create_file(tn_id, opts).await?;
 	let f_id = match created.file_id {
 		meta_adapter::FileId::FId(f_id) => Some(f_id),
@@ -2386,11 +2815,6 @@ pub async fn post_file_blob(
 	header: axum::http::HeaderMap,
 	body: Body,
 ) -> ClResult<(StatusCode, Json<ApiResponse<UploadResponse>>)> {
-	// Max file size constants (in MiB, using binary units)
-	const BYTES_PER_MIB: usize = 1_048_576; // 1024 * 1024
-	const DEFAULT_MAX_SIZE_MIB: i64 = 50;
-	const DEFAULT_MAX_STREAMING_SIZE_MIB: i64 = 100;
-
 	let file_name = match query.name.as_deref().map(str::trim) {
 		Some(name) if !name.is_empty() => name.to_owned(),
 		_ => {
@@ -2408,6 +2832,7 @@ pub async fn post_file_blob(
 		&app.meta_adapter,
 		dir_cache,
 		tn_id,
+		&tenant_id_tag,
 		auth.scope.as_deref(),
 		query.effective_parent_id()?.as_deref(),
 		query.root_id.as_deref(),
@@ -2415,13 +2840,9 @@ pub async fn post_file_blob(
 	.await?;
 	reject_trashed_parent(&app, tn_id, query.effective_parent_id()?.as_deref()).await?;
 
-	let content_type = header
-		.get(axum::http::header::CONTENT_TYPE)
-		.and_then(|v| v.to_str().ok())
-		.unwrap_or("application/octet-stream");
 	info!(
-		"post_file_blob: preset={}, content_type={}, root_id={:?}, parent_id={:?}",
-		preset_name, content_type, query.root_id, query.parent_id
+		"post_file_blob: preset={}, root_id={:?}, parent_id={:?}",
+		preset_name, query.root_id, query.parent_id
 	);
 
 	let channel = resolve_child_channel(
@@ -2447,13 +2868,65 @@ pub async fn post_file_blob(
 		None => channel,
 	};
 
-	// 1. Get preset (or default)
-	let preset = presets::get(&preset_name).unwrap_or_else(presets::default);
+	// Resolve purpose preset or profile; unknown names are a 400
+	let preset = preset::resolve(&app, tn_id, &preset_name).await?;
 
-	// 2. Map content-type to media class
+	let base = meta_adapter::CreateFile {
+		preset: Some(preset_name.into()),
+		owner_tag: Some(auth.id_tag.clone()),
+		file_name: file_name.into(),
+		file_tp: Some("BLOB".into()),
+		created_at: query.created_at.map(Into::into),
+		tags: query.tags.as_ref().map(|t| t.iter().map(|s| s.as_str().into()).collect()),
+		root_id: query.root_id.clone().map(Into::into),
+		parent_id: query.effective_parent_id()?.map(Into::into),
+		visibility,
+		channel,
+		..Default::default()
+	};
+	let (entry_id, created) =
+		store_blob_upload(&app, tn_id, preset, &header, body, base, None).await?;
+	let Some((_, data)) = created else {
+		return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id).await;
+	};
+	let thumbnail_variant_id =
+		data.get("thumbnailVariantId").and_then(|v| v.as_str()).map(Into::into);
+	let file = read_created(&app, tn_id, &entry_id, &auth.id_tag).await?;
+	let response = UploadResponse { file, thumbnail_variant_id, existed: false };
+	Ok((StatusCode::CREATED, Json(ApiResponse::new(response))))
+}
+
+/// The shared body of a blob upload (`post_file_blob`, `put_file_content`): media class
+/// against `preset`, size caps, quota, then the per-class handler for the attached content.
+///
+/// `base` carries everything but the content fields; `base.preset` is the stored profile name
+/// (`site` turns on container validation). Returns the entry id and `Some((f_id, handler
+/// data))` for new content, `None` on a dedup hit.
+async fn store_blob_upload(
+	app: &App,
+	tn_id: TnId,
+	mut preset: preset::FilePreset,
+	headers: &HeaderMap,
+	body: Body,
+	mut base: meta_adapter::CreateFile,
+	replace: Option<&PendingReplace<'_>>,
+) -> ClResult<(Box<str>, Option<(u64, serde_json::Value)>)> {
+	// Max file size constants (in MiB, using binary units)
+	const BYTES_PER_MIB: usize = 1_048_576; // 1024 * 1024
+	const DEFAULT_MAX_SIZE_MIB: i64 = 50;
+	const DEFAULT_MAX_STREAMING_SIZE_MIB: i64 = 100;
+
+	let content_type = headers
+		.get(header::CONTENT_TYPE)
+		.and_then(|v| v.to_str().ok())
+		.unwrap_or("application/octet-stream");
+	base.content_type = content_type.into();
+	let is_site = base.preset.as_deref() == Some("site");
+
+	// Map content-type to media class
 	let media_class = VariantClass::from_content_type(content_type);
 
-	// 3. Validate against preset's allowed classes
+	// Validate against preset's allowed classes
 	let media_class = match media_class {
 		Some(class) if preset.allowed_media_classes.contains(&class) => class,
 		Some(class) => {
@@ -2466,7 +2939,12 @@ pub async fn post_file_blob(
 		None => return Err(Error::ValidationError("unsupported media type".into())),
 	};
 
-	info!("Media class: {:?}", media_class);
+	// Documents and raw files have no generated variants to fall back on
+	if matches!(media_class, VariantClass::Document | VariantClass::Raw) {
+		preset.store_original = true;
+	}
+
+	info!("Media class: {:?} (content_type={})", media_class, content_type);
 
 	let max_size_mib = app
 		.settings
@@ -2493,35 +2971,20 @@ pub async fn post_file_blob(
 	// reserve an estimate per preset if that ever matters.
 	let max_storage_gb = app.settings.get_int(tn_id, "limits.max_storage_gb").await.unwrap_or(100);
 	let quota_bytes = u64::try_from(max_storage_gb).unwrap_or(0).saturating_mul(1 << 30);
-	let incoming = header
-		.get(axum::http::header::CONTENT_LENGTH)
+	let incoming = headers
+		.get(header::CONTENT_LENGTH)
 		.and_then(|v| v.to_str().ok())
 		.and_then(|v| v.parse::<u64>().ok())
 		.unwrap_or(0);
 	let used = app.meta_adapter.get_storage_usage(tn_id).await?;
 	check_quota(tn_id, used, incoming, quota_bytes)?;
 
-	let base = meta_adapter::CreateFile {
-		preset: Some(preset_name.clone().into()),
-		owner_tag: Some(auth.id_tag.clone()),
-		content_type: content_type.into(),
-		file_name: file_name.into(),
-		file_tp: Some("BLOB".into()),
-		created_at: query.created_at.map(Into::into),
-		tags: query.tags.as_ref().map(|t| t.iter().map(|s| s.as_str().into()).collect()),
-		root_id: query.root_id.clone().map(Into::into),
-		parent_id: query.effective_parent_id()?.map(Into::into),
-		visibility,
-		channel,
-		..Default::default()
-	};
-
-	// 4. Route to handler - some need bytes (in-memory), some need streaming Body.
+	// Route to handler - some need bytes (in-memory), some need streaming Body.
 	// A dedup hit returns the existing entry; a streamed arm's TempFileGuard drops the temp file.
-	let (data, entry_id) = match media_class {
+	let (entry_id, f_id, data) = match media_class {
 		// In-memory processing (small files)
 		VariantClass::Visual => {
-			let bytes = to_bytes(body, max_size_bytes).await?;
+			let bytes = read_capped(body, max_size_bytes).await?;
 			let orig_variant_id = hasher::hash("b", &bytes);
 			let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
 			let stored = app.meta_adapter.is_variant_referenced(tn_id, &orig_variant_id).await?;
@@ -2546,21 +3009,21 @@ pub async fn post_file_blob(
 				x: Some(json!({ "dim": dim })),
 				..base
 			};
-			let (entry_id, f_id) = create_upload(&app, tn_id, opts).await?;
+			let (entry_id, f_id) = attach_upload(app, tn_id, replace, opts).await?;
 			let Some(f_id) = f_id else {
-				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id).await;
+				return Ok((entry_id, None));
 			};
 			// Route to SVG or raster image handler
 			let data = if is_svg {
-				handle_post_svg(&app, tn_id, f_id, &bytes, &orig_variant_id, &preset).await?
+				handle_post_svg(app, tn_id, f_id, &bytes, &orig_variant_id, &preset).await?
 			} else {
-				handle_post_image(&app, tn_id, f_id, content_type, &bytes, &preset).await?
+				handle_post_image(app, tn_id, f_id, content_type, &bytes, &preset).await?
 			};
-			(data, entry_id)
+			(entry_id, f_id, data)
 		}
 
 		VariantClass::Document => {
-			let bytes = to_bytes(body, max_size_bytes).await?;
+			let bytes = read_capped(body, max_size_bytes).await?;
 			let orig_variant_id = hasher::hash("b", &bytes);
 			let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
 			let stored = app.meta_adapter.is_variant_referenced(tn_id, &orig_variant_id).await?;
@@ -2568,11 +3031,11 @@ pub async fn post_file_blob(
 			info!("Content id: {} ({} bytes)", orig_variant_id, bytes.len());
 
 			let opts = meta_adapter::CreateFile { orig_variant_id: Some(orig_variant_id), ..base };
-			let (entry_id, f_id) = create_upload(&app, tn_id, opts).await?;
+			let (entry_id, f_id) = attach_upload(app, tn_id, replace, opts).await?;
 			let Some(f_id) = f_id else {
-				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id).await;
+				return Ok((entry_id, None));
 			};
-			(handle_post_pdf(&app, tn_id, f_id, &bytes).await?, entry_id)
+			(entry_id, f_id, handle_post_pdf(app, tn_id, f_id, &bytes).await?)
 		}
 
 		// Streaming to disk (large files) - stream first so we know the orig
@@ -2611,9 +3074,9 @@ pub async fn post_file_blob(
 
 			let opts =
 				meta_adapter::CreateFile { orig_variant_id: Some(orig_blob_id.clone()), ..base };
-			let (entry_id, f_id) = create_upload(&app, tn_id, opts).await?;
+			let (entry_id, f_id) = attach_upload(app, tn_id, replace, opts).await?;
 			let Some(f_id) = f_id else {
-				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id).await;
+				return Ok((entry_id, None));
 			};
 			// Renamed so an operator reading `ls` sees which file this is.
 			let final_temp_path =
@@ -2621,7 +3084,7 @@ pub async fn post_file_blob(
 			tokio::fs::rename(&temp_path, &final_temp_path).await?;
 			temp_guard.replace(final_temp_path.clone());
 			let data = handle_post_video_stream(
-				&app,
+				app,
 				tn_id,
 				f_id,
 				content_type,
@@ -2636,7 +3099,7 @@ pub async fn post_file_blob(
 			.await?;
 			// Transcode tasks consume the temp file; keep it past this request.
 			temp_guard.keep();
-			(data, entry_id)
+			(entry_id, f_id, data)
 		}
 
 		VariantClass::Audio => {
@@ -2671,9 +3134,9 @@ pub async fn post_file_blob(
 
 			let opts =
 				meta_adapter::CreateFile { orig_variant_id: Some(orig_blob_id.clone()), ..base };
-			let (entry_id, f_id) = create_upload(&app, tn_id, opts).await?;
+			let (entry_id, f_id) = attach_upload(app, tn_id, replace, opts).await?;
 			let Some(f_id) = f_id else {
-				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id).await;
+				return Ok((entry_id, None));
 			};
 			// Renamed so an operator reading `ls` sees which file this is.
 			let final_temp_path =
@@ -2681,7 +3144,7 @@ pub async fn post_file_blob(
 			tokio::fs::rename(&temp_path, &final_temp_path).await?;
 			temp_guard.replace(final_temp_path.clone());
 			let data = handle_post_audio_stream(
-				&app,
+				app,
 				tn_id,
 				f_id,
 				content_type,
@@ -2695,7 +3158,7 @@ pub async fn post_file_blob(
 			.await?;
 			// Audio extractor task consumes the temp file; keep it past this request.
 			temp_guard.keep();
-			(data, entry_id)
+			(entry_id, f_id, data)
 		}
 
 		VariantClass::Raw => {
@@ -2715,7 +3178,7 @@ pub async fn post_file_blob(
 			// domain, under a CSP carrying `script-src 'unsafe-inline'` — so the
 			// allowlist is applied here, once, before the bytes reach blob storage.
 			// The guard above already owns the temp file, so a rejection cleans up.
-			if preset_name == "site" {
+			if is_site {
 				// The upload half of the bound `open_container` enforces on the read half.
 				// `max_streaming_bytes` comes from the tenant-settable
 				// `file.max_streaming_file_size_mb`, so without this a tenant can raise it
@@ -2746,9 +3209,9 @@ pub async fn post_file_blob(
 
 			let opts =
 				meta_adapter::CreateFile { orig_variant_id: Some(orig_blob_id.clone()), ..base };
-			let (entry_id, f_id) = create_upload(&app, tn_id, opts).await?;
+			let (entry_id, f_id) = attach_upload(app, tn_id, replace, opts).await?;
 			let Some(f_id) = f_id else {
-				return build_dedup_response(&app, tn_id, &auth.id_tag, &entry_id).await;
+				return Ok((entry_id, None));
 			};
 			// Renamed so an operator reading `ls` sees which file this is.
 			let final_temp_path =
@@ -2756,7 +3219,7 @@ pub async fn post_file_blob(
 			tokio::fs::rename(&temp_path, &final_temp_path).await?;
 			temp_guard.replace(final_temp_path.clone());
 			let data = handle_post_raw_stream(
-				&app,
+				app,
 				tn_id,
 				f_id,
 				content_type,
@@ -2767,14 +3230,93 @@ pub async fn post_file_blob(
 			.await?;
 			// handle_post_raw_stream removed the temp file on success.
 			temp_guard.keep();
-			(data, entry_id)
+			(entry_id, f_id, data)
 		}
 	};
-	let thumbnail_variant_id =
-		data.get("thumbnailVariantId").and_then(|v| v.as_str()).map(Into::into);
-	let file = read_created(&app, tn_id, &entry_id, &auth.id_tag).await?;
-	let response = UploadResponse { file, thumbnail_variant_id, existed: false };
-	Ok((StatusCode::CREATED, Json(ApiResponse::new(response))))
+	Ok((entry_id, Some((f_id, data))))
+}
+
+#[derive(Deserialize)]
+pub struct PutFileContentQuery {
+	/// Profile override; without it the current content's profile is reused.
+	preset: Option<String>,
+}
+
+/// `PUT /api/files/{id}/content` answer: the new content is pending until processing
+/// finalizes it and swaps it into the entry.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingReplaceResponse {
+	pub entry_id: Box<str>,
+	/// `@<f_id>` of the pending content.
+	pub pending_file_id: String,
+}
+
+/// `PUT /api/files/{id}/content`: replace a BLOB entry's content (raw body, `Content-Type`).
+///
+/// Requires write on the entry (the guard resolved it) and `If-Match: "<current contentId>"`.
+/// The swap happens asynchronously at finalize; a replace that lost a race lands in the
+/// entry's version history instead (adapter `apply_pending_replace`).
+#[expect(clippy::too_many_arguments, reason = "axum extractors")]
+pub async fn put_file_content(
+	State(app): State<App>,
+	tn_id: TnId,
+	IdTag(tenant_id_tag): IdTag,
+	Auth(auth): Auth,
+	Extension(ResolvedEntry(file)): Extension<ResolvedEntry>,
+	Query(query): Query<PutFileContentQuery>,
+	headers: HeaderMap,
+	body: Body,
+) -> ClResult<(StatusCode, Json<ApiResponse<PendingReplaceResponse>>)> {
+	// A scoped caller: strictly inside its `W` folder root, or the root itself when a BLOB.
+	let op = file_access::LifecycleOp::Replace;
+	file_access::scope_allows_lifecycle(
+		&app,
+		tn_id,
+		&tenant_id_tag,
+		auth.scope.as_deref(),
+		&file,
+		op,
+	)
+	.await?;
+	if file.file_tp.as_deref() != Some("BLOB") {
+		return Err(Error::ValidationError("only BLOB content can be replaced".into()));
+	}
+	let if_match = headers.get(header::IF_MATCH).ok_or(Error::PreconditionRequired)?;
+	// `*` takes the current content; the adapter still needs a concrete id to check against.
+	let expected = match crate::version::if_match_id(if_match)? {
+		// Early refusal; the adapter re-checks inside its transaction.
+		Some(id) if file.file_id.as_deref() != Some(id) => return Err(Error::PreconditionFailed),
+		Some(id) => id,
+		None => file.file_id.as_deref().ok_or(Error::PreconditionFailed)?,
+	};
+
+	let preset = match query.preset.as_deref() {
+		Some(name) => preset::resolve(&app, tn_id, name).await?,
+		None => preset::resolve_stored(&app, tn_id, file.preset.as_deref()).await,
+	};
+	let max_mb = app.settings.get_int(tn_id, "file.version_max_size_mb").await?;
+	let max_history_size = u64::try_from(max_mb).unwrap_or(0).saturating_mul(1 << 20);
+
+	let base = meta_adapter::CreateFile {
+		preset: Some(preset.name.clone().into()),
+		file_tp: Some("BLOB".into()),
+		root_id: file.root_id.clone(),
+		..Default::default()
+	};
+	let replace = PendingReplace {
+		entry_id: &file.entry_id,
+		expected_file_id: expected,
+		replaced_by: auth.names_holder().then_some(&*auth.id_tag),
+		max_history_size,
+	};
+	let (entry_id, created) =
+		store_blob_upload(&app, tn_id, preset, &headers, body, base, Some(&replace)).await?;
+	let Some((f_id, _)) = created else {
+		return Err(Error::Internal("pending replace attached no content".into()));
+	};
+	let response = PendingReplaceResponse { entry_id, pending_file_id: format!("@{f_id}") };
+	Ok((StatusCode::ACCEPTED, Json(ApiResponse::new(response))))
 }
 
 /// GET /api/files/{id}/metadata
@@ -2797,6 +3339,20 @@ pub async fn get_file_metadata(
 		other => Some(other),
 	};
 	Ok((StatusCode::OK, Json(ApiResponse::new(file))))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn oversize_in_memory_upload_is_a_validation_error() {
+		let max = 16;
+		let res = read_capped(Body::from(vec![0u8; max + 1]), max).await;
+		assert!(matches!(res, Err(Error::ValidationError(_))), "got {res:?}");
+		let ok = read_capped(Body::from(vec![0u8; max]), max).await;
+		assert!(matches!(ok, Ok(b) if b.len() == max));
+	}
 }
 
 // vim: ts=4

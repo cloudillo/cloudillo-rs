@@ -9,10 +9,10 @@ use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 
 use crate::utils::{Db, collect_res, map_res, parse_str_list, push_patch};
 use cloudillo_types::meta_adapter::{
-	BrokenReason, ContentInfo, CreateFile, CreatedFile, DeleteFileResult, FileId, FileResolution,
-	FileStatus, FileUserData, FileVariant, FileView, ListFileOptions, MANAGED_PARENT_ID,
-	MAX_PARENT_DEPTH, ProfileRef, ProfileType, ROOT_PARENT_ID, SHARE_FILE_REF_TYPE,
-	TRASH_PARENT_ID, UpdateFileOptions,
+	BrokenReason, ContentInfo, CreateFile, CreatedFile, DeleteFileResult, EntryChange,
+	EntryChanges, EntryVersion, FileId, FileResolution, FileStatus, FileUserData, FileVariant,
+	FileView, ListFileOptions, MANAGED_PARENT_ID, MAX_PARENT_DEPTH, ProfileRef, ProfileType,
+	ROOT_PARENT_ID, SHARE_FILE_REF_TYPE, TRASH_PARENT_ID, UpdateFileOptions,
 };
 use cloudillo_types::types::AccessLevel;
 use cloudillo_types::utils::normalize_id_tag;
@@ -97,12 +97,23 @@ pub(crate) async fn get_id(db: &SqlitePool, tn_id: TnId, f_id: u64) -> ClResult<
 	map_res(res, |row| row.try_get("file_id"))
 }
 
+/// A content's size, for content row `f` (following `merged_into`): its `orig` variant's, else
+/// its largest variant's (content stored without `orig`, e.g. `store_original: false`).
+macro_rules! content_size_subquery {
+	() => {
+		"(SELECT fv.size FROM file_variants fv WHERE fv.tn_id=f.tn_id \
+		AND fv.f_id=COALESCE(f.merged_into, f.f_id) \
+		ORDER BY fv.variant='orig' DESC, fv.size DESC LIMIT 1)"
+	};
+}
+
 /// Columns every `FileView` read selects. Alias convention: `e` = entries (placement),
 /// `f` = files (content, NULL for folders and references). `file_id` falls back to `@<f_id>` for
 /// a pending upload and to the upstream content id for a reference (NULL for a local folder);
 /// `file_tp` reports folders as `'FLDR'` and `content_type` as `cloudillo/folder` (clients require
 /// it). A reference's content fields come off its `ref_*` columns: it holds no local `files` row.
-const FILE_VIEW_COLS: &str = "e.e_id, e.entry_id, f.f_id, \
+const FILE_VIEW_COLS: &str = concat!(
+	"e.e_id, e.entry_id, f.f_id, \
 	COALESCE(f.file_id, '@' || f.f_id, e.ref_file_id) AS file_id, \
 	e.parent_id, f.root_id, e.file_name, \
 	CASE WHEN e.ref_file_id IS NOT NULL THEN e.ref_file_tp \
@@ -116,7 +127,10 @@ const FILE_VIEW_COLS: &str = "e.e_id, e.entry_id, f.f_id, \
 	p.id_tag as upstream_id_tag, p.name as upstream_name, p.type as upstream_type, \
 	p.profile_pic as upstream_profile_pic, \
 	p2.id_tag as owner_id_tag, p2.name as owner_name, p2.type as owner_type, \
-	p2.profile_pic as owner_profile_pic";
+	p2.profile_pic as owner_profile_pic, ",
+	content_size_subquery!(),
+	" AS size"
+);
 
 /// Per-user columns from the `fud` (`file_user_data`) join, read by [`user_data_from_row`].
 const FUD_COLS: &str = ", fud.accessed_at as fud_accessed_at, fud.modified_at as fud_modified_at, \
@@ -1493,9 +1507,10 @@ pub(crate) async fn create(
 }
 
 /// Create a file variant
-/// Note: Only works for pending content (an entry in status 'P') or for a verified sync mirror
-/// (`preset = 'sync'`), whose variants were hashed into its id by the descriptor sync checked —
-/// either way the content-based id stays intact.
+/// Note: Only works for pending content (an entry in status 'P', or a `pending_replaces` row for
+/// replace content that has no entry yet) or for a verified sync mirror (`preset = 'sync'`),
+/// whose variants were hashed into its id by the descriptor sync checked — either way the
+/// content-based id stays intact.
 pub(crate) async fn create_variant<'a>(
 	db: &SqlitePool,
 	tn_id: TnId,
@@ -1505,7 +1520,8 @@ pub(crate) async fn create_variant<'a>(
 	let mut tx = db.begin().await.db()?;
 	sqlx::query(
 		"SELECT 1 FROM files f WHERE f.tn_id=? AND f.f_id=? AND (f.preset='sync' \
-		 OR EXISTS (SELECT 1 FROM entries e WHERE e.f_id=f.f_id AND e.status='P'))",
+		 OR EXISTS (SELECT 1 FROM entries e WHERE e.f_id=f.f_id AND e.status='P') \
+		 OR EXISTS (SELECT 1 FROM pending_replaces p WHERE p.tn_id=f.tn_id AND p.f_id=f.f_id))",
 	)
 	.bind(tn_id.0)
 	.bind(f_id.cast_signed())
@@ -1668,9 +1684,345 @@ pub(crate) async fn finalize_file(
 			}
 		}
 	}
+	apply_pending_replace(&mut tx, tn_id, f_id).await?;
 
 	tx.commit().await.db()?;
 	Ok(())
+}
+
+/// Record content `f_id` in entry `e_id`'s history (or refresh its row there).
+/// Delete + insert, not an upsert: the fresh row must get the highest rowid, as rowid is the
+/// history order.
+async fn insert_version(
+	tx: &mut sqlx::SqliteConnection,
+	tn_id: TnId,
+	e_id: i64,
+	f_id: i64,
+	replaced_by: Option<&str>,
+	size: Option<i64>,
+) -> ClResult<()> {
+	sqlx::query("DELETE FROM entry_versions WHERE tn_id=? AND e_id=? AND f_id=?")
+		.bind(tn_id.0)
+		.bind(e_id)
+		.bind(f_id)
+		.execute(&mut *tx)
+		.await
+		.db()?;
+	sqlx::query(
+		"INSERT INTO entry_versions (tn_id, e_id, f_id, replaced_by, size) VALUES(?, ?, ?, ?, ?)",
+	)
+	.bind(tn_id.0)
+	.bind(e_id)
+	.bind(f_id)
+	.bind(replaced_by)
+	.bind(size)
+	.execute(&mut *tx)
+	.await
+	.db()?;
+	Ok(())
+}
+
+/// Content `f_id`'s size ([`content_size_subquery`]). Binds `(tn_id, f_id)`.
+const CONTENT_SIZE_SQL: &str =
+	concat!("SELECT ", content_size_subquery!(), " FROM files f WHERE f.tn_id=? AND f.f_id=?");
+
+/// Point entry `e_id` from `old_f_id` at `new_f_id`. The old content goes to history (or
+/// refreshes its row there) unless its size ([`CONTENT_SIZE_SQL`]) exceeds `max_history_size`
+/// (`None`: no cap); the new content's own history row goes, as it is current again.
+async fn swap_entry_content(
+	tx: &mut sqlx::SqliteConnection,
+	tn_id: TnId,
+	e_id: i64,
+	old_f_id: i64,
+	new_f_id: i64,
+	replaced_by: Option<&str>,
+	max_history_size: Option<i64>,
+) -> ClResult<()> {
+	let size: Option<i64> = sqlx::query_scalar(CONTENT_SIZE_SQL)
+		.bind(tn_id.0)
+		.bind(old_f_id)
+		.fetch_optional(&mut *tx)
+		.await
+		.db()?
+		.flatten();
+	if max_history_size.is_none_or(|max| size.is_none_or(|size| size <= max)) {
+		insert_version(tx, tn_id, e_id, old_f_id, replaced_by, size).await?;
+	}
+	for (sql, f) in [
+		("DELETE FROM entry_versions WHERE tn_id=?1 AND e_id=?2 AND f_id=?3", new_f_id),
+		("UPDATE entries SET f_id=?3 WHERE tn_id=?1 AND e_id=?2", new_f_id),
+		// Starts the old content's orphan window when history did not keep it.
+		("UPDATE files SET updated_at=unixepoch() WHERE tn_id=?1 AND f_id=?3", old_f_id),
+	] {
+		sqlx::query(sql).bind(tn_id.0).bind(e_id).bind(f).execute(&mut *tx).await.db()?;
+	}
+	Ok(())
+}
+
+/// Finalize-time half of [`create_pending_replace`]: when upload `upload_f_id` is pending
+/// replace content, swap it (or the content it was merged into) into its entry. When another
+/// replace won or the entry was trashed, it goes into the same entry's history instead, so it
+/// never lands outside the entry (and the uploader's scope); a tombstoned entry keeps nothing.
+async fn apply_pending_replace(
+	tx: &mut sqlx::SqliteConnection,
+	tn_id: TnId,
+	upload_f_id: i64,
+) -> ClResult<()> {
+	let pending: Option<(i64, i64, OptStr, Option<i64>)> = sqlx::query_as(
+		"DELETE FROM pending_replaces WHERE tn_id=? AND f_id=? \
+		 RETURNING e_id, expected_f_id, replaced_by, max_history_size",
+	)
+	.bind(tn_id.0)
+	.bind(upload_f_id)
+	.fetch_optional(&mut *tx)
+	.await
+	.db()?;
+	let Some((e_id, expected_f_id, replaced_by, max_history_size)) = pending else {
+		return Ok(());
+	};
+	let new_f_id: i64 = sqlx::query_scalar(
+		"SELECT coalesce(merged_into, f_id) FROM files WHERE tn_id=? AND f_id=?",
+	)
+	.bind(tn_id.0)
+	.bind(upload_f_id)
+	.fetch_one(&mut *tx)
+	.await
+	.db()?;
+	let target: Option<(Option<i64>, OptStr, OptStr)> =
+		sqlx::query_as("SELECT f_id, status, parent_id FROM entries WHERE tn_id=? AND e_id=?")
+			.bind(tn_id.0)
+			.bind(e_id)
+			.fetch_optional(&mut *tx)
+			.await
+			.db()?;
+	// `delete_entry_rows` drops an entry's pending rows with it, so this is not reached.
+	let Some((cur_f_id, status, parent_id)) = target else {
+		warn!("Pending replace f_id={} lost its entry e_id={}", upload_f_id, e_id);
+		return Ok(());
+	};
+	let trashed = parent_id.as_deref() == Some(TRASH_PARENT_ID);
+	let live = status.as_deref() == Some("A") && !trashed;
+	if live && cur_f_id == Some(new_f_id) {
+		// Identical re-save: nothing changes, nothing goes to history.
+		return Ok(());
+	}
+	if live && cur_f_id == Some(expected_f_id) {
+		swap_entry_content(
+			tx,
+			tn_id,
+			e_id,
+			expected_f_id,
+			new_f_id,
+			replaced_by.as_deref(),
+			max_history_size,
+		)
+		.await?;
+		info!("Replaced content of e_id={} with f_id={}", e_id, new_f_id);
+		return Ok(());
+	}
+	// Its history dies with a tombstone; current content needs no history row.
+	if status.as_deref() == Some("D") || cur_f_id == Some(new_f_id) {
+		return Ok(());
+	}
+	// No `max_history_size` cap here: this row is the only copy of the losing save.
+	let size: Option<i64> = sqlx::query_scalar(CONTENT_SIZE_SQL)
+		.bind(tn_id.0)
+		.bind(new_f_id)
+		.fetch_optional(&mut *tx)
+		.await
+		.db()?
+		.flatten();
+	insert_version(tx, tn_id, e_id, new_f_id, replaced_by.as_deref(), size).await?;
+	info!("Replace of e_id={} lost; content f_id={} saved as a version", e_id, new_f_id);
+	Ok(())
+}
+
+/// Live entry `entry_id`'s `(e_id, f_id, file_id, file_tp)`. `NotFound` for an unknown, trashed
+/// or deleted entry ([`LIVE_ENTRY`]) or one without local content (folder, reference).
+async fn entry_content(
+	tx: &mut sqlx::SqliteConnection,
+	tn_id: TnId,
+	entry_id: &str,
+) -> ClResult<(i64, i64, OptStr, OptStr)> {
+	let sql = format!(
+		"SELECT e.e_id, e.f_id, f.file_id, f.file_tp FROM entries e \
+		 LEFT JOIN files f ON f.f_id = e.f_id WHERE e.tn_id=? AND e.entry_id=? AND {LIVE_ENTRY}"
+	);
+	let row: Option<(i64, Option<i64>, OptStr, OptStr)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+		.bind(tn_id.0)
+		.bind(entry_id)
+		.fetch_optional(&mut *tx)
+		.await
+		.db()?;
+	match row {
+		Some((e_id, Some(f_id), file_id, file_tp)) => Ok((e_id, f_id, file_id, file_tp)),
+		_ => Err(Error::NotFound),
+	}
+}
+
+/// See `MetaAdapter::read_pending_replace`.
+pub(crate) async fn read_pending_replace(
+	db: &SqlitePool,
+	tn_id: TnId,
+	f_id: u64,
+) -> ClResult<Option<(OptStr, OptStr)>> {
+	sqlx::query_as(
+		"SELECT f.root_id, p.replaced_by FROM files f \
+		 LEFT JOIN pending_replaces p ON p.tn_id = f.tn_id AND p.f_id = f.f_id \
+		 WHERE f.tn_id=? AND f.f_id=?",
+	)
+	.bind(tn_id.0)
+	.bind(f_id.cast_signed())
+	.fetch_optional(db)
+	.await
+	.db()
+}
+
+/// See `MetaAdapter::create_pending_replace`.
+pub(crate) async fn create_pending_replace(
+	db: &SqlitePool,
+	tn_id: TnId,
+	entry_id: &str,
+	expected_file_id: &str,
+	content: CreateFile,
+	replaced_by: Option<&str>,
+	max_history_size: u64,
+) -> ClResult<u64> {
+	let mut tx = db.begin().await.db()?;
+	let (e_id, cur_f_id, cur_file_id, file_tp) = entry_content(&mut tx, tn_id, entry_id).await?;
+	if file_tp.as_deref() != Some("BLOB") {
+		return Err(Error::ValidationError("only BLOB content can be replaced".into()));
+	}
+	if cur_file_id.as_deref() != Some(expected_file_id) {
+		return Err(Error::PreconditionFailed);
+	}
+	let f_id: i64 = sqlx::query_scalar(
+		"INSERT INTO files (tn_id, root_id, preset, content_type, file_tp, x) \
+		 VALUES(?, ?, ?, ?, 'BLOB', ?) RETURNING f_id",
+	)
+	.bind(tn_id.0)
+	.bind(content.root_id.as_deref())
+	.bind(content.preset.as_deref())
+	.bind(content.content_type.as_ref())
+	.bind(content.x)
+	.fetch_one(&mut *tx)
+	.await
+	.db()?;
+	sqlx::query(
+		"INSERT INTO pending_replaces \
+		 (tn_id, f_id, e_id, expected_f_id, replaced_by, max_history_size) \
+		 VALUES(?, ?, ?, ?, ?, ?)",
+	)
+	.bind(tn_id.0)
+	.bind(f_id)
+	.bind(e_id)
+	.bind(cur_f_id)
+	.bind(replaced_by)
+	.bind(i64::try_from(max_history_size).unwrap_or(i64::MAX))
+	.execute(&mut *tx)
+	.await
+	.db()?;
+	tx.commit().await.db()?;
+	Ok(f_id.cast_unsigned())
+}
+
+/// See `MetaAdapter::list_entry_versions`.
+pub(crate) async fn list_entry_versions(
+	db: &SqlitePool,
+	tn_id: TnId,
+	entry_id: &str,
+) -> ClResult<Vec<EntryVersion>> {
+	// rowid = insertion order; replaced_at has 1 s resolution.
+	let rows: Vec<(Box<str>, i64, OptStr, Option<i64>)> = sqlx::query_as(
+		"SELECT f.file_id, v.replaced_at, v.replaced_by, v.size FROM entry_versions v \
+		 JOIN entries e ON e.tn_id = v.tn_id AND e.e_id = v.e_id \
+		 JOIN files f ON f.f_id = v.f_id \
+		 WHERE v.tn_id=? AND e.entry_id=? AND f.file_id IS NOT NULL \
+		 ORDER BY v.rowid DESC",
+	)
+	.bind(tn_id.0)
+	.bind(entry_id)
+	.fetch_all(db)
+	.await
+	.db()?;
+	Ok(rows
+		.into_iter()
+		.map(|(file_id, replaced_at, replaced_by, size)| EntryVersion {
+			file_id,
+			replaced_at: Timestamp(replaced_at),
+			replaced_by,
+			size: size.map(i64::cast_unsigned),
+		})
+		.collect())
+}
+
+/// See `MetaAdapter::restore_entry_version`.
+pub(crate) async fn restore_entry_version(
+	db: &SqlitePool,
+	tn_id: TnId,
+	entry_id: &str,
+	file_id: &str,
+	expected_file_id: Option<&str>,
+	replaced_by: Option<&str>,
+) -> ClResult<()> {
+	let mut tx = db.begin().await.db()?;
+	let (e_id, cur_f_id, cur_file_id, _) = entry_content(&mut tx, tn_id, entry_id).await?;
+	if expected_file_id.is_some_and(|exp| cur_file_id.as_deref() != Some(exp)) {
+		return Err(Error::PreconditionFailed);
+	}
+	let version: Option<i64> = sqlx::query_scalar(
+		"SELECT v.f_id FROM entry_versions v JOIN files f ON f.f_id = v.f_id \
+		 WHERE v.tn_id=? AND v.e_id=? AND f.file_id=?",
+	)
+	.bind(tn_id.0)
+	.bind(e_id)
+	.bind(file_id)
+	.fetch_optional(&mut *tx)
+	.await
+	.db()?;
+	let version = version.ok_or(Error::NotFound)?;
+	// No history cap: a restore always keeps the outgoing content, so it can be undone.
+	swap_entry_content(&mut tx, tn_id, e_id, cur_f_id, version, replaced_by, None).await?;
+	tx.commit().await.db()?;
+	Ok(())
+}
+
+/// See `MetaAdapter::prune_entry_versions`.
+pub(crate) async fn prune_entry_versions(
+	db: &SqlitePool,
+	tn_id: TnId,
+	keep_count: u32,
+	older_than: Timestamp,
+) -> ClResult<u64> {
+	// rowid = insertion order; replaced_at has 1 s resolution.
+	let res = sqlx::query(
+		"DELETE FROM entry_versions WHERE tn_id = ?1 AND (replaced_at < ?3 OR (e_id, f_id) IN ( \
+		   SELECT e_id, f_id FROM (SELECT e_id, f_id, row_number() OVER ( \
+		     PARTITION BY e_id ORDER BY rowid DESC) AS rn \
+		   FROM entry_versions WHERE tn_id = ?1) WHERE rn > ?2))",
+	)
+	.bind(tn_id.0)
+	.bind(i64::from(keep_count))
+	.bind(older_than.0)
+	.execute(db)
+	.await
+	.db()?;
+	Ok(res.rows_affected())
+}
+
+/// See `MetaAdapter::purge_stale_pending_replaces`.
+pub(crate) async fn purge_stale_pending_replaces(
+	db: &SqlitePool,
+	tn_id: TnId,
+	before: Timestamp,
+) -> ClResult<u64> {
+	let res = sqlx::query("DELETE FROM pending_replaces WHERE tn_id=? AND created_at < ?")
+		.bind(tn_id.0)
+		.bind(before.0)
+		.execute(db)
+		.await
+		.db()?;
+	Ok(res.rows_affected())
 }
 
 /// Update one entry's metadata, never its siblings'. The content fields (`content_type`,
@@ -2035,6 +2387,7 @@ fn row_to_file_view(row: &SqliteRow, user_data: Option<FileUserData>) -> ClResul
 		content_type: row.try_get("content_type").ok().flatten(),
 		file_name: row.try_get("file_name").db()?,
 		file_tp: row.try_get("file_tp").ok().flatten(),
+		size: row.try_get::<Option<i64>, _>("size").ok().flatten().map(i64::cast_unsigned),
 		created_at: row.try_get::<i64, _>("created_at").map(ApiTime).db()?,
 		accessed_at: accessed_at.map(ApiTime),
 		modified_at: modified_at.map(ApiTime),
@@ -2324,6 +2677,9 @@ async fn sweep_file_shares(
 /// by [`reap_orphan_files`] after the GC window, so a re-attach in between keeps the bytes.
 /// Returns the search object key the entry belonged to (its content id; a folder's entry id),
 /// so the caller can reindex what is left of it.
+///
+/// Managed entries only; a feed-visible entry must go through [`purge_tombstones`], which records
+/// the change-feed horizon.
 pub(crate) async fn hard_delete_file(
 	db: &SqlitePool,
 	tn_id: TnId,
@@ -2347,6 +2703,12 @@ pub(crate) async fn hard_delete_file(
 /// Hard-delete every tombstoned entry of `tn_id` ([`hard_delete_entry`]), in one transaction.
 pub(crate) async fn purge_tombstones(db: &SqlitePool, tn_id: TnId) -> ClResult<u64> {
 	let mut tx = db.begin().await.db()?;
+	let newest: Option<i64> =
+		sqlx::query_scalar("SELECT MAX(updated_at) FROM entries WHERE tn_id = ? AND status = 'D'")
+			.bind(tn_id.0)
+			.fetch_one(&mut *tx)
+			.await
+			.db()?;
 	let e_ids: Vec<i64> =
 		sqlx::query_scalar("SELECT e_id FROM entries WHERE tn_id = ? AND status = 'D'")
 			.bind(tn_id.0)
@@ -2356,8 +2718,70 @@ pub(crate) async fn purge_tombstones(db: &SqlitePool, tn_id: TnId) -> ClResult<u
 	for &e_id in &e_ids {
 		hard_delete_entry(&mut tx, tn_id, e_id.cast_unsigned()).await?;
 	}
+	if let Some(newest) = newest {
+		// The change-feed horizon: the newest purged tombstone's `updated_at`. A cursor older
+		// at or before this may have missed a deletion: `since` is inclusive, but an equal cursor
+		// may not have seen every row of that second's tie group, so it counts as missed.
+		sqlx::query(
+			"INSERT INTO entry_purges (tn_id, purged_at) VALUES (?, ?) \
+			 ON CONFLICT(tn_id) DO UPDATE SET purged_at = MAX(purged_at, excluded.purged_at)",
+		)
+		.bind(tn_id.0)
+		.bind(newest)
+		.execute(&mut *tx)
+		.await
+		.db()?;
+	}
 	tx.commit().await.db()?;
 	Ok(e_ids.len() as u64)
+}
+
+/// See `MetaAdapter::list_entry_changes`. An unknown `after` resolves to `e_id` -1, so the
+/// whole tie group at `since` comes back (duplicates the client dedupes). Not gap-free on its
+/// own: `updated_at` is stamped before commit, so the handler rewinds a fresh request 10s to
+/// catch writes that commit late; one committed more than 10s after its stamp can be missed.
+pub(crate) async fn list_entry_changes(
+	db: &SqlitePool,
+	tn_id: TnId,
+	since: Timestamp,
+	after: Option<&str>,
+	limit: u32,
+) -> ClResult<EntryChanges> {
+	let sql = format!(
+		"SELECT {FILE_VIEW_COLS}, e.updated_at{FILE_VIEW_FROM} \
+		 WHERE e.tn_id=? AND {NOT_MANAGED} AND (e.updated_at > ? OR (e.updated_at = ? \
+			AND e.e_id > COALESCE((SELECT e_id FROM entries WHERE tn_id=? AND entry_id=?), -1))) \
+		 ORDER BY e.updated_at, e.e_id LIMIT ?"
+	);
+	let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+		.bind(tn_id.0)
+		.bind(since.0)
+		.bind(since.0)
+		.bind(tn_id.0)
+		.bind(after)
+		.bind(limit)
+		.fetch_all(db)
+		.await
+		.db()?;
+	let rows = rows
+		.iter()
+		.map(|row| {
+			let view = row_to_file_view(row, None)?;
+			Ok(EntryChange {
+				e_id: row.try_get::<i64, _>("e_id").db()?.cast_unsigned(),
+				updated_at: Timestamp(row.try_get("updated_at").db()?),
+				status: view.status,
+				view,
+			})
+		})
+		.collect::<ClResult<Vec<_>>>()?;
+	let purged_at: Option<i64> =
+		sqlx::query_scalar("SELECT purged_at FROM entry_purges WHERE tn_id=?")
+			.bind(tn_id.0)
+			.fetch_optional(db)
+			.await
+			.db()?;
+	Ok(EntryChanges { rows, purged_at: purged_at.map(Timestamp) })
 }
 
 /// [`hard_delete_file`] inside the caller's transaction.
@@ -2379,8 +2803,10 @@ async fn hard_delete_entry(
 	delete_entry_rows(tx, tn_id, e_id.cast_signed()).await
 }
 
-/// Delete an entry row and its per-user `file_user_data` rows: `e_id` is a reused rowid, so a
-/// later entry would otherwise inherit stale stars, pins and cached access levels.
+/// Delete an entry row with its per-user `file_user_data`, `entry_versions` and
+/// `pending_replaces` rows: `e_id` is a reused rowid, so a later entry would otherwise inherit
+/// stale stars, pins, cached access levels and history. A dropped pending replace's content
+/// becomes an orphan.
 async fn delete_entry_rows(
 	tx: &mut sqlx::SqliteConnection,
 	tn_id: TnId,
@@ -2396,12 +2822,14 @@ async fn delete_entry_rows(
 	.execute(&mut *tx)
 	.await
 	.db()?;
-	sqlx::query("DELETE FROM file_user_data WHERE tn_id = ? AND e_id = ?")
-		.bind(tn_id.0)
-		.bind(e_id)
-		.execute(&mut *tx)
-		.await
-		.db()?;
+	// History and pending replaces go too: a later entry reusing the rowid must not inherit them.
+	for sql in [
+		"DELETE FROM file_user_data WHERE tn_id = ? AND e_id = ?",
+		"DELETE FROM entry_versions WHERE tn_id = ? AND e_id = ?",
+		"DELETE FROM pending_replaces WHERE tn_id = ? AND e_id = ?",
+	] {
+		sqlx::query(sql).bind(tn_id.0).bind(e_id).execute(&mut *tx).await.db()?;
+	}
 	sqlx::query("DELETE FROM entries WHERE tn_id = ? AND e_id = ?")
 		.bind(tn_id.0)
 		.bind(e_id)
@@ -2411,7 +2839,8 @@ async fn delete_entry_rows(
 	Ok(())
 }
 
-/// Delete content no entry references, last touched before `before`, with its `file_variants`
+/// Delete content no entry, history row or pending replace references, last touched before
+/// `before`, with its `file_variants`
 /// (the blob sweep then reclaims the bytes) and any dedup redirect pointing at it. A redirect row
 /// itself (`merged_into` set) is kept while its target lives. Returns the reaped content ids.
 pub(crate) async fn reap_orphan_files(
@@ -2424,6 +2853,8 @@ pub(crate) async fn reap_orphan_files(
 		"SELECT f.f_id, f.file_id FROM files f WHERE f.tn_id = ? AND f.merged_into IS NULL \
 		 AND f.updated_at < ? \
 		 AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.f_id = f.f_id) \
+		 AND NOT EXISTS (SELECT 1 FROM entry_versions v WHERE v.f_id = f.f_id) \
+		 AND NOT EXISTS (SELECT 1 FROM pending_replaces p WHERE p.f_id = f.f_id) \
 		 AND NOT EXISTS (SELECT 1 FROM tenants t WHERE t.tn_id = f.tn_id \
 		   AND f.file_id IN (t.profile_pic, t.cover_pic)) \
 		 AND NOT EXISTS (SELECT 1 FROM profiles p WHERE p.tn_id = f.tn_id \
@@ -2655,12 +3086,14 @@ pub(crate) async fn delete(
 #[cfg(test)]
 mod tests {
 	use super::parse_broken_reason;
+	use crate::utils::Db;
+	use cloudillo_types::error::{ClResult, Error};
 	use cloudillo_types::meta_adapter::{
-		BrokenReason, CreateFile, FileId, FileStatus, ListFileOptions, ROOT_PARENT_ID,
+		BrokenReason, CreateFile, FileId, FileStatus, FileVariant, ListFileOptions, ROOT_PARENT_ID,
 		ShareSetReader, TRASH_PARENT_ID,
 	};
 	use cloudillo_types::prelude::TnId;
-	use cloudillo_types::types::ApiTime;
+	use cloudillo_types::types::{ApiTime, Timestamp};
 	use sqlx::Row;
 	use sqlx::sqlite::{self, SqlitePool};
 
@@ -3146,5 +3579,386 @@ mod tests {
 				.expect("empty")
 				.is_empty()
 		);
+	}
+
+	// --- Content replace and version history ---
+
+	async fn f_id_of(db: &SqlitePool, file_id: &str) -> i64 {
+		sqlx::query_scalar("SELECT f_id FROM files WHERE file_id=?")
+			.bind(file_id)
+			.fetch_one(db)
+			.await
+			.expect("f_id")
+	}
+
+	async fn entry_f_id(db: &SqlitePool, entry_id: &str) -> Option<i64> {
+		sqlx::query_scalar("SELECT f_id FROM entries WHERE entry_id=?")
+			.bind(entry_id)
+			.fetch_one(db)
+			.await
+			.expect("entry f_id")
+	}
+
+	async fn add_orig(db: &SqlitePool, f_id: i64, size: u64) {
+		let variant_id = format!("b1~orig{f_id}");
+		let variant = FileVariant {
+			variant_id: variant_id.as_str(),
+			variant: "orig",
+			format: "txt",
+			size,
+			resolution: (0, 0),
+			available: true,
+			global: false,
+			duration: None,
+			bitrate: None,
+			page_count: None,
+		};
+		super::create_variant(db, TnId(1), f_id.cast_unsigned(), variant)
+			.await
+			.expect("orig");
+	}
+
+	/// Give finalized entry content an orig variant. `create_variant` only accepts pending
+	/// content, so the row is inserted directly.
+	async fn add_entry_orig(db: &SqlitePool, f_id: i64, size: i64) {
+		sqlx::query(
+			"INSERT INTO file_variants (tn_id, f_id, variant_id, variant, res_x, res_y, format, \
+			 size, available, global) VALUES (1, ?, ?, 'orig', 0, 0, 'txt', ?, 1, 0)",
+		)
+		.bind(f_id)
+		.bind(format!("b1~orig{f_id}"))
+		.bind(size)
+		.execute(db)
+		.await
+		.expect("entry orig");
+	}
+
+	/// Start a replace of `entry_id` (expected content `expected`) and upload its orig variant.
+	async fn start_replace(db: &SqlitePool, entry_id: &str, expected: &str) -> u64 {
+		let content = CreateFile {
+			preset: Some("standard".into()),
+			content_type: "text/plain".into(),
+			..Default::default()
+		};
+		let f_id = super::create_pending_replace(
+			db,
+			TnId(1),
+			entry_id,
+			expected,
+			content,
+			Some("alice"),
+			100,
+		)
+		.await
+		.expect("pending replace");
+		add_orig(db, f_id.cast_signed(), 3).await;
+		f_id
+	}
+
+	async fn count(db: &SqlitePool, sql: &str) -> i64 {
+		sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
+			.fetch_one(db)
+			.await
+			.expect("count")
+	}
+
+	#[tokio::test]
+	async fn replace_swaps_and_writes_a_version() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let e = make_entry(&db, "f1~old", false, None, &[], None).await;
+		add_entry_orig(&db, f_id_of(&db, "f1~old").await, 5).await;
+
+		let stale = super::create_pending_replace(
+			&db,
+			TnId(1),
+			&e,
+			"f1~other",
+			CreateFile::default(),
+			Some("alice"),
+			100,
+		)
+		.await;
+		assert!(matches!(stale, Err(Error::PreconditionFailed)), "stale If-Match is a 412");
+
+		let p = start_replace(&db, &e, "f1~old").await;
+		super::finalize_file(&db, TnId(1), p, "f1~new").await.expect("finalize");
+		assert_eq!(entry_f_id(&db, &e).await, Some(p.cast_signed()));
+		let versions = super::list_entry_versions(&db, TnId(1), &e).await.expect("versions");
+		assert_eq!(versions.len(), 1);
+		assert_eq!(&*versions[0].file_id, "f1~old");
+		assert_eq!(versions[0].size, Some(5));
+		assert_eq!(versions[0].replaced_by.as_deref(), Some("alice"));
+		assert_eq!(count(&db, "SELECT count(*) FROM pending_replaces").await, 0);
+
+		// Restore swaps back synchronously; the restored content leaves the history.
+		let restored =
+			super::restore_entry_version(&db, TnId(1), &e, "f1~old", Some("f1~new"), Some("bob"))
+				.await;
+		restored.expect("restore");
+		let versions = super::list_entry_versions(&db, TnId(1), &e).await.expect("versions");
+		assert_eq!(versions.len(), 1);
+		assert_eq!(&*versions[0].file_id, "f1~new");
+		assert_eq!(entry_f_id(&db, &e).await, Some(f_id_of(&db, "f1~old").await));
+	}
+
+	#[tokio::test]
+	async fn restore_keeps_oversized_current_content() -> ClResult<()> {
+		let dir = tempfile::tempdir()?;
+		let db = test_pool(dir.path()).await;
+		let e = make_entry(&db, "f1~small", false, None, &[], None).await;
+		add_entry_orig(&db, f_id_of(&db, "f1~small").await, 5).await;
+		// The new content (500 bytes) is over the replace's 100-byte history cap.
+		let content = CreateFile {
+			preset: Some("standard".into()),
+			content_type: "text/plain".into(),
+			..Default::default()
+		};
+		let p = super::create_pending_replace(
+			&db,
+			TnId(1),
+			&e,
+			"f1~small",
+			content,
+			Some("alice"),
+			100,
+		)
+		.await?;
+		add_orig(&db, p.cast_signed(), 500).await;
+		super::finalize_file(&db, TnId(1), p, "f1~big").await?;
+
+		super::restore_entry_version(&db, TnId(1), &e, "f1~small", None, Some("bob")).await?;
+		let versions = super::list_entry_versions(&db, TnId(1), &e).await?;
+		assert_eq!(versions.iter().map(|v| &*v.file_id).collect::<Vec<_>>(), ["f1~big"]);
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn content_without_orig_is_sized_by_its_largest_variant() -> ClResult<()> {
+		let dir = tempfile::tempdir()?;
+		let db = test_pool(dir.path()).await;
+		let e = make_entry(&db, "f1~hd", false, None, &[], None).await;
+		sqlx::query(
+			"INSERT INTO file_variants (tn_id, f_id, variant_id, variant, res_x, res_y, format, \
+			 size, available, global) VALUES (1, ?, 'b1~hd', 'vis.hd', 0, 0, 'webp', ?, 1, 0)",
+		)
+		.bind(f_id_of(&db, "f1~hd").await)
+		.bind(5 << 20)
+		.execute(&db)
+		.await
+		.db()?;
+		sqlx::query("INSERT INTO tenants (tn_id, id_tag, type) VALUES (1, 'owner.test', 'P')")
+			.execute(&db)
+			.await
+			.db()?;
+		let size = super::read(&db, TnId(1), &e).await?.and_then(|f| f.size);
+		assert_eq!(size, Some(5 << 20));
+
+		// Over the 1 MiB history cap: the replaced content is not kept.
+		let content = CreateFile {
+			preset: Some("standard".into()),
+			content_type: "text/plain".into(),
+			..Default::default()
+		};
+		let p = super::create_pending_replace(&db, TnId(1), &e, "f1~hd", content, None, 1 << 20)
+			.await?;
+		add_orig(&db, p.cast_signed(), 3).await;
+		super::finalize_file(&db, TnId(1), p, "f1~new").await?;
+		assert!(super::list_entry_versions(&db, TnId(1), &e).await?.is_empty());
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn restore_refuses_a_trashed_entry() -> ClResult<()> {
+		let dir = tempfile::tempdir()?;
+		let db = test_pool(dir.path()).await;
+		let e = make_entry(&db, "f1~old", false, None, &[], None).await;
+		let p = start_replace(&db, &e, "f1~old").await;
+		super::finalize_file(&db, TnId(1), p, "f1~new").await?;
+		sqlx::query("UPDATE entries SET parent_id=? WHERE entry_id=?")
+			.bind(TRASH_PARENT_ID)
+			.bind(&e)
+			.execute(&db)
+			.await
+			.db()?;
+
+		let res = super::restore_entry_version(&db, TnId(1), &e, "f1~old", None, Some("bob")).await;
+		assert!(matches!(res, Err(Error::NotFound)), "trashed entry: {res:?}");
+		assert_eq!(entry_f_id(&db, &e).await, Some(p.cast_signed()));
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn history_order_survives_same_second_swaps() -> ClResult<()> {
+		let dir = tempfile::tempdir()?;
+		let db = test_pool(dir.path()).await;
+		let e = make_entry(&db, "f1~a", false, None, &[], None).await;
+		let p = start_replace(&db, &e, "f1~a").await;
+		super::finalize_file(&db, TnId(1), p, "f1~b").await?;
+		let p = start_replace(&db, &e, "f1~b").await;
+		super::finalize_file(&db, TnId(1), p, "f1~c").await?;
+		// History [b, a]. Restore a → [c, b]; restore b → [a, c]. All within one second, and
+		// `a` has the lowest f_id, so only insertion order puts it first.
+		super::restore_entry_version(&db, TnId(1), &e, "f1~a", None, Some("bob")).await?;
+		super::restore_entry_version(&db, TnId(1), &e, "f1~b", None, Some("bob")).await?;
+		let versions = super::list_entry_versions(&db, TnId(1), &e).await?;
+		assert_eq!(versions.iter().map(|v| &*v.file_id).collect::<Vec<_>>(), ["f1~a", "f1~c"]);
+
+		super::prune_entry_versions(&db, TnId(1), 1, Timestamp(0)).await?;
+		let versions = super::list_entry_versions(&db, TnId(1), &e).await?;
+		assert_eq!(versions.iter().map(|v| &*v.file_id).collect::<Vec<_>>(), ["f1~a"]);
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn oversized_content_skips_history() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let e = make_entry(&db, "f1~big", false, None, &[], None).await;
+		add_entry_orig(&db, f_id_of(&db, "f1~big").await, 101).await;
+		let p = start_replace(&db, &e, "f1~big").await;
+		super::finalize_file(&db, TnId(1), p, "f1~small").await.expect("finalize");
+		assert_eq!(entry_f_id(&db, &e).await, Some(p.cast_signed()));
+		assert!(super::list_entry_versions(&db, TnId(1), &e).await.expect("v").is_empty());
+	}
+
+	#[tokio::test]
+	async fn identical_content_skips_history() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let e = make_entry(&db, "f1~same", false, None, &[], None).await;
+		let old = f_id_of(&db, "f1~same").await;
+		let p = start_replace(&db, &e, "f1~same").await;
+		super::finalize_file(&db, TnId(1), p, "f1~same").await.expect("finalize");
+		assert_eq!(entry_f_id(&db, &e).await, Some(old));
+		assert!(super::list_entry_versions(&db, TnId(1), &e).await.expect("v").is_empty());
+	}
+
+	#[tokio::test]
+	async fn replace_with_another_entrys_content_swaps_to_it() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let a = make_entry(&db, "f1~a", false, None, &[], None).await;
+		make_entry(&db, "f1~b", false, None, &[], None).await;
+		let p = start_replace(&db, &a, "f1~a").await;
+		super::finalize_file(&db, TnId(1), p, "f1~b").await.expect("finalize");
+		// The upload became a `merged_into` redirect; the entry points at the surviving row.
+		assert_eq!(entry_f_id(&db, &a).await, Some(f_id_of(&db, "f1~b").await));
+		let versions = super::list_entry_versions(&db, TnId(1), &a).await.expect("versions");
+		assert_eq!(versions.iter().map(|v| &*v.file_id).collect::<Vec<_>>(), ["f1~a"]);
+	}
+
+	#[tokio::test]
+	async fn losing_replace_lands_in_the_entrys_history() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		make_entry(&db, "D", true, None, &[], None).await;
+		let e = make_entry(&db, "f1~v1", false, Some("D"), &[], Some('P')).await;
+		let entries = count(&db, "SELECT count(*) FROM entries").await;
+		let p1 = start_replace(&db, &e, "f1~v1").await;
+		let p2 = start_replace(&db, &e, "f1~v1").await;
+		super::finalize_file(&db, TnId(1), p1, "f1~v2").await.expect("finalize 1");
+		super::finalize_file(&db, TnId(1), p2, "f1~v3").await.expect("finalize 2");
+		// The first replace is current; the loser is a version of the same entry, no new entry.
+		assert_eq!(entry_f_id(&db, &e).await, Some(p1.cast_signed()));
+		assert_eq!(count(&db, "SELECT count(*) FROM entries").await, entries);
+		let versions = super::list_entry_versions(&db, TnId(1), &e).await.expect("versions");
+		let mut ids = versions.iter().map(|v| &*v.file_id).collect::<Vec<_>>();
+		ids.sort_unstable();
+		assert_eq!(ids, ["f1~v1", "f1~v3"]);
+		assert!(versions.iter().all(|v| v.replaced_by.as_deref() == Some("alice")));
+	}
+
+	#[tokio::test]
+	async fn pending_replace_keeps_root_after_finalize() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let e = make_entry(&db, "f1~r1", false, None, &[], None).await;
+		let content = CreateFile {
+			root_id: Some("f1~doc".into()),
+			preset: Some("standard".into()),
+			content_type: "text/plain".into(),
+			..Default::default()
+		};
+		let p =
+			super::create_pending_replace(&db, TnId(1), &e, "f1~r1", content, Some("alice"), 100)
+				.await
+				.expect("pending replace");
+		let read = super::read_pending_replace(&db, TnId(1), p).await.expect("read");
+		assert_eq!(read, Some((Some("f1~doc".into()), Some("alice".into()))));
+		add_orig(&db, p.cast_signed(), 3).await;
+		super::finalize_file(&db, TnId(1), p, "f1~r2").await.expect("finalize");
+		// The pending row is consumed, but root_id stays: a retried `FileIdGeneratorTask`
+		// hashes the same id, and finalizing it again is a no-op.
+		let read = super::read_pending_replace(&db, TnId(1), p).await.expect("read again");
+		assert_eq!(read, Some((Some("f1~doc".into()), None)));
+		super::finalize_file(&db, TnId(1), p, "f1~r2")
+			.await
+			.expect("finalize is idempotent");
+	}
+
+	#[tokio::test]
+	async fn losing_replace_on_a_tombstone_keeps_nothing() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let e = make_entry(&db, "f1~t1", false, None, &[], None).await;
+		let p = start_replace(&db, &e, "f1~t1").await;
+		sqlx::query("UPDATE entries SET status='D'")
+			.execute(&db)
+			.await
+			.expect("tombstone");
+		super::finalize_file(&db, TnId(1), p, "f1~t2").await.expect("finalize");
+		assert_eq!(count(&db, "SELECT count(*) FROM entry_versions").await, 0);
+		assert_eq!(count(&db, "SELECT count(*) FROM entries").await, 1);
+	}
+
+	#[tokio::test]
+	async fn reap_keeps_versioned_and_pending_content_until_released() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let e = make_entry(&db, "f1~old", false, None, &[], None).await;
+		let old = f_id_of(&db, "f1~old").await;
+		let p = start_replace(&db, &e, "f1~old").await;
+		super::finalize_file(&db, TnId(1), p, "f1~new").await.expect("finalize");
+		let pending = start_replace(&db, &e, "f1~new").await;
+
+		let end = Timestamp(i64::MAX);
+		assert!(super::reap_orphan_files(&db, TnId(1), end).await.expect("reap").is_empty());
+
+		// A stale pending replace releases its content.
+		assert_eq!(super::purge_stale_pending_replaces(&db, TnId(1), end).await.expect("p"), 1);
+		super::reap_orphan_files(&db, TnId(1), end).await.expect("reap");
+		let sql = format!("SELECT count(*) FROM files WHERE f_id={pending}");
+		assert_eq!(count(&db, &sql).await, 0);
+
+		// Purging the entry drops its history, and the old content goes with the next reap.
+		sqlx::query("UPDATE entries SET status='D'")
+			.execute(&db)
+			.await
+			.expect("tombstone");
+		super::purge_tombstones(&db, TnId(1)).await.expect("purge");
+		assert_eq!(count(&db, "SELECT count(*) FROM entry_versions").await, 0);
+		let reaped = super::reap_orphan_files(&db, TnId(1), end).await.expect("reap");
+		assert!(reaped.iter().any(|id| &**id == "f1~old"), "reaped: {reaped:?}");
+		let sql = format!("SELECT count(*) FROM files WHERE f_id={old}");
+		assert_eq!(count(&db, &sql).await, 0);
+	}
+
+	#[tokio::test]
+	async fn prune_keeps_the_newest_versions() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let db = test_pool(dir.path()).await;
+		let e = make_entry(&db, "f1~v1", false, None, &[], None).await;
+		let p = start_replace(&db, &e, "f1~v1").await;
+		super::finalize_file(&db, TnId(1), p, "f1~v2").await.expect("finalize");
+		let p = start_replace(&db, &e, "f1~v2").await;
+		super::finalize_file(&db, TnId(1), p, "f1~v3").await.expect("finalize");
+		let dropped = super::prune_entry_versions(&db, TnId(1), 1, Timestamp(0)).await;
+		assert_eq!(dropped.expect("prune"), 1);
+		let versions = super::list_entry_versions(&db, TnId(1), &e).await.expect("versions");
+		assert_eq!(versions.iter().map(|v| &*v.file_id).collect::<Vec<_>>(), ["f1~v2"]);
+		// Everything replaced before `older_than` goes, whatever the count.
+		let dropped = super::prune_entry_versions(&db, TnId(1), 10, Timestamp(i64::MAX)).await;
+		assert_eq!(dropped.expect("prune"), 1);
 	}
 }

@@ -264,6 +264,9 @@ const TENANT_CASCADE_TABLES: &[&str] = &[
 	"partner_edge",
 	"profile_badges",
 	"notifications",
+	"entry_versions",
+	"pending_replaces",
+	"entry_purges",
 ];
 
 /// Delete a tenant and all its associated data (cascading delete)

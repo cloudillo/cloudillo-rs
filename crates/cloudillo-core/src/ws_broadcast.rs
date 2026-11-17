@@ -13,6 +13,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 
+/// Registry key for `/ws/file-changes` sockets. `#` never occurs in an id_tag, so
+/// `send_to_user` / `is_user_online` never see it, while `send_to_tenant` still reaches it.
+pub const FILE_CHANGES_SLOT: &str = "#file-changes";
+
 /// A message to send to a user
 #[derive(Clone, Debug)]
 pub struct BroadcastMessage {
@@ -231,7 +235,10 @@ impl BroadcastManager {
 
 		users
 			.get(&tn_id)
-			.map(|tenant_users| tenant_users.keys().cloned().collect())
+			.map(|tenant_users| {
+				// `#`-keys are slots (`FILE_CHANGES_SLOT`), not users.
+				tenant_users.keys().filter(|k| !k.starts_with('#')).cloned().collect()
+			})
 			.unwrap_or_default()
 	}
 
@@ -244,7 +251,7 @@ impl BroadcastManager {
 		let mut users_per_tenant = HashMap::new();
 
 		for (tn_id, tenant_users) in users.iter() {
-			let tenant_user_count = tenant_users.len();
+			let tenant_user_count = tenant_users.keys().filter(|k| !k.starts_with('#')).count();
 			online_users += tenant_user_count;
 			users_per_tenant.insert(*tn_id, tenant_user_count);
 
@@ -274,6 +281,25 @@ pub fn now_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[tokio::test]
+	async fn file_changes_slot_is_not_a_user() {
+		let manager = BroadcastManager::new();
+		let tn_id = TnId(1);
+		let mut rx = manager.register_user(tn_id, FILE_CHANGES_SLOT, "conn-1").await;
+
+		assert!(!manager.is_user_online(tn_id, "alice").await);
+		let msg = BroadcastMessage::new("filesChanged", Value::Null, "system");
+		assert!(matches!(
+			manager.send_to_user(tn_id, "alice", msg.clone()).await,
+			DeliveryResult::UserOffline
+		));
+		assert_eq!(manager.send_to_tenant(tn_id, msg).await, 1);
+		assert_eq!(rx.try_recv().map(|m| m.cmd).ok().as_deref(), Some("filesChanged"));
+		assert!(manager.online_users(tn_id).await.is_empty());
+		let stats = manager.user_stats().await;
+		assert_eq!((stats.online_users, stats.total_connections), (0, 1));
+	}
 
 	#[tokio::test]
 	async fn test_register_user() {

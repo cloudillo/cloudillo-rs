@@ -356,6 +356,7 @@ impl AppBuilder {
 		extensions.insert(email_module);
 		extensions.insert(proxy::new_proxy_cache());
 		extensions.insert(crate::auth::new_qr_login_store());
+		extensions.insert(crate::auth::new_pair_store());
 		extensions.insert(crate::auth::new_mfa_store());
 		extensions.insert(crate::auth::new_login_fails());
 		extensions.insert(cloudillo_file::new_container_cache());

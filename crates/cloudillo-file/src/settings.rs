@@ -89,6 +89,20 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.build()?,
 	)?;
 
+	// Tenant upload profiles: name -> { orig, vis, vid, aud, thumb, extractAudio }
+	registry.register(
+		SettingDefinition::builder("file.profiles")
+			.description("Upload profile overrides and custom profiles (name -> per-class levels)")
+			.default(SettingValue::Json(serde_json::json!({})))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.validator(|v| match v {
+				SettingValue::Json(j) => crate::preset::validate_profiles(j),
+				_ => Err(Error::ValidationError("file.profiles must be a JSON object".into())),
+			})
+			.build()?,
+	)?;
+
 	// Image format for thumbnails
 	registry.register(
 		SettingDefinition::builder("file.thumbnail_format")
@@ -181,6 +195,48 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 			.validator(|v| match v {
 				SettingValue::Int(i) if *i >= 0 => Ok(()),
 				_ => Err(Error::ValidationError("Trash retention must be >= 0 days".into())),
+			})
+			.build()?,
+	)?;
+
+	// Version history of replaced file content (pruned by the file GC, `gc.rs`)
+	registry.register(
+		SettingDefinition::builder("file.version_max_size_mb")
+			.description(
+				"Largest file (MiB) whose previous content is kept as a version on replace",
+			)
+			.default(SettingValue::Int(20))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.validator(|v| match v {
+				SettingValue::Int(i) if *i >= 0 => Ok(()),
+				_ => Err(Error::ValidationError("Version max size must be >= 0 MiB".into())),
+			})
+			.build()?,
+	)?;
+
+	registry.register(
+		SettingDefinition::builder("file.version_keep_count")
+			.description("Versions kept per file (newest first; 0 = keep none)")
+			.default(SettingValue::Int(10))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.validator(|v| match v {
+				SettingValue::Int(i) if *i >= 0 => Ok(()),
+				_ => Err(Error::ValidationError("Version keep count must be >= 0".into())),
+			})
+			.build()?,
+	)?;
+
+	registry.register(
+		SettingDefinition::builder("file.version_keep_days")
+			.description("Days a version is kept (0 = no age limit)")
+			.default(SettingValue::Int(30))
+			.scope(SettingScope::Tenant)
+			.permission(PermissionLevel::User)
+			.validator(|v| match v {
+				SettingValue::Int(i) if *i >= 0 => Ok(()),
+				_ => Err(Error::ValidationError("Version keep days must be >= 0".into())),
 			})
 			.build()?,
 	)?;

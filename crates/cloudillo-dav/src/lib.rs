@@ -16,7 +16,7 @@ pub mod propfind;
 mod propfind_util;
 pub mod report;
 
-pub use auth::{dav_basic_auth, has_scope};
+pub use auth::dav_basic_auth;
 pub use consts::{NS_CALDAV, NS_CALSERVER, NS_CARDDAV, NS_DAV};
 pub use http::{etag_header, plain_error, unquote_etag, urldecode_path, urlencode_path};
 pub use multistatus::{

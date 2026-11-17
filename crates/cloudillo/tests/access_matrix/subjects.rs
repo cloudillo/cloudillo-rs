@@ -461,6 +461,10 @@ pub async fn mint_subjects(
 		hat,
 	)
 	.await;
+	// A drive scope exists only on API keys and PROXY exchanges: a hatted session never gets
+	// one (unlisted name: the oracle expects Deny).
+	let drive = "/api/auth/access-token?scope=file:~closed-w:R";
+	m.post("scope-drive-hatted@club", CLUB, drive, hat).await;
 	m.post("refresh-hatted@club", CLUB, "/api/auth/access-token", hat).await;
 	// Not `proxy-…`: that prefix marks mints `smoke` requires to succeed.
 	m.post("proxytoken-hatted@club", CLUB, "/api/auth/proxy-token", hat).await;
@@ -499,6 +503,19 @@ pub async fn mint_subjects(
 				},
 			);
 		}
+	}
+
+	// App tokens (session re-mint) never carry a drive scope; a malformed drive target is
+	// refused as such (400). Unlisted names: the oracle expects Deny.
+	for (name, scope) in [
+		("scope-drive-main@alice", "file:__root__:W"),
+		("scope-drive-room@alice", "file:~close-friends:R"),
+		("scope-drive-all@alice", "file:*:R"),
+		("scope-drive-bad@alice", "file:~Bad:W"),
+		("scope-drive-c@alice", "file:__root__:C"),
+	] {
+		let uri = format!("/api/auth/access-token?scope={scope}");
+		m.post(name, ALICE, &uri, alice_owner.as_deref()).await;
 	}
 
 	// Scoped app tokens: owner session refresh, and a grantee's scoped PROXY exchange.
@@ -656,10 +673,26 @@ pub async fn mint_subjects(
 	m.add("apikey-dav-rw@alice", ALICE, Some(keys.dav_rw.clone()), dav_rw);
 	let club_key = SubjectFacts { id_tag: Some(CLUB.into()), ..key_facts(None, None) };
 	m.add("apikey-unscoped@club", CLUB, Some(keys.club.clone()), club_key);
-	// alice's device key (bearer only: it is never exchanged). Curated rows only; the oracle
-	// knows no `device:` scope, so it stays out of LEVEL_SUBJECTS.
+	// alice's native-client keys: `file:{folder}:W` plus capabilities (bearer only: a key
+	// carrying a capability is never exchanged). Curated rows only; the oracle does not model
+	// multi-scope sets or the lifecycle-inside-root rule, so they stay out of LEVEL_SUBJECTS.
 	let device = key_facts(Some(&keys.device_scope), None);
 	m.add("device@alice", ALICE, Some(keys.device.clone()), device);
+	// The same root plus `notifications:read` (key 9): same bounds, and it reads the log.
+	let device_notif = key_facts(Some(&keys.device_notif_scope), None);
+	m.add("device-notif@alice", ALICE, Some(keys.device_notif.clone()), device_notif);
+	// Bound to a folder on `peer.test` (key 10): locally only the forced proxy-token exchange.
+	let rfile = key_facts(Some(&keys.rfile_scope), None);
+	m.add("rfile@alice", ALICE, Some(keys.rfile.clone()), rfile);
+	// Drive-scoped keys (11..13): alice's own access narrowed to whole drives. Curated rows
+	// only (the oracle models no drive scope), so they stay out of LEVEL_SUBJECTS.
+	for (name, key, scope) in [
+		("drive-main@alice", &keys.drive_main, crate::objects::DRIVE_MAIN_SCOPE),
+		("drive-room@alice", &keys.drive_room, crate::objects::DRIVE_ROOM_SCOPE),
+		("drive-all@alice", &keys.drive_all, crate::objects::DRIVE_ALL_SCOPE),
+	] {
+		m.add(name, ALICE, Some(key.clone()), key_facts(Some(scope), None));
+	}
 
 	edge_mints(&mut m, &r.hatted, keys, &aprv, alice_owner.as_deref()).await;
 

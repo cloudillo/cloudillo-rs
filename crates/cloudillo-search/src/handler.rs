@@ -98,7 +98,7 @@ use cloudillo_types::{
 		SEARCH_MAX_LIMIT, SEARCH_MAX_OFFSET, SEARCH_MAX_TAGS, SearchMatch, SearchOptions,
 		SearchRow,
 	},
-	types::{AccessLevel, ApiResponse, ApiTime, CursorData, TokenScope},
+	types::{AccessLevel, ApiResponse, ApiTime, CursorData, TokenScope, delegated_scope},
 };
 use serde::{Deserialize, Serialize};
 
@@ -319,7 +319,7 @@ pub async fn get_search(
 	if let Some(scope) = auth.scope.as_deref() {
 		// Only a file scope reaches here; anything else — including a scope
 		// string this build cannot parse — is denied rather than ignored.
-		let Some(TokenScope::File { file_id, .. }) = TokenScope::parse(scope) else {
+		let Some(TokenScope::File { file_id, .. }) = delegated_scope(scope) else {
 			return Err(Error::PermissionDenied);
 		};
 		// The scope names an entry; index rows are keyed by content `file_id` (a folder's is

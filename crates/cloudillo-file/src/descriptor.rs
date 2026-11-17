@@ -332,9 +332,16 @@ impl Task<App> for FileIdGeneratorTask {
 
 		// Read root_id (document tree support) and the uploader from file metadata
 		let file_id_str = format!("@{}", self.f_id);
-		let file = app.meta_adapter.read_file(self.tn_id, &file_id_str).await?;
-		let root_id = file.as_ref().and_then(|f| f.root_id.clone());
-		let owner_tag = file.and_then(|f| f.owner_tag);
+		// Replace content has no entry yet: read its `files` row (root_id) and pending row
+		// (replaced_by). root_id survives `finalize_file`, so a retry hashes the same id.
+		let (root_id, owner_tag, entry_id) =
+			if let Some(file) = app.meta_adapter.read_file(self.tn_id, &file_id_str).await? {
+				(file.root_id, file.owner_tag, Some(file.entry_id))
+			} else {
+				let pending = app.meta_adapter.read_pending_replace(self.tn_id, self.f_id).await?;
+				let (root_id, owner_tag) = pending.unwrap_or_default();
+				(root_id, owner_tag, None)
+			};
 
 		let descriptor = get_file_descriptor(&variants, root_id.as_deref());
 
@@ -366,6 +373,19 @@ impl Task<App> for FileIdGeneratorTask {
 			let delivered = app.broadcast.send_to_tenant(self.tn_id, msg).await;
 			debug!("fileIdGenerated delivered to {} tenant connections", delivered);
 		}
+		let entry_id = match entry_id {
+			Some(id) => Some(id),
+			// Best effort: the file is finalized, so an error only widens the hint.
+			None => app
+				.meta_adapter
+				.read_file(self.tn_id, &file_id)
+				.await
+				.ok()
+				.flatten()
+				.map(|f| f.entry_id),
+		};
+		let entries: Vec<&str> = entry_id.as_deref().into_iter().collect();
+		crate::notify_files_changed(app, self.tn_id, &entries).await;
 
 		info!("Finished task file.id-generate {} → {}", descriptor, file_id);
 		Ok(())

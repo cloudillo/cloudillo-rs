@@ -8,7 +8,9 @@ pub mod audit;
 pub mod cleanup;
 pub mod handler;
 pub mod keys;
+mod qr_common;
 pub mod qr_login;
+pub mod qr_pair;
 pub mod settings;
 pub mod totp;
 pub mod webauthn;
@@ -31,6 +33,11 @@ pub fn init(app: &App) -> ClResult<()> {
 /// Create the QR login store (call during app building, insert into extensions)
 pub fn new_qr_login_store() -> qr_login::QrLoginStore {
 	qr_login::QrLoginStore::new()
+}
+
+/// Create the QR pairing store (call during app building, insert into extensions)
+pub fn new_pair_store() -> qr_pair::PairStore {
+	qr_pair::PairStore::new()
 }
 
 /// Create the MFA challenge store (call during app building, insert into extensions)

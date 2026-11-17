@@ -7,95 +7,35 @@
 use axum::{
 	Json,
 	extract::{ConnectInfo, Path, State},
-	http::{HeaderMap, StatusCode, header},
+	http::{HeaderMap, StatusCode},
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL};
 use cloudillo_types::extract::{JsonBody, Query};
-use dashmap::DashMap;
-use rand::RngExt;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Notify;
 
 use cloudillo_core::{Auth, extract::IdTag};
 use cloudillo_types::types::ApiResponse;
 
 use crate::handler::{Login, return_login};
 use crate::prelude::*;
+use crate::qr_common::{QrStore, client_info, secret_from};
 
-/// Session expiry: 5 minutes
-const SESSION_EXPIRY_SECS: u64 = 300;
-
-/// Maximum number of concurrent QR login sessions
-const MAX_SESSIONS: usize = 10_000;
-
-// ============================================================================
-// In-memory session store
-// ============================================================================
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum QrLoginStatus {
-	Pending,
-	Approved,
-	Denied,
-}
-
-pub struct QrLoginSession {
-	tn_id: TnId,
-	status: QrLoginStatus,
-	secret_hash: String,
+/// What the approving phone sees about the desktop.
+pub struct LoginMeta {
 	user_agent: Option<String>,
 	ip_address: Option<String>,
-	login_data: Option<Login>,
-	expires_at: Instant,
-	notify: Arc<Notify>,
 }
 
 /// Shared store for QR login sessions, registered as an extension on App.
-pub struct QrLoginStore {
-	sessions: DashMap<String, QrLoginSession>,
-}
-
-impl Default for QrLoginStore {
-	fn default() -> Self {
-		Self { sessions: DashMap::new() }
-	}
-}
-
-impl QrLoginStore {
-	pub fn new() -> Self {
-		Self::default()
-	}
-
-	/// Remove expired sessions.
-	pub fn cleanup_expired(&self) -> usize {
-		let now = Instant::now();
-		let before = self.sessions.len();
-		self.sessions.retain(|_, session| now < session.expires_at);
-		before - self.sessions.len()
-	}
-}
-
-/// Hash a secret string with SHA-256 and return the hex digest.
-fn hash_secret(secret: &str) -> String {
-	let hash = Sha256::digest(secret.as_bytes());
-	hash.iter().fold(String::with_capacity(64), |mut s, b| {
-		use std::fmt::Write;
-		let _ = write!(s, "{b:02x}");
-		s
-	})
-}
+pub type QrLoginStore = QrStore<LoginMeta, Login>;
 
 // ============================================================================
 // POST /api/auth/login/qr
 // ============================================================================
 
 #[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InitResponse {
-	#[serde(rename = "sessionId")]
 	pub session_id: String,
 	pub secret: String,
 }
@@ -108,39 +48,10 @@ pub fn create_session(
 	headers: &HeaderMap,
 ) -> ClResult<InitResponse> {
 	let store = app.ext::<QrLoginStore>()?;
-
-	// Enforce maximum session count (cleanup expired first if at capacity)
-	if store.sessions.len() >= MAX_SESSIONS {
-		store.cleanup_expired();
-		if store.sessions.len() >= MAX_SESSIONS {
-			return Err(Error::ServiceUnavailable("too many QR login sessions".into()));
-		}
-	}
-
-	// Extract User-Agent from the desktop browser request
-	let user_agent =
-		headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(String::from);
-
-	// Generate session_id (16 bytes, public — goes into QR code)
-	let session_id_bytes: [u8; 16] = rand::rng().random();
-	let session_id = BASE64_URL.encode(session_id_bytes);
-
-	// Generate secret (32 bytes, private — kept by desktop browser only)
-	let secret_bytes: [u8; 32] = rand::rng().random();
-	let secret = BASE64_URL.encode(secret_bytes);
-
-	let session = QrLoginSession {
-		tn_id,
-		status: QrLoginStatus::Pending,
-		secret_hash: hash_secret(&secret),
-		user_agent,
-		ip_address: Some(addr.ip().to_string()),
-		login_data: None,
-		expires_at: Instant::now() + Duration::from_secs(SESSION_EXPIRY_SECS),
-		notify: Arc::new(Notify::new()),
-	};
-
-	store.sessions.insert(session_id.clone(), session);
+	// User-Agent of the desktop browser request
+	let (user_agent, ip_address) = client_info(addr, headers);
+	let meta = LoginMeta { user_agent, ip_address };
+	let (session_id, secret) = store.create(tn_id, addr.ip(), meta)?;
 
 	Ok(InitResponse { session_id, secret })
 }
@@ -162,12 +73,6 @@ pub async fn post_init(
 // GET /api/auth/login/qr/{sessionId}
 // ============================================================================
 
-/// Maximum long-poll timeout in seconds
-const MAX_POLL_TIMEOUT_SECS: u64 = 30;
-
-/// Default long-poll timeout in seconds
-const DEFAULT_POLL_TIMEOUT_SECS: u64 = 15;
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusQuery {
@@ -179,71 +84,12 @@ pub struct StatusQuery {
 const QR_SECRET_HEADER: &str = "cloudillo-qr-secret";
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StatusResponse {
-	status: String,
+	status: &'static str,
 	/// Included when status is "approved"
 	#[serde(skip_serializing_if = "Option::is_none")]
 	login: Option<Login>,
-}
-
-type StatusResult = (StatusCode, Json<ApiResponse<StatusResponse>>);
-
-/// Verify that the caller knows the session secret.
-fn verify_secret(store: &QrLoginStore, session_id: &str, secret: &str) -> ClResult<()> {
-	let entry = store.sessions.get(session_id).ok_or(Error::NotFound)?;
-	if entry.secret_hash != hash_secret(secret) {
-		return Err(Error::NotFound);
-	}
-	Ok(())
-}
-
-/// Try to resolve the current session status into a response.
-/// Returns `Ok(response)` if terminal or non-pending, `Err(notify)` if pending (for long-poll).
-fn try_resolve_status(store: &QrLoginStore, session_id: &str) -> Result<StatusResult, Arc<Notify>> {
-	let entry = store.sessions.get(session_id);
-	let Some(session) = entry else {
-		let response =
-			ApiResponse::new(StatusResponse { status: "expired".to_string(), login: None });
-		return Ok((StatusCode::OK, Json(response)));
-	};
-
-	// Check expiry
-	if Instant::now() >= session.expires_at {
-		drop(session);
-		// Use remove_if to avoid TOCTOU race: post_respond could approve between
-		// drop and remove, so only remove if still expired.
-		store.sessions.remove_if(session_id, |_, s| Instant::now() >= s.expires_at);
-		let response =
-			ApiResponse::new(StatusResponse { status: "expired".to_string(), login: None });
-		return Ok((StatusCode::OK, Json(response)));
-	}
-
-	match session.status {
-		QrLoginStatus::Approved => {
-			let login_data = session.login_data.clone();
-			drop(session);
-			// Safe to remove unconditionally: Approved is a terminal state
-			store.sessions.remove(session_id);
-			let response = ApiResponse::new(StatusResponse {
-				status: "approved".to_string(),
-				login: login_data,
-			});
-			Ok((StatusCode::OK, Json(response)))
-		}
-		QrLoginStatus::Denied => {
-			drop(session);
-			// Safe to remove unconditionally: Denied is a terminal state
-			store.sessions.remove(session_id);
-			let response =
-				ApiResponse::new(StatusResponse { status: "denied".to_string(), login: None });
-			Ok((StatusCode::OK, Json(response)))
-		}
-		QrLoginStatus::Pending => {
-			let notify = session.notify.clone();
-			drop(session);
-			Err(notify)
-		}
-	}
 }
 
 pub async fn get_status(
@@ -253,43 +99,10 @@ pub async fn get_status(
 	headers: HeaderMap,
 ) -> ClResult<(StatusCode, Json<ApiResponse<StatusResponse>>)> {
 	let store = app.ext::<QrLoginStore>()?;
-	// Extract secret from header
-	let secret = headers
-		.get(QR_SECRET_HEADER)
-		.and_then(|v| v.to_str().ok())
-		.ok_or(Error::Unauthorized)?;
-
-	// Verify secret before revealing any session information
-	verify_secret(store, &session_id, secret)?;
-
-	// Check current status (reuses shared resolution logic)
-	let notify_and_wait = match try_resolve_status(store, &session_id) {
-		Ok(response) => return Ok(response),
-		Err(notify) => {
-			// Still pending — compute long-poll wait time
-			let timeout_secs =
-				query.timeout.unwrap_or(DEFAULT_POLL_TIMEOUT_SECS).min(MAX_POLL_TIMEOUT_SECS);
-			let wait = store.sessions.get(&session_id).map_or(Duration::ZERO, |s| {
-				Duration::from_secs(timeout_secs)
-					.min(s.expires_at.saturating_duration_since(Instant::now()))
-			});
-			(notify, wait)
-		}
-	};
-
-	// Long-poll: wait for notification or timeout
-	let (notify, wait) = notify_and_wait;
-	let _ = tokio::time::timeout(wait, notify.notified()).await;
-
-	// Re-check after wait
-	if let Ok(response) = try_resolve_status(store, &session_id) {
-		Ok(response)
-	} else {
-		// Still pending after timeout
-		let response =
-			ApiResponse::new(StatusResponse { status: "pending".to_string(), login: None });
-		Ok((StatusCode::OK, Json(response)))
-	}
+	let secret = secret_from(&headers, QR_SECRET_HEADER)?;
+	let (status, login) = store.poll(&session_id, secret, query.timeout).await?.into_parts();
+	let response = ApiResponse::new(StatusResponse { status, login });
+	Ok((StatusCode::OK, Json(response)))
 }
 
 // ============================================================================
@@ -297,13 +110,14 @@ pub async fn get_status(
 // ============================================================================
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DetailsResponse {
-	#[serde(rename = "userAgent")]
 	user_agent: Option<String>,
-	#[serde(rename = "ipAddress")]
 	ip_address: Option<String>,
 }
 
+/// The pending client's User-Agent and IP for the approver. Available only while the session is
+/// pending: an answered session returns `ValidationError` ("already responded").
 pub async fn get_details(
 	State(app): State<App>,
 	IdTag(id_tag): IdTag,
@@ -312,34 +126,9 @@ pub async fn get_details(
 ) -> ClResult<(StatusCode, Json<ApiResponse<DetailsResponse>>)> {
 	let store = app.ext::<QrLoginStore>()?;
 
-	// Read and validate under short lock, clone needed fields, then drop guard
-	let (user_agent, ip_address) = {
-		let entry = store.sessions.get(&session_id);
-		let Some(session) = entry else {
-			return Err(Error::NotFound);
-		};
-
-		// Check expiry first (cheapest check)
-		if Instant::now() >= session.expires_at {
-			return Err(Error::NotFound);
-		}
-
-		// Verify tenant match
-		if auth.tn_id != session.tn_id {
-			return Err(Error::PermissionDenied);
-		}
-
-		// Same binding `post_respond` applies: `auth.tn_id` is always the host tenant, so
-		// the check above admits any visitor holding a session here — who would then read
-		// the desktop's IP and User-Agent off a session they did not start.
-		if !cloudillo_core::abac::is_tenant_account(&auth, &id_tag) {
-			warn!(subject = %auth.id_tag, host = %id_tag, "QR details denied - not the account");
-			return Err(Error::PermissionDenied);
-		}
-
-		// Clone needed fields before dropping the guard
-		(session.user_agent.clone(), session.ip_address.clone())
-	};
+	let (user_agent, ip_address) = store.with_pending(&session_id, &auth, &id_tag, |m| {
+		Ok((m.user_agent.clone(), m.ip_address.clone()))
+	})?;
 
 	let response = ApiResponse::new(DetailsResponse { user_agent, ip_address });
 
@@ -365,43 +154,12 @@ pub async fn post_respond(
 ) -> ClResult<(StatusCode, Json<ApiResponse<StatusResponse>>)> {
 	let store = app.ext::<QrLoginStore>()?;
 
-	// Read and validate under short lock — do NOT hold across .await
-	let notify = {
-		let entry = store.sessions.get(&session_id).ok_or(Error::NotFound)?;
-		let session = entry.value();
+	// Validate under the short guard — never held across .await. The approver must BE the
+	// account: `create_tenant_login` refuses the mismatch too; failing here keeps the
+	// desktop's long-poll pending instead of resolving it with a foreign login.
+	store.with_pending(&session_id, &auth, &id_tag, |_| Ok(()))?;
 
-		// Check expiry first (cheapest check)
-		if Instant::now() >= session.expires_at {
-			return Err(Error::NotFound);
-		}
-
-		// Verify tenant match
-		if auth.tn_id != session.tn_id {
-			return Err(Error::PermissionDenied);
-		}
-
-		// The approver must BE the account, not merely hold a session on its host.
-		// `auth.tn_id` is always the host tenant, so the check above is satisfied by any
-		// visitor with a session here — who could otherwise approve a QR scanned off the
-		// victim's screen and silently hand the desktop *their own* identity (login CSRF).
-		// `create_tenant_login` refuses the mismatch too; failing here keeps the desktop's
-		// long-poll pending instead of resolving it with a foreign login.
-		if !cloudillo_core::abac::is_tenant_account(&auth, &id_tag) {
-			warn!(subject = %auth.id_tag, host = %id_tag, "QR login denied - not the account");
-			return Err(Error::PermissionDenied);
-		}
-
-		// Must be pending
-		if session.status != QrLoginStatus::Pending {
-			return Err(Error::ValidationError("Session already responded".into()));
-		}
-
-		session.notify.clone()
-		// DashMap read guard dropped here
-	};
-
-	// Perform async work without holding any DashMap lock
-	if body.approved {
+	let result = if body.approved {
 		// Approval mints a fresh owner session from the approver's, so it is a renewal: it
 		// may not outlive the approver's own login.
 		let auth_time = auth.auth_time.unwrap_or(Timestamp(0));
@@ -409,17 +167,17 @@ pub async fn post_respond(
 		let auth_login =
 			app.auth_adapter.create_tenant_login(&auth.id_tag, &id_tag, auth_time).await?;
 		let (_status, Json(login_data)) = return_login(&app, auth_login).await?;
+		Some(login_data)
+	} else {
+		None
+	};
+	// The session may have expired or been answered meanwhile; a late deny must not
+	// overwrite a concurrent approve.
+	let status_str = store
+		.respond(&session_id, result)
+		.map_err(|_| crate::qr_common::already_responded())?;
 
-		// Re-acquire lock to update session — return error if session vanished or already
-		// responded. The guard drops before the audit write's `.await`.
-		{
-			let mut entry = store.sessions.get_mut(&session_id).ok_or(Error::NotFound)?;
-			if entry.status != QrLoginStatus::Pending {
-				return Err(Error::ValidationError("Session already responded".into()));
-			}
-			entry.login_data = Some(login_data);
-			entry.status = QrLoginStatus::Approved;
-		}
+	if body.approved {
 		// Only once the session holds the login. `addr` is the approving phone's; the
 		// desktop's IP is not known here.
 		crate::audit::record_auth(
@@ -432,22 +190,9 @@ pub async fn post_respond(
 			Some(serde_json::json!({ "method": "qr" })),
 		)
 		.await;
-	} else {
-		let mut entry = store.sessions.get_mut(&session_id).ok_or(Error::NotFound)?;
-		// Re-check under the re-acquired lock, like the approve branch: a concurrent
-		// approve must not be overwritten by a late deny.
-		if entry.status != QrLoginStatus::Pending {
-			return Err(Error::ValidationError("Session already responded".into()));
-		}
-		entry.status = QrLoginStatus::Denied;
 	}
 
-	// Wake any long-polling get_status calls for this session
-	notify.notify_waiters();
-
-	let status_str = if body.approved { "approved" } else { "denied" };
-
-	let response = ApiResponse::new(StatusResponse { status: status_str.to_string(), login: None });
+	let response = ApiResponse::new(StatusResponse { status: status_str, login: None });
 
 	Ok((StatusCode::OK, Json(response)))
 }

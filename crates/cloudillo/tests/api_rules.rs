@@ -339,7 +339,13 @@ fn handler_serde_items_are_camel_case() {
 #[test]
 fn rest_structs_use_api_time() {
 	/// `(file, item)` — not on the REST wire: scheduler payloads, JWT claims, DB rows.
-	const ALLOW: &[(&str, &str)] = &[];
+	/// The change feed is the exception: its cursor is unix seconds so clients can overlap
+	/// (`since = last - 10s`) and dedupe on `updatedAt` as integers.
+	const ALLOW: &[(&str, &str)] = &[
+		("crates/cloudillo-file/src/handler.rs", "FileChangeRow"),
+		("crates/cloudillo-file/src/handler.rs", "FileChangeGone"),
+		("crates/cloudillo-file/src/handler.rs", "FileChangesResponse"),
+	];
 	check_allow("rest_structs_use_api_time", &["struct"], ALLOW);
 	let mut hits = Vec::new();
 	for (rel, lines) in sources() {

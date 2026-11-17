@@ -31,7 +31,7 @@ use cloudillo_types::{
 		WELCOME_REF_TYPE,
 	},
 	roles::{check_hat_aprv, hat_peer, map_hat_role, parse_hat_roles},
-	types::{AccessLevel, ApiResponse, scope_for_log},
+	types::{AccessLevel, ApiResponse, ScopeSet, TokenScope, scope_for_log},
 	utils::decode_jwt_no_verify,
 	validation::validate_id_tag,
 };
@@ -637,14 +637,24 @@ fn narrow_to_presented(expanded: Option<String>, presented: &[Box<str>]) -> Opti
 }
 
 /// The four DAV capability scopes, comma-separated, normalised — or `None` if `requested`
-/// contains anything else. Whitespace around entries is trimmed, mirroring
-/// `cloudillo_core::scope::has_scope`'s tolerance for `", "` separators.
+/// contains anything else. Parsed by [`ScopeSet`] like every other scope list, so `", "`
+/// separators are tolerated the same way.
 fn normalized_dav_scope(requested: &str) -> Option<String> {
-	const DAV_SCOPES: &[&str] = &["carddav:read", "carddav:write", "caldav:read", "caldav:write"];
-
-	// `split` always yields at least one entry, so an empty string fails the membership test.
-	let entries: Vec<&str> = requested.split(',').map(str::trim).collect();
-	entries.iter().all(|e| DAV_SCOPES.contains(e)).then(|| entries.join(","))
+	use cloudillo_types::types::Capability;
+	let set = ScopeSet::parse(requested).filter(|set| set.delegated.is_none())?;
+	let dav = |c: &Capability| {
+		matches!(
+			c,
+			Capability::CardDavRead
+				| Capability::CardDavWrite
+				| Capability::CalDavRead
+				| Capability::CalDavWrite
+		)
+	};
+	set.caps
+		.iter()
+		.all(dav)
+		.then(|| set.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(","))
 }
 
 /// Validate a client-requested `?scope=` against what the caller can actually reach, returning the
@@ -662,6 +672,7 @@ fn normalized_dav_scope(requested: &str) -> Option<String> {
 /// `cloudillo_core::tests::file_access_scope::scope_mint_denies_strangers_and_caps_at_real_access`,
 /// which pins the ladder and the `scope_char_within` cap this composes. There is no `App` test
 /// harness in the tree to pin the composition itself.
+#[expect(clippy::too_many_arguments, reason = "caller identity flags")]
 async fn validated_scope(
 	app: &App,
 	tn_id: TnId,
@@ -669,10 +680,10 @@ async fn validated_scope(
 	caller_id_tag: &str,
 	caller_roles: &[Box<str>],
 	caller_hatted: bool,
+	proxy: bool,
 	requested: Option<&str>,
 ) -> ClResult<Option<String>> {
 	use cloudillo_core::file_access::{self, FileAccessCtx};
-	use cloudillo_types::types::TokenScope;
 	use tracing::warn;
 
 	let Some(requested) = requested else { return Ok(None) };
@@ -743,11 +754,39 @@ async fn validated_scope(
 			}
 			Ok(Some(requested.to_string()))
 		}
-		// A device scope lives only on a tenant API key, which is itself the bearer; no access
-		// token is ever minted carrying it.
-		TokenScope::Device { .. } => {
-			warn!("device scope denied for access-token mint by {}", caller_id_tag);
+		// A remote-file scope lives only on a tenant API key, which is itself the bearer; no
+		// access token is ever minted carrying it.
+		TokenScope::RemoteFile { .. } => {
+			warn!("rfile scope denied for access-token mint by {}", caller_id_tag);
 			Err(Error::PermissionDenied)
+		}
+		// A drive scope narrows the holder's own access, so it is only minted on the receiving
+		// PROXY exchange (an `rfile:` key brokered here), never for app tokens or a hat.
+		TokenScope::Drive { drive, access } => {
+			if !proxy {
+				warn!("drive scope denied for access-token mint by {}", caller_id_tag);
+				return Err(Error::PermissionDenied);
+			}
+			// Narrowing would deny a room the subject cannot enter anyway; refuse early so the
+			// client gets a clear error. `None` = the tenant itself, no gate.
+			if let cloudillo_types::types::DriveTarget::Room(name) = &drive {
+				let enterable = cloudillo_core::channels::enterable_channels(
+					app,
+					tn_id,
+					tenant_id_tag,
+					caller_id_tag,
+					caller_roles,
+					caller_hatted,
+				)
+				.await?;
+				let room = cloudillo_core::channels::absolute_channel(tenant_id_tag, name);
+				if enterable.is_some_and(|list| !list.contains(&room)) {
+					warn!("drive scope denied: {} cannot enter room {}", caller_id_tag, name);
+					return Err(Error::PermissionDenied);
+				}
+			}
+			let level = access.to_scope_char().ok_or(Error::PermissionDenied)?;
+			Ok(Some(format!("file:{drive}:{level}")))
 		}
 	}
 }
@@ -760,8 +799,6 @@ fn hatted_scope_exp(
 	requested: Option<&str>,
 	now: Timestamp,
 ) -> ClResult<Timestamp> {
-	use cloudillo_types::types::TokenScope;
-
 	if !matches!(requested.and_then(TokenScope::parse), Some(TokenScope::File { .. })) {
 		return Err(Error::Unauthorized);
 	}
@@ -808,8 +845,6 @@ pub async fn post_access_token(
 
 	// Cross-document link: get scoped token for target file via source file
 	if let Some(ref via_file_id) = query.via {
-		use cloudillo_types::types::TokenScope;
-
 		// Requires scope param: "file:{target_file_id}:{R|W}"
 		let scope_str = query
 			.scope
@@ -868,7 +903,7 @@ pub async fn post_access_token(
 			// Must be scoped to the via file (bare id), and the level it carries caps
 			// whatever is minted below.
 			if let Some(TokenScope::File { file_id: ref scope_fid, access, ref_id }) =
-				TokenScope::parse(caller_scope)
+				cloudillo_types::types::delegated_scope(caller_scope)
 			{
 				caller_cap = Some(access);
 				caller_ref = ref_id;
@@ -1115,7 +1150,8 @@ pub async fn post_access_token(
 			&id_tag.0,
 			&auth_action.iss,
 			&caller_roles,
-			hat.is_some(),
+			hat.is_some(), // caller_hatted
+			true,          // proxy
 			query.scope.as_deref(),
 		)
 		.await?;
@@ -1250,23 +1286,20 @@ pub async fn post_access_token(
 			return Err(Error::PermissionDenied);
 		}
 
-		// A capability key (DAV scope) reaches its PIM routes directly; it is never exchanged.
-		if validation
-			.scopes
-			.as_deref()
-			.is_some_and(|s| s.split(',').any(|e| normalized_dav_scope(e).is_some()))
-		{
-			warn!("API key exchange refused: capability (DAV) key");
-			return Err(Error::PermissionDenied);
-		}
-		// A device key is itself the bearer; it is never exchanged for an access token.
-		{
-			use cloudillo_types::types::TokenScope;
-			if matches!(
-				validation.scopes.as_deref().and_then(TokenScope::parse),
-				Some(TokenScope::Device { .. })
-			) {
-				warn!("API key exchange refused: device key");
+		// A key carrying a capability (DAV, notifications) reaches its routes directly, and an
+		// `rfile:` key is only good for the proxy-token broker: neither is exchanged for an
+		// access token. A list that does not parse is refused rather than read as unscoped.
+		if let Some(s) = validation.scopes.as_deref() {
+			let Some(set) = ScopeSet::parse(s) else {
+				warn!("API key exchange refused: malformed scope list");
+				return Err(Error::PermissionDenied);
+			};
+			if matches!(set.delegated, Some(TokenScope::RemoteFile { .. })) {
+				warn!("API key exchange refused: rfile key");
+				return Err(Error::PermissionDenied);
+			}
+			if !set.caps.is_empty() {
+				warn!("API key exchange refused: capability key");
 				return Err(Error::PermissionDenied);
 			}
 		}
@@ -1325,7 +1358,8 @@ pub async fn post_access_token(
 				&id_tag.0,
 				&auth.id_tag,
 				&auth.roles,
-				true,
+				true,  // caller_hatted
+				false, // proxy
 				query.scope.as_deref(),
 			)
 			.await?;
@@ -1379,7 +1413,8 @@ pub async fn post_access_token(
 			&id_tag.0,
 			&auth.id_tag,
 			&caller_roles,
-			auth.hat.is_some(),
+			auth.hat.is_some(), // caller_hatted
+			false,              // proxy
 			query.scope.as_deref(),
 		)
 		.await?;
@@ -1505,6 +1540,8 @@ fn check_endorse_peer(peer: Option<(ProfileType, bool, Option<&str>)>, role: &st
 /// Generate a proxy token for federation (allows this user to authenticate on behalf of the server)
 /// Body `{idTag?, hat?}`, may be omitted. If `idTag` is provided and different from the current server, this will
 /// perform a federated token exchange with the target server.
+/// An `rfile:{idTag}:{fileId}:{R|W}` key gets only a token from its bound `idTag`, capped by the
+/// remote at `file:{fileId}:{R|W}`; a differing `idTag` or any `hat` is refused.
 #[skip_serializing_none]
 #[derive(Serialize)]
 pub struct ProxyTokenRes {
@@ -1583,7 +1620,23 @@ pub async fn post_proxy_token(
 	body: Option<JsonBody<ProxyTokenReq>>,
 ) -> ClResult<(StatusCode, Json<ApiResponse<ProxyTokenRes>>)> {
 	let query = body.map(|JsonBody(b)| b).unwrap_or_default();
-	// `scope::scope_permits` already keeps every delegated token off this route. Fail closed
+	// An `rfile:` key is the one delegated token this route serves, and only for its binding.
+	// It returns unconditionally: it must never reach the unscoped branches below.
+	if let Some(TokenScope::RemoteFile { id_tag, file_id, access }) =
+		auth.scope.as_deref().and_then(cloudillo_types::types::delegated_scope)
+	{
+		return remote_file_proxy_token(
+			&app,
+			&own_id_tag,
+			&auth,
+			&query,
+			&id_tag,
+			&file_id,
+			access,
+		)
+		.await;
+	}
+	// `scope::scope_permits` keeps every other delegated token off this route. Fail closed
 	// here as well, for both branches: a share-link token must never be able to renew itself
 	// past its link's revocation, and re-deriving roles below would hand it the tenant's own
 	// (its `id_tag` *is* the tenant, since it is minted `sub: None`).
@@ -1617,11 +1670,6 @@ pub async fn post_proxy_token(
 	if let Some(ref target_id_tag) = query.id_tag
 		&& target_id_tag != own_id_tag.as_ref()
 	{
-		#[derive(Deserialize)]
-		struct AccessTokenClaims {
-			r: Option<String>,
-		}
-
 		// Federated exchange mints a token in which the *tenant* vouches for the caller
 		// toward a remote server, so it stays owner/leader-only — and that standing is
 		// re-read from storage above, not taken from the presented `r` claim, which a
@@ -1645,16 +1693,7 @@ pub async fn post_proxy_token(
 			None => (app.request.create_proxy_token(auth.tn_id, target_id_tag).await?.into(), None),
 		};
 
-		let roles: Option<Vec<String>> = match decode_jwt_no_verify::<AccessTokenClaims>(&token) {
-			Ok(claims) => {
-				debug!("Decoded federated token, roles claim: {:?}", claims.r);
-				claims.r.map(|r| r.split(',').map(String::from).collect())
-			}
-			Err(e) => {
-				warn!("Failed to decode federated token for roles: {:?}", e);
-				None
-			}
-		};
+		let roles = federated_token_roles(&token);
 
 		info!(
 			"Issued proxy token: id_tag={} sub={} target={} hat={:?} via=federation",
@@ -1699,6 +1738,76 @@ pub async fn post_proxy_token(
 		role: None,
 	});
 
+	Ok((StatusCode::OK, Json(response)))
+}
+
+/// The `r` claim of a token a remote signed for us, for `ProxyTokenRes::roles`.
+fn federated_token_roles(token: &str) -> Option<Vec<String>> {
+	#[derive(Deserialize)]
+	struct AccessTokenClaims {
+		r: Option<String>,
+	}
+	match decode_jwt_no_verify::<AccessTokenClaims>(token) {
+		Ok(claims) => {
+			debug!("Decoded federated token, roles claim: {:?}", claims.r);
+			claims.r.map(|r| r.split(',').map(String::from).collect())
+		}
+		Err(e) => {
+			warn!("Failed to decode federated token for roles: {:?}", e);
+			None
+		}
+	}
+}
+
+/// The `rfile:` branch of `post_proxy_token`: `idTag` and scope come only from the key's
+/// binding. The remote mints and caps the token at the member's real access (its
+/// `validated_scope`); this node only vouches for identity. Minted fresh, never cached.
+/// A drive target (`__root__`, `~name`, `*`) is forwarded unchanged as `file:{target}:{lvl}`;
+/// the remote narrows it to the member's own access.
+async fn remote_file_proxy_token(
+	app: &App,
+	own_id_tag: &str,
+	auth: &auth_adapter::AuthCtx,
+	query: &ProxyTokenReq,
+	id_tag: &str,
+	file_id: &str,
+	access: AccessLevel,
+) -> ClResult<(StatusCode, Json<ApiResponse<ProxyTokenRes>>)> {
+	if query.hat.is_some() || auth.hat.is_some() {
+		warn!(subject = %auth.id_tag, "Proxy token denied - hat with a remote-file key");
+		return Err(Error::PermissionDenied);
+	}
+	if query.id_tag.as_deref().is_some_and(|t| t != id_tag) || id_tag == own_id_tag {
+		warn!(
+			subject = %auth.id_tag,
+			bound = %id_tag,
+			"Proxy token denied - idTag not the key's binding"
+		);
+		return Err(Error::PermissionDenied);
+	}
+	// API keys are not sessions (no expiry by design); re-read leader standing.
+	let reread = reread_roles(app, auth.tn_id, own_id_tag, auth).await?;
+	if !cloudillo_core::roles::is_leader(&cloudillo_core::roles::parse_roles(
+		reread.as_deref().unwrap_or(""),
+	)) {
+		warn!(
+			subject = %auth.id_tag,
+			target = %id_tag,
+			"Remote-file proxy token denied - owner/leader required"
+		);
+		return Err(Error::PermissionDenied);
+	}
+	// `RemoteFile` parses only R or W, so `None` here is unreachable; fail closed regardless.
+	let level = access.to_scope_char().ok_or(Error::PermissionDenied)?;
+	let scope = format!("file:{file_id}:{level}");
+	let token: String =
+		app.request.create_scoped_proxy_token(auth.tn_id, id_tag, &scope).await?.into();
+	let roles = federated_token_roles(&token);
+	info!(
+		"Issued proxy token: id_tag={} sub={} target={} scope={} via=rfile",
+		own_id_tag, auth.id_tag, id_tag, scope
+	);
+	let response = ApiResponse::new(ProxyTokenRes { token, roles, hat: None, role: None });
 	Ok((StatusCode::OK, Json(response)))
 }
 
@@ -2356,13 +2465,18 @@ mod tests {
 		assert_eq!(
 			normalized_dav_scope("carddav:read, caldav:write").as_deref(),
 			Some("carddav:read,caldav:write"),
-			"`, ` separators are tolerated like scope::has_scope does"
+			"`, ` separators are tolerated like ScopeSet::parse does"
 		);
 
 		assert_eq!(normalized_dav_scope("carddav:reader"), None);
 		assert_eq!(normalized_dav_scope("carddav"), None);
 		assert_eq!(normalized_dav_scope(""), None);
 		assert_eq!(normalized_dav_scope("carddav:read,bogus"), None, "one bad entry sinks it");
+		assert_eq!(
+			normalized_dav_scope("notifications:read"),
+			None,
+			"access tokens never carry notifications:read"
+		);
 	}
 }
 

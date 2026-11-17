@@ -29,31 +29,33 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 
 use cloudillo_core::{App, extract::Auth};
-use cloudillo_types::{auth_adapter::AuthCtx, extract::IdTag, prelude::*};
+use cloudillo_types::{
+	auth_adapter::AuthCtx,
+	extract::IdTag,
+	prelude::*,
+	types::{Capability, ScopeSet},
+};
 
-/// Comma-separated exact-match scope test. Lives in `cloudillo-core` so
-/// `scope::scope_permits` enforces the same vocabulary on the REST surface
-/// that this middleware enforces on `/dav/*`.
-pub use cloudillo_core::scope::has_scope;
-
-/// What the token must satisfy. `AllOf` requires every scope (the read+write pattern);
-/// `AnyOf` is used for the shared principal path where either `carddav:read` OR `caldav:read`
-/// lets a DAV client discover collection URIs.
+/// What the token must satisfy, on its scope list parsed by [`ScopeSet`] — the parser
+/// `cloudillo_core::scope::scope_permits` uses on the REST surface, so a list malformed there
+/// (unknown entry included) grants nothing here either. `AllOf` requires every scope
+/// (read+write); `AnyOf` is used for the shared principal path where either `carddav:read` OR
+/// `caldav:read` lets a DAV client discover collection URIs.
 #[derive(Debug, Clone)]
 enum Required {
-	AllOf(&'static [&'static str]),
-	AnyOf(&'static [&'static str]),
+	AllOf(&'static [Capability]),
+	AnyOf(&'static [Capability]),
 }
 
 impl Required {
 	fn satisfied_by(&self, scopes: &str) -> bool {
-		match self {
-			Self::AllOf(needed) => needed.iter().all(|s| has_scope(scopes, s)),
-			Self::AnyOf(needed) => needed.iter().any(|s| has_scope(scopes, s)),
-		}
+		ScopeSet::parse(scopes).is_some_and(|set| match self {
+			Self::AllOf(needed) => needed.iter().all(|c| set.has(*c)),
+			Self::AnyOf(needed) => needed.iter().any(|c| set.has(*c)),
+		})
 	}
 
-	fn as_slice(&self) -> &'static [&'static str] {
+	fn as_slice(&self) -> &'static [Capability] {
 		match self {
 			Self::AllOf(s) | Self::AnyOf(s) => s,
 		}
@@ -76,16 +78,17 @@ fn resource_scope_prefix(path: &str) -> Option<&'static str> {
 /// `axum::http::Method`'s canonical set but flow through as ext methods, so we match on
 /// method name strings. Write methods imply read; the principal path is any-of.
 fn required_scopes(method: &Method, path: &str) -> Required {
+	use Capability::{CalDavRead, CalDavWrite, CardDavRead, CardDavWrite};
 	let is_read = matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS" | "PROPFIND" | "REPORT");
 	match (resource_scope_prefix(path), is_read) {
-		(Some("caldav"), true) => Required::AllOf(&["caldav:read"]),
-		(Some("caldav"), false) => Required::AllOf(&["caldav:read", "caldav:write"]),
+		(Some("caldav"), true) => Required::AllOf(&[CalDavRead]),
+		(Some("caldav"), false) => Required::AllOf(&[CalDavRead, CalDavWrite]),
 		// Everything else with an explicit prefix: default to carddav (matches the pre-CalDAV
 		// status quo for any path like `/dav/addressbooks/...`).
-		(Some(_), true) => Required::AllOf(&["carddav:read"]),
-		(Some(_), false) => Required::AllOf(&["carddav:read", "carddav:write"]),
-		(None, true) => Required::AnyOf(&["carddav:read", "caldav:read"]),
-		(None, false) => Required::AnyOf(&["carddav:write", "caldav:write"]),
+		(Some(_), true) => Required::AllOf(&[CardDavRead]),
+		(Some(_), false) => Required::AllOf(&[CardDavRead, CardDavWrite]),
+		(None, true) => Required::AnyOf(&[CardDavRead, CalDavRead]),
+		(None, false) => Required::AnyOf(&[CardDavWrite, CalDavWrite]),
 	}
 }
 
@@ -206,31 +209,36 @@ pub async fn dav_basic_auth(
 mod tests {
 	use super::*;
 
-	// `has_scope` is tested in `cloudillo_core::scope`, where it lives.
+	use Capability::{CalDavRead, CalDavWrite, CardDavRead, CardDavWrite};
 
 	#[test]
 	fn required_scopes_carddav_path() {
 		let get = required_scopes(&Method::GET, "/dav/addressbooks/Contacts/");
-		assert_eq!(get.as_slice(), &["carddav:read"]);
+		assert_eq!(get.as_slice(), &[CardDavRead]);
 		assert!(get.satisfied_by("carddav:read"));
 
 		let put = required_scopes(&Method::PUT, "/dav/addressbooks/Contacts/abc.vcf");
-		assert_eq!(put.as_slice(), &["carddav:read", "carddav:write"]);
+		assert_eq!(put.as_slice(), &[CardDavRead, CardDavWrite]);
 		assert!(put.satisfied_by("carddav:read,carddav:write"));
 		assert!(!put.satisfied_by("carddav:read"));
+		assert!(put.satisfied_by("carddav:read, carddav:write"), "`, ` separators are tolerated");
+		// One unknown entry makes the list malformed: it grants nothing, as on REST.
+		assert!(!get.satisfied_by("carddav:read,bogus"));
+		assert!(!get.satisfied_by("carddav:reader"));
+		assert!(!get.satisfied_by(""));
 
 		let propfind =
 			required_scopes(&Method::from_bytes(b"PROPFIND").unwrap(), "/dav/addressbooks/");
-		assert_eq!(propfind.as_slice(), &["carddav:read"]);
+		assert_eq!(propfind.as_slice(), &[CardDavRead]);
 	}
 
 	#[test]
 	fn required_scopes_caldav_path() {
 		let get = required_scopes(&Method::GET, "/dav/calendars/Default/");
-		assert_eq!(get.as_slice(), &["caldav:read"]);
+		assert_eq!(get.as_slice(), &[CalDavRead]);
 
 		let put = required_scopes(&Method::PUT, "/dav/calendars/Default/abc.ics");
-		assert_eq!(put.as_slice(), &["caldav:read", "caldav:write"]);
+		assert_eq!(put.as_slice(), &[CalDavRead, CalDavWrite]);
 		assert!(put.satisfied_by("caldav:read,caldav:write"));
 
 		// A carddav-only token must NOT be accepted on a calendars path.

@@ -221,6 +221,27 @@ impl Request {
 	// should go through `get_or_mint_proxy_token` to benefit from caching
 	// and the 401-retry path.
 	pub async fn create_proxy_token(&self, tn_id: TnId, id_tag: &str) -> ClResult<Box<str>> {
+		self.mint_proxy_token(tn_id, id_tag, None).await
+	}
+
+	/// Like `create_proxy_token`, but asks the remote to cap the token at `scope` (a body field
+	/// next to `token`; the remote runs it through its own `validated_scope`). Never cached:
+	/// `proxy_tokens` is keyed by `(tn_id, id_tag)` and holds unscoped tokens only.
+	pub async fn create_scoped_proxy_token(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		scope: &str,
+	) -> ClResult<Box<str>> {
+		self.mint_proxy_token(tn_id, id_tag, Some(scope)).await
+	}
+
+	async fn mint_proxy_token(
+		&self,
+		tn_id: TnId,
+		id_tag: &str,
+		scope: Option<&str>,
+	) -> ClResult<Box<str>> {
 		let auth_token = self
 			.auth_adapter
 			.create_action_token(
@@ -234,7 +255,10 @@ impl Request {
 			)
 			.await?;
 		// `post` keeps the status contract: only 401/403 is a denial, 429/5xx stay retryable.
-		let body = serde_json::json!({ "token": auth_token });
+		let body = match scope {
+			Some(scope) => serde_json::json!({ "token": auth_token, "scope": scope }),
+			None => serde_json::json!({ "token": auth_token }),
+		};
 		let parsed: TokenRes = self.post(tn_id, id_tag, "/auth/access-token", &body).await?;
 		Ok(parsed.data.token)
 	}

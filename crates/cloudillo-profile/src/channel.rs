@@ -17,6 +17,7 @@ use cloudillo_core::IdTag;
 use cloudillo_core::abac::{self, VisibilityLevel, relationship_level};
 use cloudillo_core::channels::{absolute_channel, can_enter, reader_roster};
 use cloudillo_core::extract::{Auth, OptionalAuth};
+use cloudillo_core::file_access;
 use cloudillo_core::roles::{
 	FOLLOWER_LEVEL, MODERATOR_LEVEL, highest_role_level, is_moderator, role_level,
 };
@@ -164,13 +165,20 @@ pub async fn list_channels(
 	IdTag(tenant_id_tag): IdTag,
 	OptionalAuth(maybe_auth): OptionalAuth,
 ) -> ClResult<(StatusCode, Json<ApiResponse<Vec<PorchEntry>>>)> {
-	let (reader, roles, hatted): (&str, &[Box<str>], bool) = match &maybe_auth {
+	// A drive scope narrows: the subject's own standing (scope cleared), then only rooms they can
+	// enter that lie in a scoped drive. No admin view through a drive-scoped token.
+	let drive = file_access::drive_scope(maybe_auth.as_ref().and_then(|a| a.scope.as_deref()))
+		.map(|(d, _)| d);
+	let unscoped = drive.as_ref().and(maybe_auth.as_ref()).map(file_access::unscoped_auth);
+	let eval_auth = unscoped.as_ref().or(maybe_auth.as_ref());
+	let (reader, roles, hatted): (&str, &[Box<str>], bool) = match eval_auth {
 		Some(auth) => (auth.id_tag.as_ref(), &auth.roles[..], auth.hat.is_some()),
 		None => ("", &[], false),
 	};
-	let is_tenant = maybe_auth.as_ref().is_some_and(|a| abac::is_tenant_self(a, &tenant_id_tag));
-	let is_real_auth = maybe_auth.is_some() && !reader.is_empty() && reader != "guest";
-	let is_admin = is_tenant || maybe_auth.as_ref().is_some_and(abac::is_unscoped_moderator);
+	let is_tenant = eval_auth.is_some_and(|a| abac::is_tenant_self(a, &tenant_id_tag));
+	let is_real_auth = eval_auth.is_some() && !reader.is_empty() && reader != "guest";
+	let is_admin =
+		drive.is_none() && (is_tenant || eval_auth.is_some_and(abac::is_unscoped_moderator));
 
 	// `follower` ("they follow us") is the direction the visibility ladder means.
 	let rel = abac::subject_relation_to_tenant(&app, tn_id, reader).await?;
@@ -193,6 +201,12 @@ pub async fn list_channels(
 		} else {
 			porch_status(&c, roles, roster.contains(&c.name), hatted)
 		};
+		if let Some(d) = &drive {
+			let room = absolute_channel(&tenant_id_tag, &c.name);
+			if status != "in" || !d.matches(Some(&*room), &tenant_id_tag) {
+				continue;
+			}
+		}
 		let member = if is_admin || status == "in" {
 			// One roster query per closed room; add a grouped count if porches grow.
 			let member_count = if c.closed {

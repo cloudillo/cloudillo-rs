@@ -13,7 +13,7 @@ use cloudillo_core::abac;
 use cloudillo_core::extract::{Auth, IdTag};
 use cloudillo_types::extract::Query;
 use cloudillo_types::meta_adapter::{PushSubscriptionData, PushSubscriptionKeys};
-use cloudillo_types::types::{ApiResponse, ApiTime, SHARED_TN, TokenScope};
+use cloudillo_types::types::{ApiResponse, ApiTime, Capability, SHARED_TN, ScopeSet};
 
 /// Request body for creating a push subscription
 #[derive(Debug, Deserialize)]
@@ -102,10 +102,13 @@ pub async fn post_subscription(
 
 /// DELETE /api/notifications/subscriptions/{id}
 ///
-/// Removes a push notification subscription.
+/// Removes a push notification subscription. A scoped caller (a device key) removes only its
+/// own: it must prove possession by sending the row's endpoint URL in the
+/// `cloudillo-push-endpoint` header; otherwise `NotFound`, revealing nothing.
 pub async fn delete_subscription(
 	State(app): State<App>,
 	Auth(auth): Auth,
+	headers: axum::http::HeaderMap,
 	axum::extract::Path(subscription_id): axum::extract::Path<u64>,
 ) -> ClResult<StatusCode> {
 	tracing::info!(
@@ -113,6 +116,22 @@ pub async fn delete_subscription(
 		subscription_id = %subscription_id,
 		"Deleting push subscription"
 	);
+
+	if auth.scope.is_some() {
+		let endpoint = headers
+			.get("cloudillo-push-endpoint")
+			.and_then(|v| v.to_str().ok())
+			.ok_or(Error::NotFound)?;
+		let owns = app
+			.meta_adapter
+			.list_push_subscriptions(auth.tn_id)
+			.await?
+			.iter()
+			.any(|s| s.id == subscription_id && s.subscription.endpoint == endpoint);
+		if !owns {
+			return Err(Error::NotFound);
+		}
+	}
 
 	app.meta_adapter.delete_push_subscription(auth.tn_id, subscription_id).await?;
 
@@ -187,14 +206,17 @@ pub async fn list_notifications(
 	Auth(auth): Auth,
 	Query(q): Query<ListNotificationsQuery>,
 ) -> ClResult<Json<ApiResponse<ListNotificationsResponse>>> {
-	// The account itself, or its device key (minted only by the owner, never via access-token).
-	// A community member holding `leader` passes `require_leader` but must not read the log.
-	let is_device = matches!(
-		auth.scope.as_deref().and_then(TokenScope::parse),
-		Some(TokenScope::Device { .. })
-	);
-	if !is_device {
-		abac::require_tenant_self(&auth, &tenant_id_tag, "notifications")?;
+	// Unscoped: the account itself only — a community member holding `leader` passes
+	// `require_leader` but must not read the log. Scoped: a key carrying `notifications:read`
+	// (minted only by the owner, never via access-token; the key middleware binds it to this
+	// tenant). Any other scope, malformed lists included, is refused.
+	match auth.scope.as_deref() {
+		None => abac::require_tenant_self(&auth, &tenant_id_tag, "notifications")?,
+		Some(s) => {
+			if !ScopeSet::parse(s).is_some_and(|set| set.has(Capability::NotificationsRead)) {
+				return Err(Error::PermissionDenied);
+			}
+		}
 	}
 	let since = q.since.unwrap_or(0);
 	let limit = q.limit.unwrap_or(100).clamp(1, 100);

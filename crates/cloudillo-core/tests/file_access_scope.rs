@@ -129,6 +129,7 @@ async fn create_allowed_within_folder_subtree() {
 			&meta,
 			&cache,
 			tn_id,
+			"owner",
 			Some("file:F0:W"),
 			Some("F1"),
 			None
@@ -148,6 +149,7 @@ async fn create_denied_outside_folder_subtree() {
 			&meta,
 			&cache,
 			tn_id,
+			"owner",
 			Some("file:F0:W"),
 			Some("Y"),
 			None
@@ -167,6 +169,7 @@ async fn create_denied_for_non_write_scope() {
 			&meta,
 			&cache,
 			tn_id,
+			"owner",
 			Some("file:F0:R"),
 			Some("F1"),
 			None
@@ -187,6 +190,7 @@ async fn create_allowed_via_document_tree_rule() {
 			&meta,
 			&cache,
 			tn_id,
+			"owner",
 			Some("file:Z:W"),
 			None,
 			Some("Z")
@@ -201,6 +205,7 @@ async fn create_allowed_via_document_tree_rule() {
 			&meta,
 			&cache,
 			tn_id,
+			"owner",
 			Some("file:F0:W"),
 			None,
 			Some("F0")
@@ -222,6 +227,7 @@ async fn m1_subtree_rule_suppressed_for_non_folder_scope() {
 			&meta,
 			&cache,
 			tn_id,
+			"owner",
 			Some("file:Z:W"),
 			Some("Zc"),
 			None
@@ -236,6 +242,7 @@ async fn m1_subtree_rule_suppressed_for_non_folder_scope() {
 			&meta,
 			&cache,
 			tn_id,
+			"owner",
 			Some("file:Z:W"),
 			None,
 			Some("Z")
@@ -259,6 +266,7 @@ async fn document_scope_cannot_place_copy_in_unrelated_folder() {
 			&meta,
 			&cache,
 			tn_id,
+			"owner",
 			Some("file:Z:W"),
 			Some("F1"),
 			None
@@ -273,6 +281,7 @@ async fn document_scope_cannot_place_copy_in_unrelated_folder() {
 			&meta,
 			&cache,
 			tn_id,
+			"owner",
 			Some("file:Z:W"),
 			None,
 			None
@@ -283,8 +292,16 @@ async fn document_scope_cannot_place_copy_in_unrelated_folder() {
 
 	// An unscoped caller (the ordinary logged-in owner) is unaffected.
 	assert!(matches!(
-		file_access::check_scope_allows_create_in(&meta, &cache, tn_id, None, Some("F1"), None)
-			.await,
+		file_access::check_scope_allows_create_in(
+			&meta,
+			&cache,
+			tn_id,
+			"owner",
+			None,
+			Some("F1"),
+			None
+		)
+		.await,
 		Ok(())
 	));
 }
@@ -352,6 +369,7 @@ async fn create_uses_cache_backed_folder_gate() {
 			&meta,
 			&cache,
 			tn_id,
+			"owner",
 			Some("file:F0:W"),
 			Some("F1"),
 			None
@@ -365,6 +383,7 @@ async fn create_uses_cache_backed_folder_gate() {
 			&meta,
 			&cache,
 			tn_id,
+			"owner",
 			Some("file:F0:W"),
 			Some("Y"),
 			None
@@ -654,6 +673,19 @@ async fn a_pin_into_a_personal_tenant_names_its_placer_as_owner() {
 		true,
 		cloudillo_types::meta_adapter::ProfileRelation::default()
 	));
+}
+
+/// A room-scoped key matches the room only on this tenant: `@other.tld~board` is not `~board`.
+#[tokio::test]
+async fn drive_scope_matches_only_this_tenants_room() {
+	let (meta, tn_id, _temp) = seed().await;
+	let mut view = meta.read_file(tn_id, "Y").await.unwrap().unwrap();
+	let scope = Some("file:~board:W");
+	for (channel, allowed) in [("@owner~board", true), ("@other.tld~board", false)] {
+		view.channel = Some(channel.into());
+		let r = file_access::check_scope_allows_file(&meta, tn_id, "owner", scope, &view).await;
+		assert_eq!(matches!(r, file_access::ScopeCheck::Allowed(_)), allowed, "{channel}");
+	}
 }
 
 // vim: ts=4

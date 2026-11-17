@@ -39,7 +39,7 @@ async fn set_db_version(tx: &mut Transaction<'_, Sqlite>, version: i64) -> Resul
 }
 
 // Current schema version - update this when adding new migrations
-const CURRENT_DB_VERSION: i64 = 11;
+const CURRENT_DB_VERSION: i64 = 12;
 
 /// Initialize the database schema and run migrations
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -313,7 +313,6 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 		scopes TEXT,
 		expires_at INTEGER,
 		last_used_at INTEGER,
-		auth_time INTEGER,
 		created_at INTEGER DEFAULT (unixepoch()),
 		updated_at INTEGER DEFAULT (unixepoch()),
 		FOREIGN KEY (tn_id) REFERENCES tenants(tn_id) ON DELETE CASCADE
@@ -519,15 +518,64 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			}
 		}
 		set_db_version(&mut tx, 11).await?;
+		version = 11;
+	}
+
+	// Version 12: `device:` keys become `file:` keys; API keys no longer carry a login time
+	if version == 11 {
+		let rows: Vec<(i64, String)> =
+			sqlx::query_as("SELECT key_id, scopes FROM api_keys WHERE scopes LIKE '%device:%'")
+				.fetch_all(&mut *tx)
+				.await?;
+		for (key_id, scopes) in rows {
+			if let Some(scopes) = migrate_device_scope(&scopes) {
+				sqlx::query("UPDATE api_keys SET scopes = ? WHERE key_id = ?")
+					.bind(scopes)
+					.bind(key_id)
+					.execute(&mut *tx)
+					.await?;
+			}
+		}
+		sqlx::query("ALTER TABLE api_keys DROP COLUMN auth_time")
+			.execute(&mut *tx)
+			.await?;
+		set_db_version(&mut tx, 12).await?;
 		#[allow(unused_assignments)]
 		{
-			version = 11;
+			version = 12;
 		}
 	}
 
 	tx.commit().await?;
 
 	Ok(())
+}
+
+/// v12 scope rewrite: `device:X` → `file:X:W`, plus `notifications:read` and
+/// `notifications:push` when missing. `None` when the list has no `device:` entry.
+fn migrate_device_scope(scopes: &str) -> Option<String> {
+	let mut found = false;
+	let mut out: Vec<String> = scopes
+		.split(',')
+		.map(str::trim)
+		.filter(|e| !e.is_empty())
+		.map(|e| match e.strip_prefix("device:") {
+			Some(root) => {
+				found = true;
+				format!("file:{root}:W")
+			}
+			None => e.to_string(),
+		})
+		.collect();
+	if !found {
+		return None;
+	}
+	for cap in ["notifications:read", "notifications:push"] {
+		if !out.iter().any(|e| e == cap) {
+			out.push(cap.to_string());
+		}
+	}
+	Some(out.join(","))
 }
 
 #[cfg(test)]
@@ -552,7 +600,6 @@ mod tests {
 			"ALTER TABLE tenants DROP COLUMN totp_last_step",
 			"ALTER TABLE tenants DROP COLUMN suspended_at",
 			"ALTER TABLE tenants DROP COLUMN expires_at",
-			"ALTER TABLE api_keys DROP COLUMN auth_time",
 			"ALTER TABLE keys DROP COLUMN created_at",
 			"ALTER TABLE keys DROP COLUMN updated_at",
 			"UPDATE vars SET value = '6' WHERE key = 'db_version'",
@@ -567,12 +614,27 @@ mod tests {
 		assert_eq!(version, CURRENT_DB_VERSION.to_string());
 		for sql in [
 			"SELECT totp_secret, totp_last_step, suspended_at, expires_at FROM tenants",
-			"SELECT auth_time FROM api_keys",
 			"SELECT created_at, updated_at FROM keys",
 			"SELECT id, ts, tn_id, actor, event, category, ip, outcome, details FROM audit_event",
 		] {
 			sqlx::query(sql).fetch_all(&db).await.unwrap();
 		}
+		// v10 added `auth_time`, v12 dropped it again
+		assert!(sqlx::query("SELECT auth_time FROM api_keys").fetch_all(&db).await.is_err());
+	}
+
+	#[test]
+	fn device_scope_migration() {
+		assert_eq!(
+			migrate_device_scope("device:f1~a").as_deref(),
+			Some("file:f1~a:W,notifications:read,notifications:push")
+		);
+		assert_eq!(
+			migrate_device_scope(" device:f1~a , notifications:read ").as_deref(),
+			Some("file:f1~a:W,notifications:read,notifications:push")
+		);
+		assert_eq!(migrate_device_scope("file:f1~a:R,carddav:read"), None);
+		assert_eq!(migrate_device_scope(""), None);
 	}
 
 	/// A DB stamped by a newer binary is refused, not downgraded.

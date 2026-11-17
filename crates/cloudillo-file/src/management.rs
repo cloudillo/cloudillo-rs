@@ -16,7 +16,7 @@ use crate::perm::ResolvedEntry;
 use crate::prelude::*;
 use cloudillo_core::dir_cache::DirCache;
 use cloudillo_core::extract::{Auth, IdTag};
-use cloudillo_core::file_access;
+use cloudillo_core::file_access::{self, LifecycleOp};
 use cloudillo_types::auth_adapter::AuditCategory;
 use cloudillo_types::meta_adapter::{self, UpdateFileOptions};
 use cloudillo_types::types::ApiResponse;
@@ -160,7 +160,16 @@ async fn check_move_target(
 	parent: Option<&str>,
 	channel: Option<&str>,
 ) -> ClResult<()> {
-	if parent.is_none() && cloudillo_core::abac::names_tenant_without_being_it(auth, tenant_id_tag)
+	// A drive scope narrows the unscoped subject: the impostor test runs on that form, and
+	// `resolve_child_channel` confines a root target to a scoped drive.
+	let unscoped;
+	let gate = if file_access::drive_scope(auth.scope.as_deref()).is_some() {
+		unscoped = file_access::unscoped_auth(auth);
+		&unscoped
+	} else {
+		auth
+	};
+	if parent.is_none() && cloudillo_core::abac::names_tenant_without_being_it(gate, tenant_id_tag)
 	{
 		return Err(Error::PermissionDenied);
 	}
@@ -168,6 +177,7 @@ async fn check_move_target(
 		&app.meta_adapter,
 		app.ext::<DirCache>()?,
 		auth.tn_id,
+		tenant_id_tag,
 		auth.scope.as_deref(),
 		parent,
 		None,
@@ -203,7 +213,9 @@ async fn check_move_target(
 
 /// Gate for a move into another drive: [`check_move_target`], and when the moved subtree holds
 /// entries the caller does not own, the caller must be moderator or higher in the source drive
-/// (the tenant itself for the main drive).
+/// (the tenant itself for the main drive). Never for a scoped caller (folder or drive scope):
+/// the desktop client maps the refusal to `EXDEV` and falls back to copy + delete. A scoped
+/// restore whose room is gone lands in the main drive, so it is refused here too.
 async fn check_cross_drive_move(
 	app: &App,
 	auth: &cloudillo_types::auth_adapter::AuthCtx,
@@ -212,6 +224,9 @@ async fn check_cross_drive_move(
 	parent: Option<&str>,
 	channel: Option<&str>,
 ) -> ClResult<()> {
+	if auth.scope.is_some() {
+		return Err(Error::FileCrossRoom);
+	}
 	if cloudillo_core::abac::names_tenant_without_being_it(auth, tenant_id_tag) {
 		return Err(Error::PermissionDenied);
 	}
@@ -303,9 +318,32 @@ pub async fn patch_file(
 	// A move goes first; the rest of the patch follows.
 	let reindex = opts.affects_search_index();
 	let target = move_target(&app, auth.tn_id, &file, &opts.parent_id, &req.channel).await?;
-	if let Some((parent, channel)) = &target
-		&& (*channel != file.channel || parent.as_deref() != file.parent_id.as_deref())
-	{
+	let relocation = target.as_ref().filter(|(parent, channel)| {
+		*channel != file.channel || parent.as_deref() != file.parent_id.as_deref()
+	});
+	// A scoped caller renames and moves only strictly inside its folder root, never the root
+	// itself (`file_access::scope_allows_lifecycle`); both checks run before any write.
+	let renames = match &opts.file_name {
+		Patch::Undefined => false,
+		Patch::Null => true,
+		Patch::Value(name) => name.as_str() != &*file.file_name,
+	};
+	let scope = auth.scope.as_deref();
+	if renames {
+		file_access::scope_allows_lifecycle(
+			&app,
+			auth.tn_id,
+			&tenant_id_tag,
+			scope,
+			&file,
+			LifecycleOp::Rename,
+		)
+		.await?;
+	}
+	if let Some((parent, channel)) = relocation {
+		let op = LifecycleOp::Move { new_parent: parent.clone() };
+		file_access::scope_allows_lifecycle(&app, auth.tn_id, &tenant_id_tag, scope, &file, op)
+			.await?;
 		relocate(&app, &auth, &tenant_id_tag, &file, parent.as_deref(), channel.as_deref()).await?;
 	}
 	if target.is_some() {
@@ -329,6 +367,10 @@ pub async fn patch_file(
 		cloudillo_core::search_index_file(&app, auth.tn_id, &entry_id);
 	}
 
+	// The previous parent too: a move out of a scoped folder concerns that folder.
+	let entries: Vec<&str> =
+		[Some(&*entry_id), file.parent_id.as_deref()].into_iter().flatten().collect();
+	crate::notify_files_changed(&app, auth.tn_id, &entries).await;
 	info!("User {} patched file {}", auth.id_tag, entry_id);
 
 	Ok(Json(ApiResponse::new(read_updated(&app, auth.tn_id, &entry_id, &auth.id_tag).await?)))
@@ -372,6 +414,16 @@ pub async fn delete_file(
 	Query(query): Query<DeleteFileQuery>,
 ) -> ClResult<StatusCode> {
 	require_lifecycle(&app, &auth, &tenant_id_tag, &file).await?;
+	let op = if query.permanent { LifecycleOp::Purge } else { LifecycleOp::Trash };
+	file_access::scope_allows_lifecycle(
+		&app,
+		auth.tn_id,
+		&tenant_id_tag,
+		auth.scope.as_deref(),
+		&file,
+		op,
+	)
+	.await?;
 	let entry_id = file.entry_id.to_string();
 
 	if query.permanent {
@@ -396,6 +448,7 @@ pub async fn delete_file(
 			purged.refs_removed,
 			purged.share_entries_removed
 		);
+		crate::notify_files_changed(&app, auth.tn_id, &[&entry_id]).await;
 
 		Ok(StatusCode::NO_CONTENT)
 	} else {
@@ -417,6 +470,10 @@ pub async fn delete_file(
 		// here — nothing else would, since the sweep never pages the trash.
 		cloudillo_core::search_index_file(&app, auth.tn_id, &entry_id);
 
+		// The previous parent too: the entry now sits in the trash, outside every scope.
+		let entries: Vec<&str> =
+			[Some(&*entry_id), file.parent_id.as_deref()].into_iter().flatten().collect();
+		crate::notify_files_changed(&app, auth.tn_id, &entries).await;
 		info!("User {} moved file {} to trash", auth.id_tag, entry_id);
 
 		Ok(StatusCode::NO_CONTENT)
@@ -484,6 +541,16 @@ pub async fn restore_file(
 		};
 		(None, channel)
 	};
+	let op = LifecycleOp::RestoreFromTrash { parent: target_parent_id.clone() };
+	file_access::scope_allows_lifecycle(
+		&app,
+		auth.tn_id,
+		&tenant_id_tag,
+		auth.scope.as_deref(),
+		&file,
+		op,
+	)
+	.await?;
 	relocate(&app, &auth, &tenant_id_tag, &file, target_parent_id.as_deref(), channel.as_deref())
 		.await?;
 	invalidate_dir_cache(&app, auth.tn_id, &entry_id);
@@ -493,6 +560,7 @@ pub async fn restore_file(
 	cloudillo_core::search_index_file(&app, auth.tn_id, &entry_id);
 	cloudillo_core::search_index_document(&app, auth.tn_id, file.index_id());
 
+	crate::notify_files_changed(&app, auth.tn_id, &[&entry_id]).await;
 	info!("User {} restored file {} to {:?}", auth.id_tag, entry_id, target_parent_id);
 
 	Ok(Json(ApiResponse::new(read_updated(&app, auth.tn_id, &entry_id, &auth.id_tag).await?)))
@@ -513,8 +581,8 @@ pub async fn empty_trash(
 	Auth(auth): Auth,
 	IdTag(tenant_id_tag): IdTag,
 ) -> ClResult<Json<ApiResponse<EmptyTrashResponse>>> {
-	// A scope carries no lifecycle authority. Everyone else purges the rows they may manage
-	// (`file_access::can_manage_lifecycle`, per row) and leaves the rest in place.
+	// Emptying the trash is a purge, which no scope may do. Everyone else purges the rows they
+	// may manage (`file_access::can_manage_lifecycle`, per row) and leaves the rest in place.
 	if auth.scope.is_some() {
 		return Err(Error::PermissionDenied);
 	}
@@ -608,6 +676,7 @@ pub async fn patch_file_user_data(
 		file_access::check_scope_allows_file(
 			&app.meta_adapter,
 			auth.tn_id,
+			&tenant_id_tag,
 			auth.scope.as_deref(),
 			&file
 		)
@@ -647,6 +716,10 @@ pub async fn patch_file_user_data(
 pub struct DuplicateFileRequest {
 	pub file_name: Option<String>,
 	pub parent_id: Option<String>,
+	/// Restore as a new entry: copy this earlier content (`fileId`) of the `{id}` entry's history
+	/// instead of its current content. BLOB only; needs write access, and a scoped caller the
+	/// lifecycle rule (`file_access::LifecycleOp::CopyInto`).
+	pub from_version: Option<String>,
 }
 
 pub async fn duplicate_file(
@@ -674,7 +747,16 @@ pub async fn duplicate_file(
 	// `check_file_access` resolved both, returning the scope's own level for
 	// a covered file and AccessDenied otherwise. An unscoped caller needs only read
 	// here; creation is gated by `check_perm_create("file", "create")` on the route.
-	if auth.scope.is_some() && !access.access_level.can_write() {
+	// A drive-scoped caller is the unscoped subject narrowed: read on the source, like it.
+	if auth.scope.is_some()
+		&& file_access::drive_scope(auth.scope.as_deref()).is_none()
+		&& !access.access_level.can_write()
+	{
+		return Err(Error::PermissionDenied);
+	}
+	// History may hold content a later overwrite deliberately removed: copying a version needs
+	// write access, and a scoped caller the lifecycle rule (`CopyInto`, below).
+	if req.from_version.is_some() && !access.access_level.can_write() {
 		return Err(Error::PermissionDenied);
 	}
 	let file = access.file_view;
@@ -685,6 +767,9 @@ pub async fn duplicate_file(
 	}
 
 	let file_tp = file.file_tp.as_deref().unwrap_or("BLOB");
+	if req.from_version.is_some() && file_tp != "BLOB" {
+		return Err(Error::ValidationError("only BLOB entries have versions".into()));
+	}
 	if !matches!(file_tp, "CRDT" | "RTDB" | "BLOB") {
 		return Err(Error::ValidationError(format!(
 			"Only BLOB, CRDT and RTDB files can be duplicated, got '{}'",
@@ -709,11 +794,24 @@ pub async fn duplicate_file(
 	// the same boundary `post_file` enforces for direct creation. Without it the
 	// `file:*:W` shortcut in `check_perm_create` would let a guest editor plant
 	// tenant-owned rows anywhere, root included. Runs before any content is copied.
+	if req.from_version.is_some() {
+		let op = LifecycleOp::CopyInto { parent: parent_id.as_deref().map(str::to_owned) };
+		file_access::scope_allows_lifecycle(
+			&app,
+			tn_id,
+			&tenant_id_tag,
+			auth.scope.as_deref(),
+			&file,
+			op,
+		)
+		.await?;
+	}
 	let dir_cache = app.ext::<DirCache>()?;
 	file_access::check_scope_allows_create_in(
 		&app.meta_adapter,
 		dir_cache,
 		tn_id,
+		&tenant_id_tag,
 		auth.scope.as_deref(),
 		parent_id.as_deref(),
 		file.root_id.as_deref(),
@@ -734,7 +832,16 @@ pub async fn duplicate_file(
 
 	let new_file_name = req.file_name.unwrap_or_else(|| format!("Copy of {}", file.file_name));
 	// BLOB / CRDT / RTDB only (checked above): each has a content id.
-	let content_id = file.file_id.clone().ok_or(Error::NotFound)?;
+	let content_id = match req.from_version {
+		Some(version) => {
+			let versions = app.meta_adapter.list_entry_versions(tn_id, &file.entry_id).await?;
+			if !versions.iter().any(|v| *v.file_id == *version) {
+				return Err(Error::NotFound);
+			}
+			version.into()
+		}
+		None => file.file_id.clone().ok_or(Error::NotFound)?,
+	};
 
 	if file_tp == "BLOB" {
 		// Same content, new placement: a new entry over the existing content row.
@@ -768,6 +875,7 @@ pub async fn duplicate_file(
 			.await?;
 		info!("User {} copied file {} -> entry {}", auth.id_tag, file_id, entry_id);
 		cloudillo_core::search_index_file(&app, tn_id, &entry_id);
+		crate::notify_files_changed(&app, tn_id, &[&entry_id]).await;
 		let view = super::handler::read_created(&app, tn_id, &entry_id, &auth.id_tag).await?;
 		return Ok((StatusCode::CREATED, Json(ApiResponse::new(view))));
 	}
@@ -816,6 +924,7 @@ pub async fn duplicate_file(
 
 	info!("User {} duplicated file {} -> {}", auth.id_tag, file_id, new_file_id);
 	cloudillo_core::search_index_file(&app, tn_id, &new_file_id);
+	crate::notify_files_changed(&app, tn_id, &[&created.entry_id]).await;
 
 	let view = super::handler::read_created(&app, tn_id, &created.entry_id, &auth.id_tag).await?;
 	Ok((StatusCode::CREATED, Json(ApiResponse::new(view))))

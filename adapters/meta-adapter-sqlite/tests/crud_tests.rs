@@ -6,6 +6,8 @@
 //! Tests Create, Read, Update, Delete operations for tenants and profiles
 #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
+mod common;
+
 use cloudillo_meta_adapter_sqlite::MetaAdapterSqlite;
 use cloudillo_types::meta_adapter::{
 	Action, ActionId, CreateFile, FileStatus, FileView, ListActionOptions, ListProfileOptions,
@@ -1040,6 +1042,44 @@ async fn own_upload_resolves_owner_to_the_tenant_profile() {
 	assert_eq!(owner.id_tag.as_ref(), "alice.example");
 	assert_eq!(owner.name.as_ref(), "Alice", "the tenant's own profile, not a tag-only stub");
 	assert!(view.upstream.is_none(), "a local upload has no upstream");
+}
+
+/// `FileView.size` is the `orig` variant's byte size; a folder has no content and no size.
+#[tokio::test]
+async fn file_view_size_comes_from_the_orig_variant() {
+	let (adapter, _temp) = create_test_adapter().await;
+	let tn_id = TnId(1);
+	adapter.create_tenant(tn_id, "alice.example").await.expect("create tenant");
+
+	let blob = common::upload(
+		&adapter,
+		tn_id,
+		CreateFile {
+			orig_variant_id: Some("b1~sized".into()),
+			file_name: "sized.png".into(),
+			..Default::default()
+		},
+		"f1~sized",
+	)
+	.await;
+	let view = adapter.read_file(tn_id, &blob.entry_id).await.expect("read").expect("blob");
+	assert_eq!(view.size, Some(1), "common::upload stores a 1-byte orig variant");
+
+	let folder = adapter
+		.create_file(
+			tn_id,
+			CreateFile {
+				file_id: Some("fold-sized".into()),
+				file_name: "folder".into(),
+				file_tp: Some("FLDR".into()),
+				status: Some(FileStatus::Active),
+				..Default::default()
+			},
+		)
+		.await
+		.expect("create folder");
+	let view = adapter.read_file(tn_id, &folder.entry_id).await.expect("read").expect("folder");
+	assert_eq!(view.size, None);
 }
 
 /// `profile_settings.id_tag` is canonicalised on write *and* read, like every other

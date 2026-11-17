@@ -859,9 +859,71 @@ pub enum TokenScope {
 	File { file_id: String, access: AccessLevel, ref_id: Option<String> },
 	/// APKG publish scope — restricts to package upload and APKG action creation
 	ApkgPublish,
-	/// Device scope (`device:{root_id}`) for a native client's API key: uploads and folder
-	/// creation bounded to the `root_id` folder subtree, plus its push subscription.
-	Device { root_id: String },
+	/// Remote-context file scope (`rfile:{id_tag}:{file_id}:{R|W}`), valid only on API keys.
+	/// Grants nothing locally except `POST /api/auth/proxy-token`, which brokers a
+	/// `file:{file_id}:{R|W}` token from context `id_tag`.
+	RemoteFile { id_tag: String, file_id: String, access: AccessLevel },
+	/// Drive scope (`file:__root__|~{name}|*:{R|W}`). Narrows the subject's normal access to
+	/// the scoped drive(s), capped at `access`; never grants on its own.
+	Drive { drive: DriveTarget, access: AccessLevel },
+}
+
+/// The drive(s) a [`TokenScope::Drive`] selects. String form via `Display`: `__root__`,
+/// `~{name}`, `*`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriveTarget {
+	/// The tenant's main drive (entries with `channel IS NULL`).
+	Main,
+	/// One room of the tenant, by bare name (entries with `channel == "@{tenant}~{name}"`).
+	Room(String),
+	/// Every drive the subject can currently enter.
+	All,
+}
+
+impl DriveTarget {
+	/// Whether `id` is shaped like a drive target (`__root__`, `*`, or a leading `~`).
+	/// Entry and content ids never are, so such an id must parse as a drive or not at all.
+	pub fn is_drive_target(id: &str) -> bool {
+		id == "__root__" || id == "*" || id.starts_with('~')
+	}
+
+	/// Parse a drive target; `None` for anything else, including an invalid room name.
+	pub fn parse(id: &str) -> Option<Self> {
+		match id {
+			"__root__" => Some(Self::Main),
+			"*" => Some(Self::All),
+			_ => {
+				let name = id.strip_prefix('~')?;
+				crate::validation::validate_channel_name(name).then(|| Self::Room(name.into()))
+			}
+		}
+	}
+
+	/// Whether an entry with `channel` (absolute form, `None` = main drive) of tenant
+	/// `tenant_id_tag` is in this target. `All` is true for every drive: the room gate of the
+	/// unscoped evaluation that a drive scope always runs is what limits it to enterable rooms.
+	pub fn matches(&self, channel: Option<&str>, tenant_id_tag: &str) -> bool {
+		match self {
+			Self::Main => channel.is_none(),
+			Self::Room(name) => channel.is_some_and(|c| {
+				c.strip_prefix('@')
+					.and_then(|c| c.strip_prefix(tenant_id_tag))
+					.and_then(|c| c.strip_prefix('~'))
+					== Some(name.as_str())
+			}),
+			Self::All => true,
+		}
+	}
+}
+
+impl std::fmt::Display for DriveTarget {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Main => f.write_str("__root__"),
+			Self::Room(name) => write!(f, "~{name}"),
+			Self::All => f.write_str("*"),
+		}
+	}
 }
 
 impl TokenScope {
@@ -872,16 +934,47 @@ impl TokenScope {
 	/// - "file:{file_id}:C" -> File scope with Comment access
 	/// - "file:{file_id}:W" -> File scope with Write access
 	/// - "file:{file_id}:R:{ref_id}" -> minted from share-link ref `ref_id`
-	/// - "device:{root_id}" -> Device scope bounded to folder `root_id`
+	/// - "rfile:{id_tag}:{file_id}:{R|W}" -> RemoteFile scope bound to context `id_tag`;
+	///   `file_id` may also be a drive target
+	/// - "file:{__root__|~name|*}:{R|W}" -> Drive scope (no `C`, no `ref_id`)
 	pub fn parse(s: &str) -> Option<Self> {
 		if s == "apkg:publish" {
 			return Some(Self::ApkgPublish);
 		}
 		let parts: Vec<&str> = s.split(':').collect();
-		if let ["device", root_id] = parts[..] {
-			return (!root_id.is_empty()).then(|| Self::Device { root_id: root_id.to_string() });
+		if let ["rfile", id_tag, file_id, level] = parts[..] {
+			let access = match level {
+				"R" => AccessLevel::Read,
+				"W" => AccessLevel::Write,
+				_ => return None,
+			};
+			if file_id.is_empty() || !crate::validation::validate_id_tag(id_tag) {
+				return None;
+			}
+			if DriveTarget::is_drive_target(file_id) {
+				DriveTarget::parse(file_id)?;
+			}
+			return Some(Self::RemoteFile {
+				id_tag: id_tag.to_string(),
+				file_id: file_id.to_string(),
+				access,
+			});
+		}
+		if let ["file", id, level] = parts[..]
+			&& DriveTarget::is_drive_target(id)
+		{
+			let access = match level {
+				"R" => AccessLevel::Read,
+				"W" => AccessLevel::Write,
+				_ => return None,
+			};
+			return Some(Self::Drive { drive: DriveTarget::parse(id)?, access });
 		}
 		if matches!(parts.len(), 3 | 4) && parts[0] == "file" {
+			// A drive-shaped id with a `ref_id` (or any other leftover form) is not a file id.
+			if DriveTarget::is_drive_target(parts[1]) {
+				return None;
+			}
 			// Exhaustive on purpose: an unrecognized level char (including `'A'`, which
 			// `to_scope_char` never emits) makes the whole scope unparseable, which callers treat
 			// as "deny". A `Read` fallback would silently *widen* a malformed scope.
@@ -900,15 +993,96 @@ impl TokenScope {
 		None
 	}
 
-	/// The entry this scope grants access under and the level granted: a file share's target, or
-	/// a device key's root folder (as Write). `None` for `apkg:publish`.
+	/// The entry this scope grants access under and the level granted: a file scope's target.
+	/// `None` for `apkg:publish`, `rfile:` (a remote entry is never a local grant) and drive
+	/// scopes (they narrow; every `File`-only path fails closed on them).
 	pub fn file_grant(&self) -> Option<(&str, AccessLevel)> {
 		match self {
 			Self::File { file_id, access, .. } => Some((file_id, *access)),
-			Self::Device { root_id } => Some((root_id, AccessLevel::Write)),
-			Self::ApkgPublish => None,
+			Self::ApkgPublish | Self::RemoteFile { .. } | Self::Drive { .. } => None,
 		}
 	}
+}
+
+/// A route capability an API key can carry next to (or instead of) a delegated `TokenScope`.
+/// Capabilities never grant file access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+	CardDavRead,
+	CardDavWrite,
+	CalDavRead,
+	CalDavWrite,
+	NotificationsRead,
+	NotificationsPush,
+}
+
+impl Capability {
+	/// Parse one capability entry (exact match, no trimming). `None` for anything unknown.
+	pub fn parse(s: &str) -> Option<Self> {
+		match s {
+			"carddav:read" => Some(Self::CardDavRead),
+			"carddav:write" => Some(Self::CardDavWrite),
+			"caldav:read" => Some(Self::CalDavRead),
+			"caldav:write" => Some(Self::CalDavWrite),
+			"notifications:read" => Some(Self::NotificationsRead),
+			"notifications:push" => Some(Self::NotificationsPush),
+			_ => None,
+		}
+	}
+
+	/// The scope-string form of this capability; `parse(c.as_str()) == Some(c)`.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::CardDavRead => "carddav:read",
+			Self::CardDavWrite => "carddav:write",
+			Self::CalDavRead => "caldav:read",
+			Self::CalDavWrite => "caldav:write",
+			Self::NotificationsRead => "notifications:read",
+			Self::NotificationsPush => "notifications:push",
+		}
+	}
+}
+
+/// A parsed scope list: at most one delegated `TokenScope` plus any number of capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeSet {
+	/// The single delegated entry (`file:…`, `apkg:publish`, `rfile:…`) — the file grant.
+	pub delegated: Option<TokenScope>,
+	/// Capability entries in list order; duplicates are kept.
+	pub caps: Vec<Capability>,
+}
+
+impl ScopeSet {
+	/// None = malformed: empty string, blank entry, unknown entry, or >1 delegated entry.
+	/// Entries split on ',' and are trimmed, so `", "` separators are tolerated.
+	/// Callers must treat `None` as "grants nothing", never as unscoped.
+	pub fn parse(s: &str) -> Option<Self> {
+		let mut set = Self { delegated: None, caps: Vec::new() };
+		for entry in s.split(',').map(str::trim) {
+			if entry.is_empty() {
+				return None;
+			}
+			if let Some(ts) = TokenScope::parse(entry) {
+				if set.delegated.replace(ts).is_some() {
+					return None;
+				}
+			} else {
+				set.caps.push(Capability::parse(entry)?);
+			}
+		}
+		Some(set)
+	}
+
+	/// Whether the list carries capability `c`.
+	pub fn has(&self, c: Capability) -> bool {
+		self.caps.contains(&c)
+	}
+}
+
+/// Shorthand for the many sites that only want the file grant: the delegated entry of a valid
+/// list. `None` for a malformed list and for a capability-only list alike.
+pub fn delegated_scope(s: &str) -> Option<TokenScope> {
+	ScopeSet::parse(s)?.delegated
 }
 
 /// `scope` without a share link's trailing `:{ref_id}`, for logging: logs must not print the ref.
@@ -1084,7 +1258,56 @@ impl AttrSet for SubjectAttrs {
 
 #[cfg(test)]
 mod access_level_tests {
-	use super::{AccessLevel, TokenScope, scope_for_log};
+	use super::{
+		AccessLevel, Capability, DriveTarget, ScopeSet, TokenScope, delegated_scope, scope_for_log,
+	};
+
+	#[test]
+	fn drive_scope_parse_and_round_trip() {
+		for (s, drive, access) in [
+			("file:__root__:R", DriveTarget::Main, AccessLevel::Read),
+			("file:__root__:W", DriveTarget::Main, AccessLevel::Write),
+			("file:~close-friends:R", DriveTarget::Room("close-friends".into()), AccessLevel::Read),
+			("file:~board:W", DriveTarget::Room("board".into()), AccessLevel::Write),
+			("file:*:R", DriveTarget::All, AccessLevel::Read),
+			("file:*:W", DriveTarget::All, AccessLevel::Write),
+		] {
+			let parsed = TokenScope::parse(s);
+			assert_eq!(parsed, Some(TokenScope::Drive { drive: drive.clone(), access }), "{s}");
+			assert_eq!(parsed.as_ref().and_then(TokenScope::file_grant), None, "{s}");
+			let lvl = access.to_scope_char().unwrap_or('?');
+			assert_eq!(format!("file:{drive}:{lvl}"), s);
+		}
+		for bad in [
+			"file:~Bad:W",
+			"file:~-x:W",
+			"file:~x:C",
+			"file:__root__:W:ref",
+			"file:~:W",
+			"file:*:C",
+			"file:__root__:A",
+			"file:~x:R:ref",
+			"file:~a~b:W",
+		] {
+			assert_eq!(TokenScope::parse(bad), None, "{bad}");
+		}
+		// A `~` inside an entry id is not a room.
+		assert!(matches!(TokenScope::parse("file:f1~abc:W"), Some(TokenScope::File { .. })));
+	}
+
+	#[test]
+	fn drive_target_matches_channel() {
+		let room = DriveTarget::Room("board".into());
+		assert!(DriveTarget::Main.matches(None, "club.test"));
+		assert!(!DriveTarget::Main.matches(Some("@club.test~board"), "club.test"));
+		assert!(room.matches(Some("@club.test~board"), "club.test"));
+		assert!(!room.matches(None, "club.test"));
+		assert!(!room.matches(Some("@club.test~boards"), "club.test"));
+		assert!(!room.matches(Some("@other.test~board"), "club.test"));
+		assert!(!room.matches(Some("club.test~board"), "club.test"));
+		assert!(DriveTarget::All.matches(None, "club.test"));
+		assert!(DriveTarget::All.matches(Some("@club.test~board"), "club.test"));
+	}
 
 	#[test]
 	fn scope_for_log_drops_share_link_ref() {
@@ -1199,16 +1422,41 @@ mod access_level_tests {
 	}
 
 	#[test]
-	fn device_scope_parse_and_file_grant() {
-		let device = TokenScope::parse("device:abc");
-		assert_eq!(device, Some(TokenScope::Device { root_id: "abc".to_string() }));
-		for bad in ["device", "device:", "device:a:b", "Device:a"] {
+	fn remote_file_scope_parse_and_file_grant() {
+		let rfile = TokenScope::parse("rfile:bob.example:f1~x:W");
+		assert_eq!(
+			rfile,
+			Some(TokenScope::RemoteFile {
+				id_tag: "bob.example".to_string(),
+				file_id: "f1~x".to_string(),
+				access: AccessLevel::Write,
+			})
+		);
+		assert_eq!(rfile.as_ref().and_then(TokenScope::file_grant), None);
+		for target in ["__root__", "~board", "*"] {
+			assert_eq!(
+				TokenScope::parse(&format!("rfile:bob.example:{target}:R")),
+				Some(TokenScope::RemoteFile {
+					id_tag: "bob.example".to_string(),
+					file_id: target.to_string(),
+					access: AccessLevel::Read,
+				}),
+				"{target}"
+			);
+		}
+		for bad in [
+			"rfile::f1~x:W",
+			"rfile:Bob.example:f1~x:W",
+			"rfile:bob.example:f1~x:C",
+			"rfile:bob.example:f1~x",
+			"rfile:bob.example:f1~x:W:extra",
+			"rfile:bob.example::R",
+			"rfile:bob.example:~Bad:W",
+			"rfile:bob.example:~:R",
+			"device:abc",
+		] {
 			assert_eq!(TokenScope::parse(bad), None, "{bad}");
 		}
-		assert_eq!(
-			device.and_then(|d| d.file_grant().map(|(id, a)| (id.to_string(), a))),
-			Some(("abc".to_string(), AccessLevel::Write))
-		);
 		let file = TokenScope::parse("file:f1~abc:R");
 		assert_eq!(
 			file.as_ref().and_then(TokenScope::file_grant),
@@ -1218,6 +1466,75 @@ mod access_level_tests {
 			TokenScope::parse("apkg:publish").as_ref().and_then(TokenScope::file_grant),
 			None
 		);
+	}
+
+	#[test]
+	fn scope_set_parses_mixed_lists() {
+		assert_eq!(
+			ScopeSet::parse("file:abc:W,notifications:read,notifications:push"),
+			Some(ScopeSet {
+				delegated: Some(TokenScope::File {
+					file_id: "abc".to_string(),
+					access: AccessLevel::Write,
+					ref_id: None
+				}),
+				caps: vec![Capability::NotificationsRead, Capability::NotificationsPush],
+			})
+		);
+		assert_eq!(
+			ScopeSet::parse("carddav:read, caldav:read"),
+			Some(ScopeSet {
+				delegated: None,
+				caps: vec![Capability::CardDavRead, Capability::CalDavRead],
+			})
+		);
+		assert_eq!(
+			ScopeSet::parse("file:f1~a:R"),
+			Some(ScopeSet {
+				delegated: Some(TokenScope::File {
+					file_id: "f1~a".to_string(),
+					access: AccessLevel::Read,
+					ref_id: None
+				}),
+				caps: vec![],
+			})
+		);
+		// Duplicate capabilities are tolerated.
+		assert!(ScopeSet::parse("caldav:read,caldav:read").is_some());
+	}
+
+	#[test]
+	fn scope_set_rejects_malformed_lists() {
+		for bad in ["file:a:W,file:f1~b:R", "file:a:W,bogus", "", ",", "file:a:W,", " "] {
+			assert_eq!(ScopeSet::parse(bad), None, "{bad:?}");
+		}
+	}
+
+	#[test]
+	fn scope_set_has_and_delegated_scope() {
+		let set = ScopeSet::parse("file:abc:W,notifications:read");
+		assert!(set.as_ref().is_some_and(|s| s.has(Capability::NotificationsRead)));
+		assert!(set.as_ref().is_some_and(|s| !s.has(Capability::CardDavRead)));
+		assert_eq!(delegated_scope("carddav:read,caldav:write"), None);
+		assert_eq!(delegated_scope("file:a:W,bogus"), None);
+		assert_eq!(
+			delegated_scope("file:abc:W, carddav:read"),
+			Some(TokenScope::File {
+				file_id: "abc".to_string(),
+				access: AccessLevel::Write,
+				ref_id: None
+			})
+		);
+		for c in [
+			Capability::CardDavRead,
+			Capability::CardDavWrite,
+			Capability::CalDavRead,
+			Capability::CalDavWrite,
+			Capability::NotificationsRead,
+			Capability::NotificationsPush,
+		] {
+			assert_eq!(Capability::parse(c.as_str()), Some(c));
+		}
 	}
 }
 

@@ -37,7 +37,7 @@ use cloudillo_core::share_access::{ShareStanding, share_standing};
 use cloudillo_types::auth_adapter::AuthCtx;
 use cloudillo_types::hasher;
 use cloudillo_types::meta_adapter::{self, ListRefsOptions, SHARE_FILE_REF_TYPE, ShareEntry};
-use cloudillo_types::types::{AccessLevel, ApiResponse, ApiTime, TokenScope};
+use cloudillo_types::types::{AccessLevel, ApiResponse, ApiTime, TokenScope, delegated_scope};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -133,7 +133,7 @@ struct AccessLink {
 fn is_link_guest(auth: &AuthCtx) -> bool {
 	auth.anonymous
 		&& matches!(
-			auth.scope.as_deref().and_then(TokenScope::parse),
+			auth.scope.as_deref().and_then(delegated_scope),
 			Some(TokenScope::File { ref_id: Some(_), .. })
 		)
 }
