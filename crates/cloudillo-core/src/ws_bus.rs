@@ -190,7 +190,7 @@ pub async fn handle_bus_connection(
 	// Presence (Contract 11): persist last_seen_at only when the tenant's last
 	// ws-bus connection closes. "Online now" is read from the in-memory registry;
 	// this DB value mainly survives restarts. No per-heartbeat writes.
-	if app.broadcast.online_users(tn_id).await.is_empty() {
+	if !app.broadcast.is_user_online(tn_id, &user_id).await {
 		let update = cloudillo_types::meta_adapter::UpdateTenantData {
 			last_seen_at: cloudillo_types::types::Patch::Value(
 				cloudillo_types::types::Timestamp::now(),
