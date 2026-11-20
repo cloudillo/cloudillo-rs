@@ -13,6 +13,7 @@ use axum::{
 	http::StatusCode,
 };
 use cloudillo_types::extract::{JsonBody, Query};
+use cloudillo_types::utils::is_control_or_invisible;
 use uuid::Uuid;
 
 use cloudillo_core::{IdTag, extract::Auth, prelude::*};
@@ -307,7 +308,7 @@ fn validate_ab_name(name: &str) -> ClResult<()> {
 	if name.len() > 128 {
 		return Err(Error::ValidationError("name too long".into()));
 	}
-	if name.chars().any(|c| c.is_control() || c == '/' || c == '\\') {
+	if name.chars().any(|c| is_control_or_invisible(c) || c == '/' || c == '\\') {
 		return Err(Error::ValidationError("name contains invalid character".into()));
 	}
 	Ok(())
@@ -594,6 +595,19 @@ pub async fn import_contacts(
 
 	let resp = ApiResponse::new(result);
 	Ok((StatusCode::OK, Json(resp)))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn validate_ab_name_rejects_invisible_keeps_emoji() {
+		assert!(validate_ab_name("a\u{200B}b").is_err());
+		assert!(validate_ab_name("a\u{202E}b").is_err());
+		assert!(validate_ab_name("❤️ Family").is_ok());
+		assert!(validate_ab_name("👨\u{200D}👩\u{200D}👧").is_ok());
+	}
 }
 
 // vim: ts=4

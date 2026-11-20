@@ -101,7 +101,9 @@ pub async fn post_pair_init(
 ) -> ClResult<(StatusCode, Json<ApiResponse<PairInitResponse>>)> {
 	let device_name = body.device_name.trim();
 	let len = device_name.chars().count();
-	if !(1..=64).contains(&len) || device_name.chars().any(char::is_control) {
+	if !(1..=64).contains(&len)
+		|| device_name.chars().any(cloudillo_types::utils::is_control_or_invisible)
+	{
 		return Err(Error::InvalidField {
 			field: "deviceName",
 			message: "must be 1-64 printable characters".into(),

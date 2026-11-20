@@ -161,9 +161,39 @@ pub fn mask_email(email: &str) -> Option<String> {
 	Some(format!("{}***@{}***.{}", local_visible, domain_visible, tld))
 }
 
+/// Control chars, plus zero-width space, bidi marks/overrides/isolates, line/paragraph
+/// separator, soft hyphen and filler chars: they make two names look alike or reorder the
+/// text around them. ZWJ/ZWNJ, variation selectors and tag chars stay allowed: emoji
+/// sequences, flags and several scripts need them.
+pub fn is_control_or_invisible(c: char) -> bool {
+	c.is_control()
+		|| matches!(
+			c,
+			'\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}'
+				| '\u{180E}' | '\u{180F}'
+				| '\u{200B}' | '\u{200E}' | '\u{200F}'
+				| '\u{202A}'..='\u{202E}'
+				| '\u{2028}' | '\u{2029}'
+				| '\u{2060}'..='\u{2069}'
+				| '\u{3164}'
+				| '\u{FEFF}'
+				| '\u{FFA0}'
+		)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn control_or_invisible_chars() {
+		for c in ['\t', '\n', '\u{202E}', '\u{200B}', '\u{00AD}', '\u{2066}'] {
+			assert!(is_control_or_invisible(c), "{c:?}");
+		}
+		for c in ['a', 'é', ' ', '-', '😀', '\u{FE0F}', '\u{E0041}', '\u{200D}', '\u{200C}'] {
+			assert!(!is_control_or_invisible(c), "{c:?}");
+		}
+	}
 
 	#[test]
 	fn test_derive_name_from_id_tag() {

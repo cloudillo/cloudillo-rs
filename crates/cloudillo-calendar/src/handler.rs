@@ -14,6 +14,7 @@ use axum::{
 };
 use cloudillo_core::{IdTag, extract::Auth, prelude::*};
 use cloudillo_types::extract::{JsonBody, Query};
+use cloudillo_types::utils::is_control_or_invisible;
 use cloudillo_types::{
 	meta_adapter::{
 		Calendar, CalendarObject, CalendarObjectExtracted, CalendarObjectView, CalendarObjectWrite,
@@ -126,7 +127,7 @@ fn validate_cal_name(name: &str) -> ClResult<()> {
 	if name.len() > 128 {
 		return Err(Error::ValidationError("name too long".into()));
 	}
-	if name.chars().any(|c| c.is_control() || c == '/' || c == '\\') {
+	if name.chars().any(|c| is_control_or_invisible(c) || c == '/' || c == '\\') {
 		return Err(Error::ValidationError("name contains invalid character".into()));
 	}
 	Ok(())
@@ -764,6 +765,14 @@ pub async fn delete_exception(
 mod tests {
 	use super::*;
 	use crate::types::{Alarm, Attendee};
+
+	#[test]
+	fn validate_cal_name_rejects_invisible_keeps_emoji() {
+		assert!(validate_cal_name("a\u{200B}b").is_err());
+		assert!(validate_cal_name("a\u{202E}b").is_err());
+		assert!(validate_cal_name("❤️ Family").is_ok());
+		assert!(validate_cal_name("👨\u{200D}👩\u{200D}👧").is_ok());
+	}
 
 	/// Full-fidelity round-trip: generate a VCALENDAR from an EventInput that includes
 	/// description, attendees, and alarms; then parse it back and confirm everything
