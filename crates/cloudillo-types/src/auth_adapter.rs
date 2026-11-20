@@ -194,6 +194,11 @@ impl AuthCtx {
 	pub fn names_holder(&self) -> bool {
 		!(self.anonymous && self.scope.is_some())
 	}
+
+	/// `id_tag` when it names the holder ([`Self::names_holder`]), else `None`.
+	pub fn holder_tag(&self) -> Option<&str> {
+		self.names_holder().then_some(&*self.id_tag)
+	}
 }
 
 #[derive(Debug)]

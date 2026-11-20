@@ -22,8 +22,10 @@
 //! | `/api/files/{id}/duplicate`           | | `create()` ᶜ | | | |
 //! | `/api/files/{id}/restore`             | | `write()` ᶜ | | | |
 //! | `/api/files/{id}/versions`            | `write()` ᶜ | | | | |
-//! | `/api/files/{id}/versions/{fileId}`   | `write()` ᶜ | | | | |
+//! | `/api/files/{id}/version-policy`      | `write()` ᶜ | | | | |
+//! | `/api/files/{id}/versions/{fileId}`   | `write()` ᶜ | | | | `write()` ᶜ |
 //! | `/api/files/{id}/versions/{fileId}/restore` | | `write()` ᶜ | | | |
+//! | `/api/files/{id}/versions/{fileId}/name` | | | `write()` ᶜ | | |
 //! | `/api/files/{id}/tags/{tag}`          | | | `write()` ᶜ | | `write()` ᶜ |
 //! | `/api/files/{id}/user-data`           | | | | `user_data()` ᴱ | |
 //! | `/api/files/{id}/refresh`             | | `user_data()` ᴱ | | | |
@@ -99,8 +101,13 @@ pub(crate) fn write() -> Router<App> {
 		.route("/api/files/{id}/restore", post(management::restore_file))
 		// Version history needs write access even to read: it may hold removed content.
 		.route("/api/files/{id}/versions", get(version::list_versions))
-		.route("/api/files/{id}/versions/{file_id}", get(version::get_version_content))
+		.route("/api/files/{id}/version-policy", get(version::version_policy))
+		.route(
+			"/api/files/{id}/versions/{file_id}",
+			get(version::get_version_content).delete(version::delete_version),
+		)
 		.route("/api/files/{id}/versions/{file_id}/restore", post(version::restore_version))
+		.route("/api/files/{id}/versions/{file_id}/name", put(version::name_version))
 		.route("/api/files/{id}/tags/{tag}", put(tag::put_file_tag).delete(tag::delete_file_tag))
 }
 

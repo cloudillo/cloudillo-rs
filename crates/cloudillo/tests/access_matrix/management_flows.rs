@@ -2905,9 +2905,9 @@ async fn versions_of(fx: &Fixture, s: &Subject, entry: &str) -> Vec<String> {
 }
 
 /// Replace, list, download, restore and restore-as-copy with real version ids, on fresh entries
-/// (the seeded ones are shared). The curated side is MG-691..MG-710: the allowed community
-/// member, and the scoped credentials whose root does not strictly contain the entry, which
-/// the handlers refuse before any version lookup (a W folder key inside its root:
+/// (the seeded ones are shared). The curated side is MG-691..MG-710 and MG-797..MG-821: the
+/// allowed community member, and the scoped credentials whose root does not strictly contain the
+/// entry, which the handlers refuse before any version lookup (a W folder key inside its root:
 /// `scoped_lifecycle_inside_root`).
 /// Here: the 428 / 412s, the swap, the bytes served, a reader who cannot write refused on a
 /// version that exists, and another entry's version refused as not this entry's history.
@@ -3019,6 +3019,54 @@ async fn content_replace_and_versions_flow() {
 	assert_eq!(find_str(&rows[0], "fileId").as_deref(), Some(a0), "newest version: {got}");
 	assert!(rows[0]["replacedBy"].is_null(), "share-link replace names nobody: {got}");
 	assert!(rows[1]["replacedBy"].is_string(), "owner restore names the owner: {got}");
+
+	// Names and delete on `b`, whose one history row is `b0`: a named version is not deleted,
+	// an unnamed one is, the current content never is.
+	let ver_b0 = format!("/api/files/{b}/versions/{b0}");
+	let name_b0 = format!("{ver_b0}/name");
+	let (st, body) = send(fx, owner, Method::PUT, &name_b0, r#"{"name":"keep"}"#).await;
+	assert_eq!(st, StatusCode::OK, "name: {body}");
+	let uri = format!("/api/files/{b}/versions?current=true");
+	let (st, got) = send(fx, owner, Method::GET, &uri, "").await;
+	assert!(st.is_success(), "versions?current=true: {st} {got}");
+	let rows = got["data"].as_array().unwrap();
+	assert_eq!(find_str(&rows[0], "fileId").as_deref(), Some(b1.as_str()), "current: {got}");
+	let h = rows.iter().find(|v| find_str(v, "fileId").as_deref() == Some(b0)).unwrap();
+	assert_eq!(find_str(h, "name").as_deref(), Some("keep"), "name listed: {got}");
+	let (st, body) = send(fx, owner, Method::DELETE, &ver_b0, "").await;
+	assert_eq!(st, StatusCode::CONFLICT, "delete a named version: {body}");
+	let (st, body) = send(fx, owner, Method::PUT, &name_b0, r#"{"name":""}"#).await;
+	assert_eq!(st, StatusCode::OK, "unname: {body}");
+	let (st, body) = send(fx, owner, Method::DELETE, &ver_b0, "").await;
+	assert_eq!(st, StatusCode::OK, "delete: {body}");
+	assert!(versions_of(fx, owner, &b).await.is_empty(), "{b0} deleted");
+	let uri = format!("/api/files/{b}/versions/{b1}");
+	let (st, body) = send(fx, owner, Method::DELETE, &uri, "").await;
+	assert_eq!(st, StatusCode::CONFLICT, "delete the current content: {body}");
+	let uri = format!("/api/files/{b}/version-policy");
+	let (st, got) = send(fx, owner, Method::GET, &uri, "").await;
+	assert!(st.is_success(), "policy: {st} {got}");
+	let policy = &got["data"];
+	assert_eq!(
+		(&policy["keepCount"], &policy["keepDays"], &policy["maxSizeMb"]),
+		(&Value::from(10), &Value::from(30), &Value::from(20)),
+		"policy defaults: {got}"
+	);
+	let keys = ["file.version_keep_count", "file.version_keep_days", "file.version_max_size_mb"];
+	for (key, n) in keys.iter().zip([7, 3, 5]) {
+		fx.app.settings.set(alice, key, SettingValue::Int(n), &["SADM"]).await.unwrap();
+	}
+	let (st, got) = send(fx, owner, Method::GET, &uri, "").await;
+	for key in keys {
+		fx.app.settings.delete(alice, key).await.unwrap();
+	}
+	assert!(st.is_success(), "policy: {st} {got}");
+	let policy = &got["data"];
+	assert_eq!(
+		(&policy["keepCount"], &policy["keepDays"], &policy["maxSizeMb"]),
+		(&Value::from(7), &Value::from(3), &Value::from(5)),
+		"policy set: {got}"
+	);
 }
 
 /// `POST /api/auth/pair` on `host`: `(sessionId, secret, code)`.

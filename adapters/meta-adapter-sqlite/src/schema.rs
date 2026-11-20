@@ -451,7 +451,7 @@ async fn migrate_v58_entries(tx: &mut Transaction<'_, Sqlite>) -> Result<(), sql
 /// Initialize the database schema with all required tables and indexes
 pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	// Current schema version - update this when adding new migrations
-	const CURRENT_DB_VERSION: i64 = 65;
+	const CURRENT_DB_VERSION: i64 = 66;
 
 	let mut tx = db.begin().await?;
 
@@ -679,6 +679,8 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			ref_preset text,
 			created_at INTEGER DEFAULT (unixepoch()),
 			updated_at INTEGER DEFAULT (unixepoch()),
+			content_saved_by text,		-- id_tag who saved the current content (NULL: unknown)
+			content_saved_at integer,	-- when the current content was saved
 			broken_at INTEGER,			-- Tombstone written by the cross-context refresh endpoint
 			broken_reason TEXT,			-- BrokenReason enum: 'deleted' | 'revoked'
 			PRIMARY KEY(e_id)
@@ -740,6 +742,8 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 			replaced_at integer NOT NULL DEFAULT (unixepoch()),
 			replaced_by text,			-- id_tag of the caller who replaced it
 			size integer,				-- orig variant size in bytes
+			saved_by text,				-- id_tag who saved this content (NULL: unknown)
+			saved_at integer,			-- when this content was saved
 			PRIMARY KEY(tn_id, e_id, f_id)
 		)",
 	)
@@ -748,6 +752,21 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	sqlx::query("CREATE INDEX IF NOT EXISTS idx_entry_versions_f ON entry_versions(f_id)")
 		.execute(&mut *tx)
 		.await?;
+	// Version names, keyed by content so the current content can be named too and a name
+	// survives restore / re-replace. Named content is exempt from every history cap.
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS entry_version_names (
+			tn_id integer NOT NULL,
+			e_id integer NOT NULL,		-- entries.e_id
+			f_id integer NOT NULL,		-- files.f_id of the named content
+			name text NOT NULL,
+			named_by text,				-- id_tag of the caller who named it
+			named_at integer NOT NULL DEFAULT (unixepoch()),
+			PRIMARY KEY(tn_id, e_id, f_id)
+		)",
+	)
+	.execute(&mut *tx)
+	.await?;
 
 	// Replace in flight: new content (no entry yet) waiting for `finalize_file` to swap it into
 	// entry `e_id`. A GC reference; rows older than the scratch window are dropped by the GC.
@@ -3299,6 +3318,15 @@ pub(crate) async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 	if version < 65 {
 		// idx_entries_updated + entry_purges (created idempotently in init_db)
 		set_db_version(&mut tx, 65).await?;
+	}
+
+	if version < 66 {
+		// Version authorship columns (entry_version_names is created idempotently in init_db)
+		add_column_if_missing(&mut tx, "entries", "content_saved_by", "text").await?;
+		add_column_if_missing(&mut tx, "entries", "content_saved_at", "integer").await?;
+		add_column_if_missing(&mut tx, "entry_versions", "saved_by", "text").await?;
+		add_column_if_missing(&mut tx, "entry_versions", "saved_at", "integer").await?;
+		set_db_version(&mut tx, 66).await?;
 	}
 
 	// Unversioned and idempotent: a DB that reached v58 on a pre-rename build still has

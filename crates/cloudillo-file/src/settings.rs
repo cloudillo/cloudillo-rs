@@ -8,6 +8,10 @@ use cloudillo_core::settings::types::{
 	PermissionLevel, SettingDefinition, SettingScope, SettingValue, SettingsRegistry,
 };
 
+pub(crate) const VERSION_MAX_SIZE_MB: &str = "file.version_max_size_mb";
+pub(crate) const VERSION_KEEP_COUNT: &str = "file.version_keep_count";
+pub(crate) const VERSION_KEEP_DAYS: &str = "file.version_keep_days";
+
 /// Register all file and storage settings
 pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 	// Max file size
@@ -201,7 +205,7 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 
 	// Version history of replaced file content (pruned by the file GC, `gc.rs`)
 	registry.register(
-		SettingDefinition::builder("file.version_max_size_mb")
+		SettingDefinition::builder(VERSION_MAX_SIZE_MB)
 			.description(
 				"Largest file (MiB) whose previous content is kept as a version on replace",
 			)
@@ -216,7 +220,7 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 	)?;
 
 	registry.register(
-		SettingDefinition::builder("file.version_keep_count")
+		SettingDefinition::builder(VERSION_KEEP_COUNT)
 			.description("Versions kept per file (newest first; 0 = keep none)")
 			.default(SettingValue::Int(10))
 			.scope(SettingScope::Tenant)
@@ -229,7 +233,7 @@ pub fn register_settings(registry: &mut SettingsRegistry) -> ClResult<()> {
 	)?;
 
 	registry.register(
-		SettingDefinition::builder("file.version_keep_days")
+		SettingDefinition::builder(VERSION_KEEP_DAYS)
 			.description("Days a version is kept (0 = no age limit)")
 			.default(SettingValue::Int(30))
 			.scope(SettingScope::Tenant)

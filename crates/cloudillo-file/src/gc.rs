@@ -188,8 +188,16 @@ async fn sweep_tenant(
 
 	// 2c. Version retention — history beyond the newest `keep_count` per entry, or older than
 	// `keep_days` (0 = no age limit), goes, so its content can turn orphan below.
-	let keep_count = app.settings.get_int(tn_id, "file.version_keep_count").await.unwrap_or(10);
-	let keep_days = app.settings.get_int(tn_id, "file.version_keep_days").await.unwrap_or(30);
+	let keep_count = app
+		.settings
+		.get_int(tn_id, crate::settings::VERSION_KEEP_COUNT)
+		.await
+		.unwrap_or(10);
+	let keep_days = app
+		.settings
+		.get_int(tn_id, crate::settings::VERSION_KEEP_DAYS)
+		.await
+		.unwrap_or(30);
 	let older_than = if keep_days > 0 {
 		Timestamp::now().0.saturating_sub(keep_days.saturating_mul(86_400))
 	} else {

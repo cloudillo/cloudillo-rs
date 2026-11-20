@@ -834,8 +834,9 @@ pub async fn duplicate_file(
 	// BLOB / CRDT / RTDB only (checked above): each has a content id.
 	let content_id = match req.from_version {
 		Some(version) => {
-			let versions = app.meta_adapter.list_entry_versions(tn_id, &file.entry_id).await?;
-			if !versions.iter().any(|v| *v.file_id == *version) {
+			if !app.meta_adapter.has_entry_version(tn_id, &file.entry_id, &version).await? {
+				// Live entries only, like restore: a trashed entry's history is reachable
+				// again after restore-from-trash.
 				return Err(Error::NotFound);
 			}
 			version.into()
@@ -909,6 +910,7 @@ pub async fn duplicate_file(
 				file_id: Some(new_file_id.clone().into()),
 				parent_id,
 				owner_tag: Some(auth.id_tag.clone()),
+				saved_by: auth.holder_tag().map(Into::into),
 				content_type: file.content_type.unwrap_or_else(|| "application/json".into()),
 				file_name: new_file_name.into(),
 				file_tp: file.file_tp,

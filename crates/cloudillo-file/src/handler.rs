@@ -1828,6 +1828,7 @@ pub async fn post_file(
 				parent_id: req.effective_parent_id()?.map(Into::into),
 				root_id: req.root_id.map(Into::into),
 				owner_tag: Some(auth.id_tag.clone()),
+				saved_by: auth.holder_tag().map(Into::into),
 				content_type: content_type.into(),
 				file_name: req.file_name.clone().unwrap_or_else(|| "file".into()).into(),
 				file_tp: Some(req.file_tp.clone().into()),
@@ -2874,6 +2875,7 @@ pub async fn post_file_blob(
 	let base = meta_adapter::CreateFile {
 		preset: Some(preset_name.into()),
 		owner_tag: Some(auth.id_tag.clone()),
+		saved_by: auth.holder_tag().map(Into::into),
 		file_name: file_name.into(),
 		file_tp: Some("BLOB".into()),
 		created_at: query.created_at.map(Into::into),
@@ -3295,7 +3297,7 @@ pub async fn put_file_content(
 		Some(name) => preset::resolve(&app, tn_id, name).await?,
 		None => preset::resolve_stored(&app, tn_id, file.preset.as_deref()).await,
 	};
-	let max_mb = app.settings.get_int(tn_id, "file.version_max_size_mb").await?;
+	let max_mb = app.settings.get_int(tn_id, crate::settings::VERSION_MAX_SIZE_MB).await?;
 	let max_history_size = u64::try_from(max_mb).unwrap_or(0).saturating_mul(1 << 20);
 
 	let base = meta_adapter::CreateFile {
@@ -3307,7 +3309,7 @@ pub async fn put_file_content(
 	let replace = PendingReplace {
 		entry_id: &file.entry_id,
 		expected_file_id: expected,
-		replaced_by: auth.names_holder().then_some(&*auth.id_tag),
+		replaced_by: auth.holder_tag(),
 		max_history_size,
 	};
 	let (entry_id, created) =

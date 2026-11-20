@@ -2784,6 +2784,28 @@ pub const MG: &[Row] = &[
 	// past the gate; the real swap is `scoped_lifecycle_inside_root`.
 	("MG-704", "device@alice", FOLDER_CHILD, VER_LIST, "Allow"),
 	("MG-705", "device@alice", FOLDER_CHILD, VER_PUT, "428"),
+	// Version names, delete and policy; the 404s are past the gate (fake version id).
+	// Saver authorship: share links cannot upload (MG-288), so no row exercises a share-link
+	// saver; the adapter side is `version_tests::upload_without_saver_records_nobody`.
+	("MG-797", "owner@alice", "tenant-blob-d-active@alice", VER_POLICY, "Allow"),
+	("MG-798", "owner@alice", "tenant-blob-d-active@alice", VER_DELETE, "404"),
+	("MG-799", "owner@alice", "tenant-blob-d-active@alice", VER_NAME, "404"),
+	("MG-801", "m_contributor@club", VER_CLUB, VER_POLICY, "Allow"),
+	("MG-802", "m_contributor@club", VER_CLUB, VER_DELETE, "404"),
+	("MG-803", "m_contributor@club", VER_CLUB, VER_NAME, "404"),
+	("MG-805", "m_supporter@club", VER_CLUB, VER_POLICY, "Deny"),
+	("MG-806", "m_supporter@club", VER_CLUB, VER_DELETE, "Deny"),
+	("MG-807", "m_supporter@club", VER_CLUB, VER_NAME, "Deny"),
+	("MG-808", "m_follower@club", VER_CLUB, VER_POLICY, "Deny"),
+	("MG-809", "m_follower@club", VER_CLUB, VER_NAME, "Deny"),
+	("MG-818", "m_follower@club", VER_CLUB, VER_DELETE, "Deny"),
+	("MG-819", "m_contributor@club", VER_CLUB, VER_LIST_CURRENT, "Allow"),
+	("MG-820", "m_supporter@club", VER_CLUB, VER_LIST_CURRENT, "Deny"),
+	// A scoped key reads history but never names or deletes a version: those are
+	// `LifecycleOp::Purge`. Nor does it read the retention policy.
+	("MG-810", "device@alice", FOLDER_CHILD, VER_POLICY, "Deny"),
+	("MG-811", "device@alice", FOLDER_CHILD, VER_NAME, "Deny"),
+	("MG-813", "device@alice", FOLDER_CHILD, VER_DELETE, "Deny"),
 	// Change feed: a folder root the caller reads, the main drive, a room drive. The unreadable
 	// and scoped callers on a folder root are the `CHANGES_DENIED` grid; the `gone` markers
 	// (renamed out, trashed, unenterable room) and the 410 are `main::file_change_feed`.
@@ -2965,11 +2987,16 @@ const CHANGES_DENIED: &[&str] = &[
 
 /// Content replace and version routes; `{entry}` is a BLOB. `f1~zqm-nover` is in no history.
 const VER_LIST: Route = Call("GET", "/api/files/{entry}/versions", "");
+const VER_LIST_CURRENT: Route = Call("GET", "/api/files/{entry}/versions?current=true", "");
 const VER_PUT: Route = Call("PUT", "/api/files/{entry}/content", "zqm");
 const VER_GET: Route = Call("GET", "/api/files/{entry}/versions/f1~zqm-nover", "");
 const VER_RESTORE: Route = Call("POST", "/api/files/{entry}/versions/f1~zqm-nover/restore", "");
 const VER_COPY: Route =
 	Call("POST", "/api/files/{entry}/duplicate", r#"{"fromVersion":"f1~zqm-nover"}"#);
+const VER_POLICY: Route = Call("GET", "/api/files/{entry}/version-policy", "");
+const VER_DELETE: Route = Call("DELETE", "/api/files/{entry}/versions/f1~zqm-nover", "");
+const VER_NAME: Route =
+	Call("PUT", "/api/files/{entry}/versions/f1~zqm-nover/name", r#"{"name":"x"}"#);
 /// A BLOB in a community folder, which a contributor writes (MG-287).
 const VER_CLUB: &str = "folderchild-blob-d-active@club";
 
@@ -3308,6 +3335,10 @@ const VERSION_ROUTES: &[(&str, Route)] = &[
 	("MG-708", VER_GET),
 	("MG-709", VER_RESTORE),
 	("MG-710", VER_COPY),
+	("MG-814", VER_POLICY),
+	("MG-815", VER_DELETE),
+	("MG-816", VER_NAME),
+	("MG-821", VER_LIST_CURRENT),
 ];
 const VERSION_DENIED: &[&str] = &[
 	"anon@alice",

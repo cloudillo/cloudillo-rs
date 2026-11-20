@@ -265,6 +265,7 @@ const TENANT_CASCADE_TABLES: &[&str] = &[
 	"profile_badges",
 	"notifications",
 	"entry_versions",
+	"entry_version_names",
 	"pending_replaces",
 	"entry_purges",
 ];

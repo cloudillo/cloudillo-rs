@@ -581,8 +581,38 @@ impl MetaAdapter for MetaAdapterSqlite {
 		&self,
 		tn_id: TnId,
 		entry_id: &str,
+		include_current: bool,
 	) -> ClResult<Vec<EntryVersion>> {
-		file::list_entry_versions(&self.dbr, tn_id, entry_id).await
+		file::list_entry_versions(&self.dbr, tn_id, entry_id, include_current).await
+	}
+
+	async fn has_entry_version(
+		&self,
+		tn_id: TnId,
+		entry_id: &str,
+		file_id: &str,
+	) -> ClResult<bool> {
+		file::has_entry_version(&self.dbr, tn_id, entry_id, file_id).await
+	}
+
+	async fn set_entry_version_name(
+		&self,
+		tn_id: TnId,
+		entry_id: &str,
+		file_id: &str,
+		name: Option<&str>,
+		named_by: Option<&str>,
+	) -> ClResult<()> {
+		file::set_entry_version_name(&self.db, tn_id, entry_id, file_id, name, named_by).await
+	}
+
+	async fn delete_entry_version(
+		&self,
+		tn_id: TnId,
+		entry_id: &str,
+		file_id: &str,
+	) -> ClResult<()> {
+		file::delete_entry_version(&self.db, tn_id, entry_id, file_id).await
 	}
 
 	async fn restore_entry_version(

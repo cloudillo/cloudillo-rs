@@ -754,7 +754,6 @@ async fn seed_file(app: &App, o: &FileObj) -> String {
 		.create_file(
 			o.tn_id,
 			CreateFile {
-				orig_variant_id: None,
 				file_id: Some(o.file_id.clone().into()),
 				parent_id: o.parent_id.clone().map(Into::into),
 				root_id: o.root_id.clone().map(Into::into),
@@ -764,12 +763,8 @@ async fn seed_file(app: &App, o: &FileObj) -> String {
 				content_type: content_type.into(),
 				file_name: format!("zqmatrix {}", s.name).into(),
 				file_tp: Some(file_tp.into()),
-				created_at: None,
-				tags: None,
-				x: None,
 				visibility: s.vis,
 				channel: s.channel.map(|c| absolute_channel(s.tn, c)),
-				hidden: false,
 				// A folder or a reference has nothing to finalize; it starts in its final state.
 				status: Some(
 					if (s.shape == FileShape::Folder || o.upstream_tag.is_some())
@@ -780,7 +775,7 @@ async fn seed_file(app: &App, o: &FileObj) -> String {
 						FileStatus::Pending
 					},
 				),
-				action_id: None,
+				..Default::default()
 			},
 		)
 		.await

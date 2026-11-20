@@ -106,24 +106,13 @@ async fn seed(s: &Server) -> String {
 		.create_file(
 			s.alice,
 			CreateFile {
-				orig_variant_id: None,
 				file_id: Some(FILE_ID.into()),
-				parent_id: None,
-				root_id: None,
-				upstream_tag: None,
-				owner_tag: None,
-				preset: None,
 				content_type: "text/plain".into(),
 				file_name: "snapshot.txt".into(),
 				file_tp: Some("BLOB".into()),
-				created_at: None,
-				tags: None,
-				x: None,
 				visibility: Some('P'),
-				channel: None,
-				hidden: false,
 				status: Some(FileStatus::Pending),
-				action_id: None,
+				..Default::default()
 			},
 		)
 		.await

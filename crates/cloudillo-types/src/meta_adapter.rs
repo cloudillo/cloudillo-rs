@@ -1012,13 +1012,25 @@ pub struct ContentInfo {
 /// One row of an entry's content history ([`MetaAdapter::list_entry_versions`]).
 #[derive(Debug, Clone)]
 pub struct EntryVersion {
-	/// Content id (`files.file_id`) the entry pointed at before it was replaced.
+	/// Content id (`files.file_id`): a history row's earlier content, or the entry's current
+	/// content when `current`.
 	pub file_id: Box<str>,
-	pub replaced_at: Timestamp,
-	/// id_tag of the caller who replaced it.
+	/// When it stopped being current; `None` for the current row.
+	pub replaced_at: Option<Timestamp>,
+	/// id_tag of the caller who replaced it (`None` for the current row).
 	pub replaced_by: Option<Box<str>>,
 	/// `orig` variant size in bytes.
 	pub size: Option<u64>,
+	/// id_tag of the caller who saved this content (`None`: unknown, e.g. older rows).
+	pub saved_by: Option<Box<str>>,
+	/// When this content was saved (`None`: unknown).
+	pub saved_at: Option<Timestamp>,
+	/// Version name; named content is exempt from every history cap.
+	pub name: Option<Box<str>>,
+	pub named_by: Option<Box<str>>,
+	pub named_at: Option<Timestamp>,
+	/// The entry's current content (only listed with `include_current`).
+	pub current: bool,
 }
 
 /// One row of the change feed ([`MetaAdapter::list_entry_changes`]).
@@ -1486,6 +1498,9 @@ pub struct CreateFile {
 	/// `file_id` upstream, holds no local bytes and never links a local `files` row.
 	pub upstream_tag: Option<Box<str>>,
 	pub owner_tag: Option<Box<str>>, // The profile with owner authority; NULL ⇒ the tenant
+	/// Who saved the new content (uploads only; None: unknown, e.g. a copy or a share-link
+	/// holder). Set ⇒ content_saved_by/at are stamped.
+	pub saved_by: Option<Box<str>>,
 	pub preset: Option<Box<str>>,
 	pub content_type: Box<str>,
 	pub file_name: Box<str>,
@@ -2905,9 +2920,43 @@ pub trait MetaAdapter: Debug + Send + Sync {
 		f_id: u64,
 	) -> ClResult<Option<(Option<Box<str>>, Option<Box<str>>)>>;
 
-	/// Entry `entry_id`'s content history, newest first. Empty for an unknown entry.
-	async fn list_entry_versions(&self, tn_id: TnId, entry_id: &str)
-	-> ClResult<Vec<EntryVersion>>;
+	/// Entry `entry_id`'s content history, newest first. Empty for an unknown or non-live
+	/// (trashed) entry.
+	/// `include_current` prepends the current content (`current = true`) for a live entry.
+	async fn list_entry_versions(
+		&self,
+		tn_id: TnId,
+		entry_id: &str,
+		include_current: bool,
+	) -> ClResult<Vec<EntryVersion>>;
+
+	/// Whether content `file_id` is in live entry `entry_id`'s history (not its current
+	/// content).
+	async fn has_entry_version(&self, tn_id: TnId, entry_id: &str, file_id: &str)
+	-> ClResult<bool>;
+
+	/// Name (`Some`) or unname (`None`) content `file_id` of live entry `entry_id`; naming
+	/// overwrites any previous name. `NotFound` unless `file_id` is the entry's current content
+	/// or in its history. `ValidationError` when naming a so far unnamed version would exceed
+	/// the per-entry cap on names (renaming and unnaming always work).
+	async fn set_entry_version_name(
+		&self,
+		tn_id: TnId,
+		entry_id: &str,
+		file_id: &str,
+		name: Option<&str>,
+		named_by: Option<&str>,
+	) -> ClResult<()>;
+
+	/// Drop content `file_id` from live entry `entry_id`'s history; the content goes with
+	/// [`Self::reap_orphan_files`]. `Conflict` for the current content or a named version,
+	/// `NotFound` when `file_id` is neither current nor in the history.
+	async fn delete_entry_version(
+		&self,
+		tn_id: TnId,
+		entry_id: &str,
+		file_id: &str,
+	) -> ClResult<()>;
 
 	/// Point entry `entry_id` back at `file_id` from its history (dropping that history row);
 	/// the current content always goes to history (no size cap), so a restore can be undone.
@@ -2923,7 +2972,8 @@ pub trait MetaAdapter: Debug + Send + Sync {
 	) -> ClResult<()>;
 
 	/// Drop history rows beyond each entry's newest `keep_count`, and any replaced before
-	/// `older_than`. Returns the number dropped; their content goes with
+	/// `older_than`. Named rows are never dropped and do not take a `keep_count` slot.
+	/// Returns the number dropped; their content goes with
 	/// [`Self::reap_orphan_files`].
 	async fn prune_entry_versions(
 		&self,
